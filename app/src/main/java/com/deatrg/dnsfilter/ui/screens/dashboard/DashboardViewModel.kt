@@ -1,0 +1,225 @@
+package com.deatrg.dnsfilter.ui.screens.dashboard
+
+import android.content.Context
+import android.content.Intent
+import android.net.VpnService
+import android.os.Build
+import android.util.Log
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
+import com.deatrg.dnsfilter.ServiceLocator
+import com.deatrg.dnsfilter.data.local.PreferencesManager
+import com.deatrg.dnsfilter.data.local.StatisticsBuffer
+import com.deatrg.dnsfilter.data.remote.DomainFilter
+import com.deatrg.dnsfilter.data.repository.FilterListRepositoryImpl
+import com.deatrg.dnsfilter.domain.model.DnsStatistics
+import com.deatrg.dnsfilter.service.DnsVpnService
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+
+class DashboardViewModel(
+    private val context: Context,
+    private val preferencesManager: PreferencesManager,
+    private val statisticsBuffer: StatisticsBuffer,
+    private val filterListRepository: FilterListRepositoryImpl,
+    private val domainFilter: DomainFilter
+) : ViewModel() {
+    companion object {
+        private const val TAG = "DashboardViewModel"
+        private const val VPN_STATE_TIMEOUT_MS = 5000L
+        private const val POLL_INTERVAL_MS = 100L
+    }
+
+    // VPN实际运行状态（从Service读取）
+    private val _isVpnActuallyRunning = MutableStateFlow(false)
+    val isVpnActuallyRunning: StateFlow<Boolean> = _isVpnActuallyRunning.asStateFlow()
+
+    // VPN操作是否正在处理中
+    private val _isVpnProcessing = MutableStateFlow(false)
+    val isVpnProcessing: StateFlow<Boolean> = _isVpnProcessing.asStateFlow()
+
+    // Blocklist 状态
+    val isFilterLoaded = domainFilter.isLoaded
+    val isFilterLoading = domainFilter.isLoading
+    val filterListCount = domainFilter.filterListCount
+    val downloadProgress = domainFilter.downloadProgress
+
+    // 使用内存缓冲的统计信息
+    val statistics: StateFlow<DnsStatistics> = statisticsBuffer.statistics
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), DnsStatistics())
+
+    init {
+        // 定期检查VPN实际运行状态并同步到UI
+        viewModelScope.launch {
+            while (true) {
+                updateVpnRunningState()
+                delay(POLL_INTERVAL_MS)
+            }
+        }
+
+        // 加载统计信息初始值
+        viewModelScope.launch {
+            statisticsBuffer.loadInitialValues()
+        }
+
+        // 初始化：从本地缓存加载 blocklist（不下载）
+        viewModelScope.launch {
+            filterListRepository.loadFilterLists()
+            // 如果有缓存，后台检查更新
+            if (domainFilter.isLoaded.value) {
+                checkForUpdates()
+            }
+        }
+    }
+    
+    /**
+     * 检查并自动更新（后台静默更新，不影响 UI 状态）
+     */
+    private fun checkForUpdates() {
+        viewModelScope.launch {
+            filterListRepository.checkAndUpdate()
+        }
+    }
+    
+    /**
+     * 更新VPN运行状态
+     */
+    private fun updateVpnRunningState() {
+        _isVpnActuallyRunning.value = DnsVpnService.isServiceRunning
+    }
+
+    /**
+     * 切换VPN状态
+     */
+    fun toggleVpn(targetEnabled: Boolean) {
+        viewModelScope.launch {
+            Log.d(TAG, "toggleVpn: target=$targetEnabled, current=${_isVpnActuallyRunning.value}")
+            
+            if (_isVpnActuallyRunning.value == targetEnabled) {
+                return@launch
+            }
+            
+            _isVpnProcessing.value = true
+            
+            try {
+                if (targetEnabled) {
+                    // 1. 确保 blocklist 已加载（从缓存或下载）
+                    val hasData = ensureFilterListsLoaded()
+                    
+                    if (!hasData) {
+                        Log.e(TAG, "No filter lists available, cannot start VPN")
+                        // 可以在这里显示错误提示
+                        return@launch
+                    }
+
+                    // 2. 启动 VPN
+                    val intent = Intent(context, DnsVpnService::class.java).apply {
+                        action = DnsVpnService.ACTION_START
+                    }
+                    
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        context.startForegroundService(intent)
+                    } else {
+                        context.startService(intent)
+                    }
+
+                    // 等待Service状态变为目标状态
+                    val success = waitForVpnState(true)
+                    
+                    if (success) {
+                        preferencesManager.setVpnEnabled(true)
+                        Log.d(TAG, "VPN started successfully")
+                    } else {
+                        Log.e(TAG, "VPN start timeout")
+                    }
+                } else {
+                    // 停止 VPN
+                    val intent = Intent(context, DnsVpnService::class.java).apply {
+                        action = DnsVpnService.ACTION_STOP
+                    }
+                    context.startService(intent)
+                    
+                    val success = waitForVpnState(false)
+                    
+                    if (success) {
+                        preferencesManager.setVpnEnabled(false)
+                        // 刷新统计信息到磁盘
+                        statisticsBuffer.flush()
+                        Log.d(TAG, "VPN stopped successfully")
+                    } else {
+                        Log.e(TAG, "VPN stop timeout")
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error toggling VPN", e)
+            } finally {
+                _isVpnProcessing.value = false
+            }
+        }
+    }
+    
+    /**
+     * 确保过滤列表已加载
+     * @return true 如果有可用数据（从缓存加载成功或下载成功）
+     */
+    private suspend fun ensureFilterListsLoaded(): Boolean {
+        // 如果已经加载且有数据，直接返回
+        if (domainFilter.isLoaded.value && domainFilter.filterListCount.value > 0) {
+            Log.d(TAG, "Filter lists already loaded: ${domainFilter.filterListCount.value} domains")
+            // 后台检查更新
+            checkForUpdates()
+            return true
+        }
+        
+        // 需要加载（从缓存或下载）
+        Log.d(TAG, "Loading filter lists...")
+        val loaded = domainFilter.loadFilterLists()
+        
+        return loaded
+    }
+    
+    /**
+     * 等待VPN状态变为目标状态
+     */
+    private suspend fun waitForVpnState(targetState: Boolean): Boolean {
+        val startTime = System.currentTimeMillis()
+        while (System.currentTimeMillis() - startTime < VPN_STATE_TIMEOUT_MS) {
+            if (DnsVpnService.isServiceRunning == targetState) {
+                _isVpnActuallyRunning.value = targetState
+                return true
+            }
+            delay(POLL_INTERVAL_MS)
+        }
+        _isVpnActuallyRunning.value = DnsVpnService.isServiceRunning
+        return false
+    }
+
+    fun requestVpnPermission(): Intent? {
+        return VpnService.prepare(context)
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        // ViewModel 销毁时刷新统计信息
+        viewModelScope.launch {
+            statisticsBuffer.flush()
+        }
+    }
+
+    class Factory(private val context: Context) : ViewModelProvider.Factory {
+        @Suppress("UNCHECKED_CAST")
+        override fun <T : ViewModel> create(modelClass: Class<T>): T {
+            val prefs = ServiceLocator.providePreferencesManager()
+            val filterRepo = ServiceLocator.provideFilterListRepository() as FilterListRepositoryImpl
+            return DashboardViewModel(
+                context,
+                prefs,
+                ServiceLocator.provideStatisticsBuffer(),
+                filterRepo,
+                ServiceLocator.provideDomainFilter()
+            ) as T
+        }
+    }
+}

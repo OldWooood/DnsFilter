@@ -1,0 +1,37 @@
+# Build output
+/build
+/intermediates
+/outputs
+/tmp
+
+# Local configuration
+/local.properties
+
+# Signing config (contains sensitive info)
+/release
+/debug
+
+# External native build
+/.externalNativeBuild
+/.cxx
+
+# NDK
+/obj
+
+# Coverage reports
+/coverage
+
+# Test results
+/test-results
+
+# Dependencies
+/dependencies
+
+# Bundle output
+*.aab
+
+# APK output
+*.apk
+
+# Instant App output
+/instantapp
