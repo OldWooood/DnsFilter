@@ -35,9 +35,31 @@ class PreferencesManager(private val context: Context) {
         parseServers(json)
     }
 
+    /**
+     * 确保默认 DNS 服务器已初始化（首次安装时调用）
+     */
+    suspend fun ensureDefaultServersInitialized() {
+        dataStore.edit { prefs ->
+            if (prefs[DNS_SERVERS] == null || prefs[DNS_SERVERS] == "[]") {
+                prefs[DNS_SERVERS] = serversToJson(getDefaultServers())
+            }
+        }
+    }
+
     val filterLists: Flow<List<FilterList>> = dataStore.data.map { prefs ->
         val json = prefs[FILTER_LISTS] ?: "[]"
         parseFilterLists(json)
+    }
+
+    /**
+     * 确保默认过滤列表已初始化（首次安装时调用）
+     */
+    suspend fun ensureDefaultFilterListsInitialized() {
+        dataStore.edit { prefs ->
+            if (prefs[FILTER_LISTS] == null || prefs[FILTER_LISTS] == "[]") {
+                prefs[FILTER_LISTS] = filterListsToJson(getDefaultFilterLists())
+            }
+        }
     }
 
     val isFilteringEnabled: Flow<Boolean> = dataStore.data.map { prefs ->
@@ -238,15 +260,8 @@ class PreferencesManager(private val context: Context) {
     private fun getDefaultFilterLists(): List<FilterList> = listOf(
         FilterList(
             id = "1",
-            name = "AdAway Default",
-            url = "https://adaway.org/hosts.txt",
-            isEnabled = true,
-            isBuiltIn = true
-        ),
-        FilterList(
-            id = "2",
-            name = "StevenBlack Unified",
-            url = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+            name = "anti-ad",
+            url = "https://anti-ad.net/domains.txt",
             isEnabled = true,
             isBuiltIn = true
         )

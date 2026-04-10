@@ -65,24 +65,12 @@ class DashboardViewModel(
         }
 
         // 初始化：从本地缓存加载 blocklist（不下载）
+        // 注意：不在这里调用 checkForUpdates()，由 WorkManager 负责定时更新
         viewModelScope.launch {
             filterListRepository.loadFilterLists()
-            // 如果有缓存，后台检查更新
-            if (domainFilter.isLoaded.value) {
-                checkForUpdates()
-            }
         }
     }
-    
-    /**
-     * 检查并自动更新（后台静默更新，不影响 UI 状态）
-     */
-    private fun checkForUpdates() {
-        viewModelScope.launch {
-            filterListRepository.checkAndUpdate()
-        }
-    }
-    
+
     /**
      * 更新VPN运行状态
      */
@@ -168,15 +156,13 @@ class DashboardViewModel(
         // 如果已经加载且有数据，直接返回
         if (domainFilter.isLoaded.value && domainFilter.filterListCount.value > 0) {
             Log.d(TAG, "Filter lists already loaded: ${domainFilter.filterListCount.value} domains")
-            // 后台检查更新
-            checkForUpdates()
             return true
         }
-        
+
         // 需要加载（从缓存或下载）
         Log.d(TAG, "Loading filter lists...")
         val loaded = domainFilter.loadFilterLists()
-        
+
         return loaded
     }
     

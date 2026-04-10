@@ -12,6 +12,7 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.SocketTimeoutException
+import java.util.LinkedHashMap
 
 class DnsQueryExecutor(
     private val okHttpClient: OkHttpClient,
@@ -20,8 +21,44 @@ class DnsQueryExecutor(
 
     companion object {
         private const val TAG = "DnsQueryExecutor"
+        private const val DNS_CACHE_SIZE = 4096
+        private const val DNS_CACHE_TTL_MS = 5 * 60 * 1000L // 5 minutes
     }
+
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    // DNS 响应缓存（LRU，最大 4096 条）
+    private val dnsCache = object : LinkedHashMap<String, CachedDnsResult>(DNS_CACHE_SIZE, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CachedDnsResult>?): Boolean {
+            return size > DNS_CACHE_SIZE
+        }
+    }
+
+    private data class CachedDnsResult(
+        val responseIp: String,
+        val timestamp: Long
+    )
+
+    private fun getCacheKey(domain: String, qtype: Int): String = "$domain:$qtype"
+
+    private fun getFromCache(domain: String, qtype: Int): String? {
+        val key = getCacheKey(domain, qtype)
+        synchronized(dnsCache) {
+            val cached = dnsCache[key]
+            if (cached != null && System.currentTimeMillis() - cached.timestamp < DNS_CACHE_TTL_MS) {
+                return cached.responseIp
+            }
+            dnsCache.remove(key)
+        }
+        return null
+    }
+
+    private fun putToCache(domain: String, qtype: Int, responseIp: String) {
+        val key = getCacheKey(domain, qtype)
+        synchronized(dnsCache) {
+            dnsCache[key] = CachedDnsResult(responseIp, System.currentTimeMillis())
+        }
+    }
 
     suspend fun query(
         domain: String,
@@ -29,6 +66,17 @@ class DnsQueryExecutor(
         qtype: Int = 1,
         timeoutMs: Long = 3000
     ): DnsQueryResult = withContext(Dispatchers.IO) {
+        // 先检查缓存
+        getFromCache(domain, qtype)?.let { cachedIp ->
+            Log.d(TAG, "DNS cache hit: domain=$domain qtype=$qtype ip=$cachedIp")
+            return@withContext DnsQueryResult(
+                success = true,
+                responseIp = cachedIp,
+                responseTime = 0,
+                error = null
+            )
+        }
+
         val activeServers = servers.filter { it.isEnabled }
         if (activeServers.isEmpty()) {
             return@withContext DnsQueryResult(
@@ -59,6 +107,8 @@ class DnsQueryExecutor(
                 val result = completed.second
                 if (result.first.success) {
                     deferreds.forEach { it.cancel() }
+                    // 缓存结果
+                    result.first.responseIp?.let { putToCache(domain, qtype, it) }
                     Log.d(TAG, "DNS success: domain=$domain qtype=$qtype ip=${result.first.responseIp} time=${result.second}ms")
                     return@coroutineScope DnsQueryResult(
                         success = true,
@@ -177,54 +227,54 @@ class DnsQueryExecutor(
                     if (body != null) {
                         val responseIp = parseDnsResponse(body, body.size, qtype)
                         if (responseIp != null) {
-                            continuation.resume(
+                            continuation.resumeWith(Result.success(
                                 DnsQueryResult(
                                     success = true,
                                     responseIp = responseIp,
                                     responseTime = 0,
                                     error = null
                                 )
-                            ) {}
+                            ))
                         } else {
-                            continuation.resume(
+                            continuation.resumeWith(Result.success(
                                 DnsQueryResult(
                                     success = false,
                                     responseIp = null,
                                     responseTime = 0,
                                     error = "Failed to parse DoH response"
                                 )
-                            ) {}
+                            ))
                         }
                     } else {
-                        continuation.resume(
+                        continuation.resumeWith(Result.success(
                             DnsQueryResult(
                                 success = false,
                                 responseIp = null,
                                 responseTime = 0,
                                 error = "Empty response"
                             )
-                        ) {}
+                        ))
                     }
                 } else {
-                    continuation.resume(
+                    continuation.resumeWith(Result.success(
                         DnsQueryResult(
                             success = false,
                             responseIp = null,
                             responseTime = 0,
                             error = "HTTP ${response.code}"
                         )
-                    ) {}
+                    ))
                 }
             }
         } catch (e: IOException) {
-            continuation.resume(
+            continuation.resumeWith(Result.success(
                 DnsQueryResult(
                     success = false,
                     responseIp = null,
                     responseTime = 0,
                     error = e.message
                 )
-            ) {}
+            ))
         }
     }
 

@@ -137,31 +137,30 @@ class DomainFilter(private val context: Context) {
      */
     suspend fun checkAndUpdate(): Boolean = withContext(Dispatchers.IO) {
         if (_isLoading.value) return@withContext false
-        
+
         try {
-            var updated = false
-            
+            val updatedLists = mutableListOf<FilterList>()
+
             filterListsToLoad.forEach { filterList ->
                 val needsUpdate = cacheManager.needsUpdate(filterList)
                 val hasCache = cacheManager.hasCache(filterList)
-                
+
                 if (!hasCache || needsUpdate) {
-                    // 后台更新：先下载，成功后替换内存中的数据
+                    // 后台更新：先下载
                     val count = downloadFilterList(filterList)
                     if (count != null) {
-                        // 重新加载这个列表到内存
-                        val cachedDomains = cacheManager.loadBlocklist(filterList)
-                        if (cachedDomains != null) {
-                            // 清除旧数据并重新加载所有列表
-                            reloadAllFromCache()
-                            updated = true
-                        }
+                        updatedLists.add(filterList)
                     }
                 }
             }
-            
+
+            // 只在有列表更新时才重新加载所有列表（只加载一次）
+            if (updatedLists.isNotEmpty()) {
+                reloadAllFromCache()
+            }
+
             _filterListCount.value = blockedDomains.size + blockedPatterns.size
-            updated
+            updatedLists.isNotEmpty()
         } catch (e: Exception) {
             Log.e(TAG, "Error checking for updates", e)
             false
@@ -262,20 +261,39 @@ class DomainFilter(private val context: Context) {
      * 从缓存重新加载所有列表
      */
     private suspend fun reloadAllFromCache() = withContext(Dispatchers.IO) {
-        synchronized(this@DomainFilter) {
-            okCache.clear()
-            blockedCache.clear()
+        // 预计算总大小以避免 rehash
+        var totalDomains = 0
+        filterListsToLoad.forEach { filterList ->
+            cacheManager.loadBlocklist(filterList)?.let { totalDomains += it.size }
         }
-        blockedDomains.clear()
-        blockedPatterns.clear()
-        
+
+        // 使用预分配容量创建新集合
+        val newBlockedDomains = HashSet<String>(totalDomains.coerceAtLeast(1000))
+        val newBlockedPatterns = mutableListOf<Regex>()
+
         filterListsToLoad.forEach { filterList ->
             val cachedDomains = cacheManager.loadBlocklist(filterList)
             if (cachedDomains != null) {
-                addDomainsToBlocklist(cachedDomains)
+                cachedDomains.forEach { domain ->
+                    if (domain.contains("*")) {
+                        newBlockedPatterns.add(createPattern(domain))
+                    } else {
+                        newBlockedDomains.add(domain)
+                    }
+                }
             }
         }
-        
+
+        // 原子性替换集合内容
+        synchronized(this@DomainFilter) {
+            okCache.clear()
+            blockedCache.clear()
+            blockedDomains.clear()
+            blockedPatterns.clear()
+            blockedDomains.addAll(newBlockedDomains)
+            blockedPatterns.addAll(newBlockedPatterns)
+        }
+
         _filterListCount.value = blockedDomains.size + blockedPatterns.size
         _isLoaded.value = blockedDomains.isNotEmpty() || blockedPatterns.isNotEmpty()
     }

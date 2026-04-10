@@ -143,16 +143,16 @@ class DnsVpnService : VpnService() {
         isServiceRunning = false
         vpnInterface?.close()
         vpnInterface = null
-        
-        // 刷新统计信息到磁盘
-        runBlocking {
+
+        // 刷新统计信息到磁盘（异步，不阻塞主线程）
+        scope.launch {
             try {
                 statisticsBuffer?.flush()
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to flush statistics", e)
             }
         }
-        
+
         scope.cancel()
         dnsQueryExecutor?.shutdown()
         stopForeground(STOP_FOREGROUND_REMOVE)
