@@ -5,10 +5,8 @@ import com.deatrg.dnsfilter.data.local.PreferencesManager
 import com.deatrg.dnsfilter.data.local.StatisticsBuffer
 import com.deatrg.dnsfilter.data.remote.DomainFilter
 import com.deatrg.dnsfilter.data.remote.DnsQueryExecutor
-import com.deatrg.dnsfilter.data.repository.DnsLogRepositoryImpl
 import com.deatrg.dnsfilter.data.repository.DnsServerRepositoryImpl
 import com.deatrg.dnsfilter.data.repository.FilterListRepositoryImpl
-import com.deatrg.dnsfilter.domain.repository.DnsLogRepository
 import com.deatrg.dnsfilter.domain.repository.DnsServerRepository
 import com.deatrg.dnsfilter.domain.repository.FilterListRepository
 import kotlinx.coroutines.CoroutineScope
@@ -89,9 +87,5 @@ object ServiceLocator {
 
     fun provideFilterListRepository(): FilterListRepositoryImpl {
         return FilterListRepositoryImpl(providePreferencesManager(), provideDomainFilter())
-    }
-
-    fun provideDnsLogRepository(): DnsLogRepository {
-        return DnsLogRepositoryImpl(providePreferencesManager())
     }
 }

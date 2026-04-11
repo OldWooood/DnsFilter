@@ -40,21 +40,33 @@ class DashboardViewModel(
     private val _isVpnProcessing = MutableStateFlow(false)
     val isVpnProcessing: StateFlow<Boolean> = _isVpnProcessing.asStateFlow()
 
+    // 显示无 DNS 服务器错误的 snackbar
+    private val _showNoDnsServersError = MutableSharedFlow<Unit>()
+    val showNoDnsServersError: SharedFlow<Unit> = _showNoDnsServersError.asSharedFlow()
+
+    // 是否暂停轮询（应用在后台时暂停，省电）
+    private val _isPaused = MutableStateFlow(false)
+    val isPaused: StateFlow<Boolean> = _isPaused.asStateFlow()
+
     // Blocklist 状态
     val isFilterLoaded = domainFilter.isLoaded
     val isFilterLoading = domainFilter.isLoading
     val filterListCount = domainFilter.filterListCount
     val downloadProgress = domainFilter.downloadProgress
+    val enabledDnsServerCount = filterListRepository.enabledDnsServerCount
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
 
     // 使用内存缓冲的统计信息
     val statistics: StateFlow<DnsStatistics> = statisticsBuffer.statistics
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), DnsStatistics())
 
     init {
-        // 定期检查VPN实际运行状态并同步到UI
+        // 定期检查VPN实际运行状态并同步到UI（暂停时不轮询，省电）
         viewModelScope.launch {
             while (true) {
-                updateVpnRunningState()
+                if (!_isPaused.value) {
+                    updateVpnRunningState()
+                }
                 delay(POLL_INTERVAL_MS)
             }
         }
@@ -93,7 +105,14 @@ class DashboardViewModel(
             
             try {
                 if (targetEnabled) {
-                    // 1. 确保 blocklist 已加载（从缓存或下载）
+                    // 1. 检查是否有启用的 DNS 服务器（直接从 preferences 读取当前值）
+                    val enabledCount = preferencesManager.dnsServers.first().count { it.isEnabled }
+                    if (enabledCount == 0) {
+                        _showNoDnsServersError.emit(Unit)
+                        return@launch
+                    }
+
+                    // 2. 确保 blocklist 已加载（从缓存或下载）
                     val hasData = ensureFilterListsLoaded()
                     
                     if (!hasData) {
@@ -184,6 +203,20 @@ class DashboardViewModel(
 
     fun requestVpnPermission(): Intent? {
         return VpnService.prepare(context)
+    }
+
+    /**
+     * 暂停轮询（应用进入后台时调用）
+     */
+    fun pause() {
+        _isPaused.value = true
+    }
+
+    /**
+     * 恢复轮询（应用回到前台时调用）
+     */
+    fun resume() {
+        _isPaused.value = false
     }
 
     override fun onCleared() {

@@ -169,22 +169,23 @@ class DomainFilter(private val context: Context) {
 
     /**
      * 手动触发加载（用于首次启动时下载）
+     * @param forceReload 是否强制重新下载（忽略 24 小时缓存检查）
      * 返回 true 表示可以开始拦截（有数据或空列表都视为成功）
      */
-    suspend fun loadFilterLists(): Boolean = withContext(Dispatchers.IO) {
+    suspend fun loadFilterLists(forceReload: Boolean = false): Boolean = withContext(Dispatchers.IO) {
         if (_isLoading.value) return@withContext _isLoaded.value
-        
+
         // 如果没有需要加载的列表，直接返回 true（空 blocklist 是合法状态）
         if (filterListsToLoad.isEmpty()) {
             _isLoaded.value = true
             Log.d(TAG, "No filter lists to load, returning success with empty blocklist")
             return@withContext true
         }
-        
+
         _isLoading.value = true
         _downloadProgress.value = Pair(0, filterListsToLoad.size)
         val downloadedCount = AtomicInteger(0)
-        
+
         try {
             // 清除旧数据
             synchronized(this@DomainFilter) {
@@ -193,14 +194,14 @@ class DomainFilter(private val context: Context) {
             }
             blockedDomains.clear()
             blockedPatterns.clear()
-            
+
             var loadedCount = 0
-            
+
             filterListsToLoad.forEach { filterList ->
                 val hasCache = cacheManager.hasCache(filterList)
-                
-                val domains = if (hasCache && !cacheManager.needsUpdate(filterList)) {
-                    // 使用缓存
+
+                val domains = if (hasCache && !forceReload && !cacheManager.needsUpdate(filterList)) {
+                    // 使用缓存（除非强制刷新）
                     cacheManager.loadBlocklist(filterList)
                 } else {
                     // 需要下载
@@ -218,19 +219,19 @@ class DomainFilter(private val context: Context) {
                         }
                     }
                 }
-                
+
                 domains?.let { addDomainsToBlocklist(it) }
                 downloadedCount.incrementAndGet()
                 _downloadProgress.value = Pair(downloadedCount.get(), filterListsToLoad.size)
             }
-            
+
             _filterListCount.value = blockedDomains.size + blockedPatterns.size
-            
+
             // 只要有至少一个列表加载成功，或所有列表都有旧缓存，就视为成功
             // 允许部分列表失败，但至少要有一个列表的缓存
             val hasAnyData = blockedDomains.isNotEmpty() || blockedPatterns.isNotEmpty()
             _isLoaded.value = hasAnyData
-            
+
             Log.d(TAG, "loadFilterLists completed: ${blockedDomains.size} domains, loaded=$loadedCount/${filterListsToLoad.size}")
             hasAnyData
         } finally {
@@ -260,7 +261,7 @@ class DomainFilter(private val context: Context) {
     /**
      * 从缓存重新加载所有列表
      */
-    private suspend fun reloadAllFromCache() = withContext(Dispatchers.IO) {
+    suspend fun reloadAllFromCache() = withContext(Dispatchers.IO) {
         // 预计算总大小以避免 rehash
         var totalDomains = 0
         filterListsToLoad.forEach { filterList ->
@@ -379,6 +380,13 @@ class DomainFilter(private val context: Context) {
         }
 
         return BlockResult(false, null)
+    }
+
+    /**
+     * 获取指定过滤列表的最后更新时间
+     */
+    fun getFilterLastUpdated(filterList: FilterList): Long? {
+        return cacheManager.getLastUpdated(filterList.url)
     }
 
     fun shutdown() {

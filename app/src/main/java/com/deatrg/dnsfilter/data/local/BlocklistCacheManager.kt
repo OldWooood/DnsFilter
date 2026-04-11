@@ -109,6 +109,13 @@ class BlocklistCacheManager(private val context: Context) {
     }
 
     /**
+     * 获取指定 URL 的最后更新时间
+     */
+    fun getLastUpdated(url: String): Long? {
+        return getMeta(url)?.lastUpdated
+    }
+
+    /**
      * 清除指定 blocklist 的缓存
      */
     suspend fun clearCache(filterList: FilterList) = withContext(Dispatchers.IO) {

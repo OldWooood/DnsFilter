@@ -10,7 +10,6 @@ import com.deatrg.dnsfilter.ServiceLocator
 import com.deatrg.dnsfilter.data.local.StatisticsBuffer
 import com.deatrg.dnsfilter.data.remote.DomainFilter
 import com.deatrg.dnsfilter.data.remote.DnsQueryExecutor
-import com.deatrg.dnsfilter.domain.model.DnsQuery
 import com.deatrg.dnsfilter.domain.model.DnsServer
 import com.deatrg.dnsfilter.domain.model.DnsServerType
 import kotlinx.coroutines.*
@@ -364,16 +363,6 @@ class DnsVpnService : VpnService() {
             
             // Record blocked query log
             val responseTime = System.currentTimeMillis() - startTime
-            val query = DnsQuery(
-                domain = question.domain,
-                timestamp = System.currentTimeMillis(),
-                isBlocked = true,
-                matchedFilter = blockResult.reason,
-                responseIp = null,
-                responseTime = responseTime
-            )
-            DnsQueryLogger.addQuery(query)
-            
             // Update statistics（使用内存缓冲，无磁盘 I/O）
             statisticsBuffer?.recordQuery(blocked = true, responseTime = responseTime)
             
@@ -392,18 +381,7 @@ class DnsVpnService : VpnService() {
 
         if (result?.success == true && result.responseIp != null) {
             Log.d(TAG, "DNS response: ${question.domain} -> ${result.responseIp} (${result.responseTime}ms)")
-            
-            // Record allowed query log
-            val query = DnsQuery(
-                domain = question.domain,
-                timestamp = System.currentTimeMillis(),
-                isBlocked = false,
-                matchedFilter = null,
-                responseIp = result.responseIp,
-                responseTime = responseTime
-            )
-            DnsQueryLogger.addQuery(query)
-            
+
             // Update statistics（使用内存缓冲，无磁盘 I/O）
             statisticsBuffer?.recordQuery(blocked = false, responseTime = responseTime)
             

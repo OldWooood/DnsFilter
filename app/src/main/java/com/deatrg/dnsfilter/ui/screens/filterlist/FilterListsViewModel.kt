@@ -10,11 +10,20 @@ import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import java.util.UUID
 
+data class FilterListUiModel(
+    val filterList: FilterList,
+    val lastUpdated: Long?
+)
+
 class FilterListsViewModel(
     private val repository: FilterListRepository
 ) : ViewModel() {
 
     val filterLists: StateFlow<List<FilterList>> = repository.filterLists
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val filterListsUi: StateFlow<List<FilterListUiModel>> = repository.filterLists
+        .map { lists -> lists.map { FilterListUiModel(it, repository.getFilterLastUpdated(it)) } }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val filterCount: StateFlow<Int> = repository.filterListCount

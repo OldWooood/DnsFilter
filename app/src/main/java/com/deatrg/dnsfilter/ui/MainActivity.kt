@@ -20,7 +20,6 @@ import com.deatrg.dnsfilter.ui.navigation.Screen
 import com.deatrg.dnsfilter.ui.screens.dashboard.DashboardScreen
 import com.deatrg.dnsfilter.ui.screens.dnsserver.DnsServersScreen
 import com.deatrg.dnsfilter.ui.screens.filterlist.FilterListsScreen
-import com.deatrg.dnsfilter.ui.screens.logs.LogsScreen
 import com.deatrg.dnsfilter.ui.theme.DnsFilterTheme
 
 class MainActivity : ComponentActivity() {
@@ -49,8 +48,7 @@ private fun MainScreen() {
                 val screens = listOf(
                     Screen.Dashboard,
                     Screen.DnsServers,
-                    Screen.FilterLists,
-                    Screen.Logs
+                    Screen.FilterLists
                 )
                 screens.forEach { screen ->
                     NavigationBarItem(
@@ -84,9 +82,6 @@ private fun MainScreen() {
             }
             composable(Screen.FilterLists.route) {
                 FilterListsScreen()
-            }
-            composable(Screen.Logs.route) {
-                LogsScreen()
             }
         }
     }

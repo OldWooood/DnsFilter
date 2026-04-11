@@ -15,12 +15,14 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.deatrg.dnsfilter.domain.model.FilterList
+import java.text.SimpleDateFormat
+import java.util.*
 
 @Composable
 fun FilterListsScreen(
     viewModel: FilterListsViewModel = viewModel(factory = FilterListsViewModel.Factory())
 ) {
-    val filterLists by viewModel.filterLists.collectAsStateWithLifecycle(initialValue = emptyList())
+    val filterLists by viewModel.filterListsUi.collectAsStateWithLifecycle(initialValue = emptyList())
     val filterCount by viewModel.filterCount.collectAsStateWithLifecycle(initialValue = 0)
     val isLoaded by viewModel.isLoaded.collectAsStateWithLifecycle(initialValue = false)
     var showAddDialog by remember { mutableStateOf(false) }
@@ -28,19 +30,10 @@ fun FilterListsScreen(
 
     Scaffold(
         floatingActionButton = {
-            Column {
-                SmallFloatingActionButton(
-                    onClick = { viewModel.refreshLists() },
-                    containerColor = MaterialTheme.colorScheme.secondaryContainer
-                ) {
-                    Icon(Icons.Default.Refresh, contentDescription = "Refresh Lists")
-                }
-                Spacer(modifier = Modifier.height(8.dp))
-                FloatingActionButton(
-                    onClick = { showAddDialog = true }
-                ) {
-                    Icon(Icons.Default.Add, contentDescription = "Add Filter List")
-                }
+            FloatingActionButton(
+                onClick = { showAddDialog = true }
+            ) {
+                Icon(Icons.Default.Add, contentDescription = "Add Filter List")
             }
         }
     ) { padding ->
@@ -61,11 +54,11 @@ fun FilterListsScreen(
                 modifier = Modifier.weight(1f),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                items(filterLists, key = { it.id }) { filterList ->
+                items(filterLists, key = { it.filterList.id }) { item ->
                     FilterListCard(
-                        filterList = filterList,
-                        onToggle = { viewModel.toggleFilterList(filterList) },
-                        onDelete = { filterListToDelete = filterList }
+                        item = item,
+                        onToggle = { viewModel.toggleFilterList(item.filterList) },
+                        onDelete = { filterListToDelete = item.filterList }
                     )
                 }
 
@@ -170,10 +163,13 @@ private fun HeaderSection(
 
 @Composable
 private fun FilterListCard(
-    filterList: FilterList,
+    item: FilterListUiModel,
     onToggle: () -> Unit,
     onDelete: () -> Unit
 ) {
+    val dateFormat = remember { SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.getDefault()) }
+    val filterList = item.filterList
+
     Card(modifier = Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier
@@ -205,10 +201,18 @@ private fun FilterListCard(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
+                if (item.lastUpdated != null) {
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = "Updated: ${dateFormat.format(Date(item.lastUpdated))}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                    )
+                }
             }
             IconButton(onClick = onToggle) {
                 Icon(
-                    imageVector = if (filterList.isEnabled) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                    imageVector = Icons.Default.Shield,
                     contentDescription = if (filterList.isEnabled) "Enabled" else "Disabled",
                     tint = if (filterList.isEnabled)
                         MaterialTheme.colorScheme.primary

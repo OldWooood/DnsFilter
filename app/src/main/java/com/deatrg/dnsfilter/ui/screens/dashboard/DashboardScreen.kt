@@ -7,6 +7,9 @@ import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -26,6 +29,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.deatrg.dnsfilter.domain.model.DnsStatistics
@@ -41,6 +47,7 @@ fun DashboardScreen(
     val isFilterLoaded by viewModel.isFilterLoaded.collectAsStateWithLifecycle(initialValue = false)
     val isFilterLoading by viewModel.isFilterLoading.collectAsStateWithLifecycle(initialValue = false)
     val downloadProgress by viewModel.downloadProgress.collectAsStateWithLifecycle(initialValue = null)
+    val snackbarHostState = remember { SnackbarHostState() }
 
     val vpnPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
@@ -50,7 +57,29 @@ fun DashboardScreen(
         }
     }
 
-    fun onVpnToggle(enabled: Boolean) {
+    LaunchedEffect(Unit) {
+        viewModel.showNoDnsServersError.collect {
+            snackbarHostState.showSnackbar("Please enable at least one DNS server")
+        }
+    }
+
+    // 监听生命周期，后台时暂停轮询
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> viewModel.resume()
+                Lifecycle.Event.ON_PAUSE -> viewModel.pause()
+                else -> {}
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
+    val onVpnToggle: (Boolean) -> Unit = { enabled ->
         if (enabled) {
             val permissionIntent = viewModel.requestVpnPermission()
             if (permissionIntent != null) {
@@ -63,35 +92,40 @@ fun DashboardScreen(
         }
     }
 
-    LazyColumn(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background),
-        contentPadding = PaddingValues(horizontal = 20.dp, vertical = 24.dp),
-        verticalArrangement = Arrangement.spacedBy(20.dp)
-    ) {
-        item {
-            Text(
-                text = "Dashboard",
-                style = MaterialTheme.typography.headlineLarge,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onBackground
-            )
-        }
+    Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) }
+    ) { innerPadding ->
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colorScheme.background)
+                .padding(innerPadding),
+            contentPadding = PaddingValues(horizontal = 20.dp, vertical = 24.dp),
+            verticalArrangement = Arrangement.spacedBy(20.dp)
+        ) {
+            item {
+                Text(
+                    text = "Dashboard",
+                    style = MaterialTheme.typography.headlineLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onBackground
+                )
+            }
 
-        item {
-            StatusCard(
-                isRunning = isVpnActuallyRunning,
-                isProcessing = isVpnProcessing,
-                isFilterLoading = isFilterLoading,
-                downloadProgress = downloadProgress,
-                filterCount = filterCount,
-                onToggle = { onVpnToggle(it) }
-            )
-        }
+            item {
+                StatusCard(
+                    isRunning = isVpnActuallyRunning,
+                    isProcessing = isVpnProcessing,
+                    isFilterLoading = isFilterLoading,
+                    downloadProgress = downloadProgress,
+                    filterCount = filterCount,
+                    onToggle = { onVpnToggle(it) }
+                )
+            }
 
-        item {
-            StatisticsSection(statistics = statistics)
+            item {
+                StatisticsSection(statistics = statistics)
+            }
         }
     }
 }
