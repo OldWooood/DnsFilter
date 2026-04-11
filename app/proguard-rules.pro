@@ -1,3 +1,9 @@
+# Remove Log.d/v in release (no side effects, R8 removes as dead code)
+-assumenosideeffects class android.util.Log {
+    public static int d(...);
+    public static int v(...);
+}
+
 # Add project specific ProGuard rules here.
 
 # Keep Application class (referenced in manifest)
