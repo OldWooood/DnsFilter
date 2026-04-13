@@ -26,6 +26,9 @@ class BlocklistUpdateWorker(
         return try {
             val repository = ServiceLocator.provideFilterListRepository()
 
+            // 先加载本地保存的 filter 列表到 DomainFilter，否则 filterListsToLoad 为空
+            repository.loadFilterLists()
+
             // 检查并更新过期的 blocklist
             repository.checkAndUpdate()
 
