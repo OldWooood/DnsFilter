@@ -29,18 +29,20 @@ class BlocklistUpdateScheduler(private val context: Context) {
             .build()
 
         // 创建每日重复的工作请求
+        // flex 设为 15 分钟，使执行窗口更贴近目标时间
         val dailyUpdateRequest = PeriodicWorkRequestBuilder<BlocklistUpdateWorker>(
-            UPDATE_INTERVAL_HOURS, TimeUnit.HOURS
+            UPDATE_INTERVAL_HOURS, TimeUnit.HOURS,
+            15, TimeUnit.MINUTES
         )
             .setConstraints(constraints)
             .setInitialDelay(calculateInitialDelay(), TimeUnit.MILLISECONDS)
             .addTag(BlocklistUpdateWorker.WORK_NAME)
             .build()
 
-        // 将工作加入队列，使用 REPLACE 策略确保只有一个更新任务
+        // 使用 UPDATE 策略替换旧任务，确保代码修复后能生效
         WorkManager.getInstance(context).enqueueUniquePeriodicWork(
             BlocklistUpdateWorker.WORK_NAME,
-            ExistingPeriodicWorkPolicy.KEEP,
+            ExistingPeriodicWorkPolicy.UPDATE,
             dailyUpdateRequest
         )
 
@@ -73,20 +75,20 @@ class BlocklistUpdateScheduler(private val context: Context) {
     }
 
     /**
-     * 计算初始延迟，使更新任务在凌晨 4 点执行
-     * 如果当前时间在 4 点之前，则在今天 4 点执行
-     * 否则在明天 4 点执行
+     * 计算初始延迟，使更新任务在当地时间 12:00 执行
+     * 如果当前时间在 12:00 之前，则在今天 12:00 执行
+     * 否则在明天 12:00 执行
      */
     private fun calculateInitialDelay(): Long {
         val calendar = java.util.Calendar.getInstance()
         val now = calendar.timeInMillis
 
-        calendar.set(java.util.Calendar.HOUR_OF_DAY, 4)
+        calendar.set(java.util.Calendar.HOUR_OF_DAY, 12)
         calendar.set(java.util.Calendar.MINUTE, 0)
         calendar.set(java.util.Calendar.SECOND, 0)
         calendar.set(java.util.Calendar.MILLISECOND, 0)
 
-        // 如果已过 4 点，安排到明天
+        // 如果已过 12:00，安排到明天
         if (now >= calendar.timeInMillis) {
             calendar.add(java.util.Calendar.DAY_OF_YEAR, 1)
         }
