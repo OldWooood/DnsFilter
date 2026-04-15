@@ -9,7 +9,10 @@ import com.deatrg.dnsfilter.ServiceLocator
 /**
  * Blocklist 后台更新 Worker
  * 使用 WorkManager 实现每天自动更新
+ *
+ * @deprecated 已改用 AlarmManager + BroadcastReceiver 实现，避免国产 OEM 杀死 WorkManager 任务
  */
+@Deprecated("已改用 AlarmManager 实现")
 class BlocklistUpdateWorker(
     context: Context,
     params: WorkerParameters

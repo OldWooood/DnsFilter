@@ -1,7 +1,9 @@
 package com.deatrg.dnsfilter
 
 import android.app.Application
-import com.deatrg.dnsfilter.data.worker.BlocklistUpdateScheduler
+import androidx.work.WorkManager
+import com.deatrg.dnsfilter.data.worker.BlocklistUpdateAlarmScheduler
+import com.deatrg.dnsfilter.data.worker.BlocklistUpdateWorker
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -22,8 +24,11 @@ class DnsFilterApplication : Application() {
             prefs.ensureDefaultFilterListsInitialized()
         }
 
-        // 调度每天自动更新 blocklist
-        val scheduler = BlocklistUpdateScheduler(this)
+        // 取消遗留的 WorkManager 任务，避免干扰
+        WorkManager.getInstance(this).cancelUniqueWork(BlocklistUpdateWorker.WORK_NAME)
+
+        // 使用 AlarmManager 调度每天自动更新 blocklist（比 WorkManager 更可靠）
+        val scheduler = BlocklistUpdateAlarmScheduler(this)
         scheduler.scheduleDailyUpdate()
     }
 }

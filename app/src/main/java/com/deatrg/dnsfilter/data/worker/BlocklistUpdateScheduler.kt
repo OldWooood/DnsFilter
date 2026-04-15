@@ -8,7 +8,10 @@ import java.util.concurrent.TimeUnit
 /**
  * Blocklist 更新调度器
  * 负责安排每天自动更新 blocklist 的 WorkManager 任务
+ *
+ * @deprecated 已改用 [BlocklistUpdateAlarmScheduler] 实现
  */
+@Deprecated("已改用 AlarmManager 实现，请使用 BlocklistUpdateAlarmScheduler")
 class BlocklistUpdateScheduler(private val context: Context) {
 
     companion object {
