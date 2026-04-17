@@ -115,6 +115,11 @@ class DnsVpnService : VpnService() {
             .setMtu(3000)
             .setBlocking(true)
 
+        // Android Q+ 默认将VPN视为计费网络，设置为false让系统从底层网络继承计费状态
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            builder.setMetered(false)
+        }
+
         // Exclude ourselves from VPN to avoid routing loops
         try {
             builder.addDisallowedApplication(packageName)
