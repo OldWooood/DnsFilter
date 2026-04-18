@@ -73,7 +73,8 @@ class DnsQueryExecutor(
                 success = true,
                 responseIp = cachedIp,
                 responseTime = 0,
-                error = null
+                error = null,
+                fromCache = true
             )
         }
 
@@ -114,7 +115,8 @@ class DnsQueryExecutor(
                         success = true,
                         responseIp = result.first.responseIp,
                         responseTime = result.second,
-                        error = null
+                        error = null,
+                        fromCache = false
                     )
                 } else if (firstError == null) {
                     firstError = result.first.error
@@ -429,5 +431,6 @@ data class DnsQueryResult(
     val success: Boolean,
     val responseIp: String?,
     val responseTime: Long,
-    val error: String?
+    val error: String?,
+    val fromCache: Boolean = false
 )

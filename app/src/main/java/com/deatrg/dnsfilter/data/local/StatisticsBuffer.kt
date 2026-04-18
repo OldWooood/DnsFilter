@@ -37,6 +37,8 @@ class StatisticsBuffer(
             _totalQueries.set(stats.totalQueries)
             _blockedQueries.set(stats.blockedQueries)
             _allowedQueries.set(stats.allowedQueries)
+            // 用旧数据反推总响应时间和计数，保持数据连续性
+            // 旧口径下所有查询都计入了平均，这里做近似恢复即可
             _totalResponseTime.set(stats.totalQueries * stats.averageResponseTime)
             _queryCount.set(stats.totalQueries)
             updateFlow()
@@ -46,15 +48,17 @@ class StatisticsBuffer(
     /**
      * 记录一次查询（内存操作，无磁盘 I/O）
      */
-    fun recordQuery(blocked: Boolean, responseTime: Long) {
+    fun recordQuery(blocked: Boolean, responseTime: Long, includeInAvg: Boolean = true) {
         _totalQueries.incrementAndGet()
         if (blocked) {
             _blockedQueries.incrementAndGet()
         } else {
             _allowedQueries.incrementAndGet()
         }
-        _totalResponseTime.addAndGet(responseTime)
-        _queryCount.incrementAndGet()
+        if (includeInAvg) {
+            _totalResponseTime.addAndGet(responseTime)
+            _queryCount.incrementAndGet()
+        }
 
         updateFlow()
 

@@ -366,10 +366,8 @@ class DnsVpnService : VpnService() {
         if (blockResult?.isBlocked == true) {
             Log.d(TAG, "Domain ${question.domain} is blocked: ${blockResult.reason}")
             
-            // Record blocked query log
-            val responseTime = System.currentTimeMillis() - startTime
-            // Update statistics（使用内存缓冲，无磁盘 I/O）
-            statisticsBuffer?.recordQuery(blocked = true, responseTime = responseTime)
+            // Update statistics（被拦截的请求不计入平均响应时间）
+            statisticsBuffer?.recordQuery(blocked = true, responseTime = 0, includeInAvg = false)
             
             return buildBlockedDnsResponse(dnsPayload)
         }
@@ -382,13 +380,14 @@ class DnsVpnService : VpnService() {
 
         // Forward to upstream DNS
         val result = dnsQueryExecutor?.query(question.domain, servers, question.qtype)
-        val responseTime = System.currentTimeMillis() - startTime
 
         if (result?.success == true && result.responseIp != null) {
             Log.d(TAG, "DNS response: ${question.domain} -> ${result.responseIp} (${result.responseTime}ms)")
 
-            // Update statistics（使用内存缓冲，无磁盘 I/O）
-            statisticsBuffer?.recordQuery(blocked = false, responseTime = responseTime)
+            // 只有真实发送的上游请求才计入平均响应时间，缓存命中不计入
+            val includeInAvg = !result.fromCache
+            val recordedTime = if (result.fromCache) 0 else result.responseTime
+            statisticsBuffer?.recordQuery(blocked = false, responseTime = recordedTime, includeInAvg = includeInAvg)
             
             return buildDnsResponse(dnsPayload, question.qtype, result.responseIp)
         }
