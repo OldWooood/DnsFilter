@@ -35,6 +35,8 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.deatrg.dnsfilter.domain.model.DnsStatistics
+import java.text.SimpleDateFormat
+import java.util.*
 
 @Composable
 fun DashboardScreen(
@@ -100,16 +102,11 @@ fun DashboardScreen(
                 .fillMaxSize()
                 .background(MaterialTheme.colorScheme.background)
                 .padding(innerPadding),
-            contentPadding = PaddingValues(horizontal = 20.dp, vertical = 24.dp),
-            verticalArrangement = Arrangement.spacedBy(20.dp)
+            contentPadding = PaddingValues(horizontal = 20.dp, vertical = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             item {
-                Text(
-                    text = "Dashboard",
-                    style = MaterialTheme.typography.headlineLarge,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onBackground
-                )
+                HeaderSection()
             }
 
             item {
@@ -131,6 +128,26 @@ fun DashboardScreen(
 }
 
 @Composable
+private fun HeaderSection() {
+    val dateFormat = remember { SimpleDateFormat("EEEE, MMM d", Locale.getDefault()) }
+    val today = remember { dateFormat.format(Date()) }
+
+    Column {
+        Text(
+            text = today,
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            text = "Dashboard",
+            style = MaterialTheme.typography.headlineMedium,
+            fontWeight = FontWeight.ExtraBold,
+            color = MaterialTheme.colorScheme.onBackground
+        )
+    }
+}
+
+@Composable
 private fun StatusCard(
     isRunning: Boolean,
     isProcessing: Boolean,
@@ -140,38 +157,61 @@ private fun StatusCard(
     onToggle: (Boolean) -> Unit
 ) {
     val cardShape = RoundedCornerShape(28.dp)
-    val gradientBrush = if (isRunning) {
-        Brush.linearGradient(
-            colors = listOf(
-                MaterialTheme.colorScheme.primary,
-                MaterialTheme.colorScheme.primaryContainer
-            )
-        )
-    } else {
-        Brush.linearGradient(
-            colors = listOf(
-                MaterialTheme.colorScheme.surfaceVariant,
-                MaterialTheme.colorScheme.surfaceVariant
-            )
-        )
-    }
+    val animSpec = tween<Color>(600, easing = FastOutSlowInEasing)
 
-    val contentColor = if (isRunning) {
-        MaterialTheme.colorScheme.onPrimary
-    } else {
-        MaterialTheme.colorScheme.onSurfaceVariant
-    }
+    // Animate background colors - running state uses deep indigo/violet gradient for white text readability
+    val bgColorStart by animateColorAsState(
+        targetValue = if (isRunning) Color(0xFF4F46E5) else MaterialTheme.colorScheme.surfaceVariant,
+        animationSpec = animSpec,
+        label = "bg_start"
+    )
+    val bgColorMid by animateColorAsState(
+        targetValue = if (isRunning) Color(0xFF4338CA) else MaterialTheme.colorScheme.surfaceVariant,
+        animationSpec = animSpec,
+        label = "bg_mid"
+    )
+    val bgColorEnd by animateColorAsState(
+        targetValue = if (isRunning) Color(0xFF3730A3) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.8f),
+        animationSpec = animSpec,
+        label = "bg_end"
+    )
+
+    // Animate content color
+    val contentColor by animateColorAsState(
+        targetValue = if (isRunning) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
+        animationSpec = animSpec,
+        label = "content_color"
+    )
+
+    // Animate icon background color
+    val iconBgColor by animateColorAsState(
+        targetValue = if (isRunning) contentColor.copy(alpha = 0.2f) else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.1f),
+        animationSpec = animSpec,
+        label = "icon_bg"
+    )
+
+    // Animate button container color
+    val btnContainerColor by animateColorAsState(
+        targetValue = if (isRunning) MaterialTheme.colorScheme.error.copy(alpha = 0.95f) else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.9f),
+        animationSpec = animSpec,
+        label = "btn_bg"
+    )
+
+    val gradientBrush = Brush.linearGradient(
+        colors = listOf(bgColorStart, bgColorMid, bgColorEnd)
+    )
 
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = cardShape,
-        colors = CardDefaults.cardColors(containerColor = Color.Transparent)
+        colors = CardDefaults.cardColors(containerColor = Color.Transparent),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
     ) {
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .background(gradientBrush)
-                .padding(24.dp)
+                .padding(20.dp)
         ) {
             Column(
                 modifier = Modifier.fillMaxWidth(),
@@ -184,34 +224,55 @@ private fun StatusCard(
                     label = "icon_scale"
                 )
 
+                val infiniteTransition = rememberInfiniteTransition(label = "pulse")
+                val pulseAlpha by infiniteTransition.animateFloat(
+                    initialValue = 0.12f,
+                    targetValue = 0.28f,
+                    animationSpec = infiniteFloatTween,
+                    label = "pulse_alpha"
+                )
+
                 Box(
-                    modifier = Modifier
-                        .size(80.dp)
-                        .scale(scale)
-                        .clip(CircleShape)
-                        .background(
-                            if (isRunning) contentColor.copy(alpha = 0.2f)
-                            else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.1f)
-                        ),
+                    modifier = Modifier.size(72.dp),
                     contentAlignment = Alignment.Center
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.Shield,
-                        contentDescription = null,
-                        modifier = Modifier.size(40.dp),
-                        tint = if (isRunning) contentColor else contentColor.copy(alpha = 0.5f)
-                    )
+                    // Glow ring
+                    if (isRunning) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .scale(scale)
+                                .clip(CircleShape)
+                                .background(contentColor.copy(alpha = pulseAlpha))
+                        )
+                    }
+                    // Icon background
+                    Box(
+                        modifier = Modifier
+                            .size(56.dp)
+                            .scale(scale)
+                            .clip(CircleShape)
+                            .background(iconBgColor),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Shield,
+                            contentDescription = null,
+                            modifier = Modifier.size(28.dp),
+                            tint = contentColor.copy(alpha = if (isRunning) 1f else 0.6f)
+                        )
+                    }
                 }
 
-                Spacer(modifier = Modifier.height(16.dp))
+                Spacer(modifier = Modifier.height(12.dp))
 
                 // Status Text
                 val progressText = downloadProgress?.let { (current, total) ->
                     if (total > 0) " ($current/$total)" else ""
                 } ?: ""
-                
+
                 val hasNoFilters = filterCount == 0 && !isFilterLoading
-                
+
                 val statusText = when {
                     isProcessing && isFilterLoading && filterCount == 0 -> "Downloading blocklist$progressText..."
                     isProcessing && isRunning -> "Stopping..."
@@ -222,7 +283,7 @@ private fun StatusCard(
 
                 Text(
                     text = statusText,
-                    style = MaterialTheme.typography.headlineSmall,
+                    style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.SemiBold,
                     color = contentColor
                 )
@@ -234,10 +295,10 @@ private fun StatusCard(
                         hasNoFilters -> "Tap to enable protection (no blocklist configured)"
                         else -> "Tap to enable protection"
                     },
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = contentColor.copy(alpha = 0.8f)
+                    style = MaterialTheme.typography.bodySmall,
+                    color = contentColor.copy(alpha = 0.85f)
                 )
-                
+
                 // 显示下载进度条
                 if (isFilterLoading && downloadProgress != null && filterCount == 0) {
                     Spacer(modifier = Modifier.height(12.dp))
@@ -245,33 +306,38 @@ private fun StatusCard(
                     if (total > 0) {
                         LinearProgressIndicator(
                             progress = { current.toFloat() / total.toFloat() },
-                            modifier = Modifier.fillMaxWidth(),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(4.dp)),
+                            color = contentColor,
+                            trackColor = contentColor.copy(alpha = 0.25f)
                         )
                     } else {
-                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        LinearProgressIndicator(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(4.dp)),
+                            color = contentColor,
+                            trackColor = contentColor.copy(alpha = 0.25f)
+                        )
                     }
                 }
 
-                Spacer(modifier = Modifier.height(20.dp))
+                Spacer(modifier = Modifier.height(16.dp))
 
                 // Toggle Button
                 Button(
                     onClick = { onToggle(!isRunning) },
                     enabled = !isProcessing || isFilterLoading,
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = if (isRunning) {
-                            MaterialTheme.colorScheme.error
-                        } else {
-                            MaterialTheme.colorScheme.onSurfaceVariant
-                        },
-                        contentColor = if (isRunning) {
-                            MaterialTheme.colorScheme.onError
-                        } else {
-                            MaterialTheme.colorScheme.surface
-                        }
+                        containerColor = btnContainerColor,
+                        contentColor = if (isRunning) MaterialTheme.colorScheme.onError else MaterialTheme.colorScheme.surface
                     ),
                     shape = RoundedCornerShape(16.dp),
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(44.dp),
+                    elevation = ButtonDefaults.buttonElevation(defaultElevation = 0.dp)
                 ) {
                     Icon(
                         imageVector = if (isRunning) Icons.Default.Stop else Icons.Default.PlayArrow,
@@ -282,7 +348,7 @@ private fun StatusCard(
                     Text(
                         text = if (isRunning) "STOP" else "START",
                         style = MaterialTheme.typography.labelLarge,
-                        fontWeight = FontWeight.SemiBold
+                        fontWeight = FontWeight.Bold
                     )
                 }
             }
@@ -296,7 +362,7 @@ private fun StatisticsSection(statistics: DnsStatistics?) {
         Text(
             text = "Statistics",
             style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.SemiBold,
+            fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.onBackground
         )
 
@@ -309,39 +375,48 @@ private fun StatisticsSection(statistics: DnsStatistics?) {
                 ModernStatCard(
                     modifier = Modifier.weight(1f),
                     title = "Total",
-                    value = statistics?.totalQueries?.toString() ?: "0",
+                    value = formatLargeNumber(statistics?.totalQueries ?: 0),
                     icon = Icons.Outlined.QueryStats,
-                    containerColor = MaterialTheme.colorScheme.primaryContainer,
-                    contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                    containerColor = MaterialTheme.colorScheme.surfaceContainer,
+                    contentColor = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 ModernStatCard(
                     modifier = Modifier.weight(1f),
                     title = "Blocked",
-                    value = statistics?.blockedQueries?.toString() ?: "0",
+                    value = formatLargeNumber(statistics?.blockedQueries ?: 0),
                     icon = Icons.Outlined.Block,
-                    containerColor = MaterialTheme.colorScheme.errorContainer,
-                    contentColor = MaterialTheme.colorScheme.onErrorContainer
+                    containerColor = MaterialTheme.colorScheme.surfaceContainer,
+                    contentColor = MaterialTheme.colorScheme.error
                 )
             }
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                ModernStatCard(
+                // 拦截率卡片
+                val total = statistics?.totalQueries ?: 0
+                val blocked = statistics?.blockedQueries ?: 0
+                val blockRate = if (total > 0) {
+                    (blocked.toFloat() / total.toFloat() * 100f)
+                } else 0f
+                val blockRateText = String.format(Locale.getDefault(), "%.1f%%", blockRate)
+
+                BlockRateStatCard(
                     modifier = Modifier.weight(1f),
-                    title = "Allowed",
-                    value = statistics?.allowedQueries?.toString() ?: "0",
-                    icon = Icons.Outlined.CheckCircle,
-                    containerColor = MaterialTheme.colorScheme.tertiaryContainer,
-                    contentColor = MaterialTheme.colorScheme.onTertiaryContainer
+                    title = "拦截率",
+                    value = blockRateText,
+                    progress = blockRate / 100f,
+                    icon = Icons.Outlined.Security,
+                    containerColor = MaterialTheme.colorScheme.surfaceContainer,
+                    contentColor = MaterialTheme.colorScheme.tertiary
                 )
                 ModernStatCard(
                     modifier = Modifier.weight(1f),
                     title = "Avg Response",
                     value = "${statistics?.averageResponseTime ?: 0}ms",
                     icon = Icons.Outlined.Speed,
-                    containerColor = MaterialTheme.colorScheme.secondaryContainer,
-                    contentColor = MaterialTheme.colorScheme.onSecondaryContainer
+                    containerColor = MaterialTheme.colorScheme.surfaceContainer,
+                    contentColor = MaterialTheme.colorScheme.primary
                 )
             }
         }
@@ -362,31 +437,32 @@ private fun ModernStatCard(
     Card(
         modifier = modifier,
         shape = cardShape,
-        colors = CardDefaults.cardColors(containerColor = containerColor)
+        colors = CardDefaults.cardColors(containerColor = containerColor),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(16.dp),
+                .padding(14.dp),
             horizontalAlignment = Alignment.Start
         ) {
-            // Icon with background
+            // Icon with subtle background
             Box(
                 modifier = Modifier
-                    .size(40.dp)
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(contentColor.copy(alpha = 0.15f)),
+                    .size(36.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(contentColor.copy(alpha = 0.1f)),
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
                     imageVector = icon,
                     contentDescription = null,
-                    modifier = Modifier.size(24.dp),
+                    modifier = Modifier.size(20.dp),
                     tint = contentColor
                 )
             }
 
-            Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.height(10.dp))
 
             // Value with animation
             AnimatedContent(
@@ -399,19 +475,130 @@ private fun ModernStatCard(
             ) { targetValue ->
                 Text(
                     text = targetValue,
-                    style = MaterialTheme.typography.headlineMedium,
-                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.ExtraBold,
                     color = contentColor,
                     textAlign = TextAlign.Start
                 )
             }
 
+            Spacer(modifier = Modifier.height(2.dp))
+
             Text(
                 text = title,
                 style = MaterialTheme.typography.bodySmall,
+                fontWeight = FontWeight.Medium,
                 color = contentColor.copy(alpha = 0.7f)
             )
         }
     }
 }
 
+@Composable
+private fun BlockRateStatCard(
+    modifier: Modifier = Modifier,
+    title: String,
+    value: String,
+    progress: Float,
+    icon: ImageVector,
+    containerColor: Color,
+    contentColor: Color
+) {
+    val cardShape = RoundedCornerShape(20.dp)
+    val animatedProgress by animateFloatAsState(
+        targetValue = progress.coerceIn(0f, 1f),
+        animationSpec = tween(800, easing = FastOutSlowInEasing),
+        label = "progress_animation"
+    )
+
+    Card(
+        modifier = modifier,
+        shape = cardShape,
+        colors = CardDefaults.cardColors(containerColor = containerColor),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(14.dp)
+        ) {
+            Column(
+                horizontalAlignment = Alignment.Start
+            ) {
+                // Icon with subtle background
+                Box(
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(contentColor.copy(alpha = 0.1f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = icon,
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp),
+                        tint = contentColor
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // Value with animation
+                AnimatedContent(
+                    targetState = value,
+                    transitionSpec = {
+                        slideInVertically { it } + fadeIn() togetherWith
+                                slideOutVertically { -it } + fadeOut()
+                    },
+                    label = "value_animation"
+                ) { targetValue ->
+                    Text(
+                        text = targetValue,
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = contentColor,
+                        textAlign = TextAlign.Start
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(2.dp))
+
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.Medium,
+                    color = contentColor.copy(alpha = 0.7f)
+                )
+            }
+
+            // Circular progress indicator - top right
+            Box(
+                modifier = Modifier
+                    .size(40.dp)
+                    .align(Alignment.TopEnd),
+                contentAlignment = Alignment.Center
+            ) {
+                CircularProgressIndicator(
+                    progress = { animatedProgress },
+                    modifier = Modifier.fillMaxSize(),
+                    color = contentColor,
+                    trackColor = contentColor.copy(alpha = 0.12f),
+                    strokeWidth = 3.dp
+                )
+            }
+        }
+    }
+}
+
+private fun formatLargeNumber(number: Long): String {
+    return when {
+        number >= 1_000_000 -> String.format(Locale.getDefault(), "%.1fM", number / 1_000_000.0)
+        number >= 1_000 -> String.format(Locale.getDefault(), "%.1fK", number / 1_000.0)
+        else -> number.toString()
+    }
+}
+
+private val infiniteFloatTween = infiniteRepeatable<Float>(
+    animation = tween(1500, easing = FastOutSlowInEasing),
+    repeatMode = RepeatMode.Reverse
+)

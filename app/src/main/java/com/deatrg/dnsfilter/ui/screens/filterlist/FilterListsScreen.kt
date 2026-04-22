@@ -1,14 +1,19 @@
 package com.deatrg.dnsfilter.ui.screens.filterlist
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -31,7 +36,10 @@ fun FilterListsScreen(
     Scaffold(
         floatingActionButton = {
             FloatingActionButton(
-                onClick = { showAddDialog = true }
+                onClick = { showAddDialog = true },
+                shape = RoundedCornerShape(18.dp),
+                containerColor = MaterialTheme.colorScheme.primary,
+                contentColor = MaterialTheme.colorScheme.onPrimary
             ) {
                 Icon(Icons.Default.Add, contentDescription = "Add Filter List")
             }
@@ -41,7 +49,7 @@ fun FilterListsScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .padding(horizontal = 16.dp)
+                .padding(horizontal = 20.dp)
         ) {
             // Header - fixed
             HeaderSection(
@@ -64,31 +72,7 @@ fun FilterListsScreen(
 
                 if (filterLists.isEmpty()) {
                     item {
-                        Card(
-                            modifier = Modifier.fillMaxWidth(),
-                            colors = CardDefaults.cardColors(
-                                containerColor = MaterialTheme.colorScheme.surfaceVariant
-                            )
-                        ) {
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(24.dp),
-                                horizontalAlignment = Alignment.CenterHorizontally
-                            ) {
-                                Icon(
-                                    Icons.Default.Block,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(48.dp)
-                                )
-                                Spacer(modifier = Modifier.height(8.dp))
-                                Text("No filter lists configured")
-                                Text(
-                                    text = "Tap + to add a filter list",
-                                    style = MaterialTheme.typography.bodySmall
-                                )
-                            }
-                        }
+                        EmptyStateCard()
                     }
                 }
             }
@@ -111,7 +95,13 @@ fun FilterListsScreen(
     filterListToDelete?.let { filterList ->
         AlertDialog(
             onDismissRequest = { filterListToDelete = null },
-            title = { Text("Delete Filter List") },
+            shape = RoundedCornerShape(28.dp),
+            title = {
+                Text(
+                    "Delete Filter List",
+                    fontWeight = FontWeight.Bold
+                )
+            },
             text = { Text("Are you sure you want to delete \"${filterList.name}\"?") },
             confirmButton = {
                 TextButton(
@@ -139,9 +129,10 @@ private fun HeaderSection(
 ) {
     Text(
         text = "Filter Lists",
-        style = MaterialTheme.typography.headlineMedium,
-        fontWeight = FontWeight.Bold,
-        modifier = Modifier.padding(top = 16.dp, bottom = 8.dp)
+        style = MaterialTheme.typography.headlineLarge,
+        fontWeight = FontWeight.ExtraBold,
+        modifier = Modifier.padding(top = 20.dp, bottom = 4.dp),
+        color = MaterialTheme.colorScheme.onBackground
     )
     Row(
         modifier = Modifier
@@ -156,7 +147,63 @@ private fun HeaderSection(
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
         if (!isLoaded) {
-            CircularProgressIndicator(modifier = Modifier.size(16.dp))
+            CircularProgressIndicator(
+                modifier = Modifier.size(18.dp),
+                strokeWidth = 2.dp
+            )
+        }
+    }
+}
+
+@Composable
+private fun EmptyStateCard() {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(24.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainer
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(32.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(64.dp)
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(
+                        Brush.linearGradient(
+                            colors = listOf(
+                                MaterialTheme.colorScheme.error.copy(alpha = 0.15f),
+                                MaterialTheme.colorScheme.error.copy(alpha = 0.08f)
+                            )
+                        )
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    Icons.Default.Block,
+                    contentDescription = null,
+                    modifier = Modifier.size(32.dp),
+                    tint = MaterialTheme.colorScheme.error
+                )
+            }
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(
+                "No filter lists configured",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = "Tap + to add a filter list",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
     }
 }
@@ -170,7 +217,14 @@ private fun FilterListCard(
     val dateFormat = remember { SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.getDefault()) }
     val filterList = item.filterList
 
-    Card(modifier = Modifier.fillMaxWidth()) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainer
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+    ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -182,27 +236,37 @@ private fun FilterListCard(
                     Text(
                         text = filterList.name,
                         style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Medium
+                        fontWeight = FontWeight.SemiBold
                     )
                     if (filterList.isBuiltIn) {
                         Spacer(modifier = Modifier.width(8.dp))
-                        AssistChip(
+                        SuggestionChip(
                             onClick = { },
-                            label = { Text("Built-in") },
-                            modifier = Modifier.height(24.dp)
+                            label = {
+                                Text(
+                                    "Built-in",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Medium
+                                )
+                            },
+                            colors = SuggestionChipDefaults.suggestionChipColors(
+                                containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                                labelColor = MaterialTheme.colorScheme.onSecondaryContainer
+                            ),
+                            border = null
                         )
                     }
                 }
-                Spacer(modifier = Modifier.height(4.dp))
+                Spacer(modifier = Modifier.height(6.dp))
                 Text(
                     text = filterList.url,
-                    style = MaterialTheme.typography.bodySmall,
+                    style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
                 if (item.lastUpdated != null) {
-                    Spacer(modifier = Modifier.height(2.dp))
+                    Spacer(modifier = Modifier.height(4.dp))
                     Text(
                         text = "Updated: ${dateFormat.format(Date(item.lastUpdated))}",
                         style = MaterialTheme.typography.bodySmall,
@@ -212,20 +276,21 @@ private fun FilterListCard(
             }
             IconButton(onClick = onToggle) {
                 Icon(
-                    imageVector = Icons.Default.Shield,
+                    imageVector = if (filterList.isEnabled) Icons.Filled.Shield else Icons.Outlined.Shield,
                     contentDescription = if (filterList.isEnabled) "Enabled" else "Disabled",
                     tint = if (filterList.isEnabled)
                         MaterialTheme.colorScheme.primary
                     else
-                        MaterialTheme.colorScheme.error
+                        MaterialTheme.colorScheme.error.copy(alpha = 0.7f),
+                    modifier = Modifier.size(28.dp)
                 )
             }
             if (!filterList.isBuiltIn) {
                 IconButton(onClick = onDelete) {
                     Icon(
-                        Icons.Default.Delete,
+                        Icons.Outlined.Delete,
                         contentDescription = "Delete",
-                        tint = MaterialTheme.colorScheme.error
+                        tint = MaterialTheme.colorScheme.error.copy(alpha = 0.7f)
                     )
                 }
             }
@@ -243,15 +308,22 @@ private fun AddFilterListDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Add Filter List") },
+        shape = RoundedCornerShape(28.dp),
+        title = {
+            Text(
+                "Add Filter List",
+                fontWeight = FontWeight.Bold
+            )
+        },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
                 OutlinedTextField(
                     value = name,
                     onValueChange = { name = it },
                     label = { Text("Name") },
                     singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp)
                 )
                 OutlinedTextField(
                     value = url,
@@ -259,7 +331,8 @@ private fun AddFilterListDialog(
                     label = { Text("URL") },
                     placeholder = { Text("https://...") },
                     singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp)
                 )
                 Text(
                     text = "Supports AdAway-format blocklists (.txt or hosts files)",
@@ -269,9 +342,10 @@ private fun AddFilterListDialog(
             }
         },
         confirmButton = {
-            TextButton(
+            Button(
                 onClick = { onAdd(name, url) },
-                enabled = name.isNotBlank() && url.isNotBlank()
+                enabled = name.isNotBlank() && url.isNotBlank(),
+                shape = RoundedCornerShape(14.dp)
             ) {
                 Text("Add")
             }

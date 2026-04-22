@@ -1,14 +1,20 @@
 package com.deatrg.dnsfilter.ui.screens.dnsserver
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -26,7 +32,10 @@ fun DnsServersScreen(
     Scaffold(
         floatingActionButton = {
             FloatingActionButton(
-                onClick = { showAddDialog = true }
+                onClick = { showAddDialog = true },
+                shape = RoundedCornerShape(18.dp),
+                containerColor = MaterialTheme.colorScheme.primary,
+                contentColor = MaterialTheme.colorScheme.onPrimary
             ) {
                 Icon(Icons.Default.Add, contentDescription = "Add DNS Server")
             }
@@ -36,7 +45,7 @@ fun DnsServersScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .padding(horizontal = 16.dp)
+                .padding(horizontal = 20.dp)
         ) {
             // Header - fixed
             HeaderSection()
@@ -56,31 +65,7 @@ fun DnsServersScreen(
 
                 if (servers.isEmpty()) {
                     item {
-                        Card(
-                            modifier = Modifier.fillMaxWidth(),
-                            colors = CardDefaults.cardColors(
-                                containerColor = MaterialTheme.colorScheme.surfaceVariant
-                            )
-                        ) {
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(24.dp),
-                                horizontalAlignment = Alignment.CenterHorizontally
-                            ) {
-                                Icon(
-                                    Icons.Default.Dns,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(48.dp)
-                                )
-                                Spacer(modifier = Modifier.height(8.dp))
-                                Text("No DNS servers configured")
-                                Text(
-                                    text = "Tap + to add a DNS server",
-                                    style = MaterialTheme.typography.bodySmall
-                                )
-                            }
-                        }
+                        EmptyStateCard()
                     }
                 }
             }
@@ -89,7 +74,8 @@ fun DnsServersScreen(
             Spacer(modifier = Modifier.height(8.dp))
             OutlinedButton(
                 onClick = { viewModel.resetToDefaults() },
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp)
             ) {
                 Icon(Icons.Default.Refresh, contentDescription = null)
                 Spacer(modifier = Modifier.width(8.dp))
@@ -114,9 +100,10 @@ fun DnsServersScreen(
 private fun HeaderSection() {
     Text(
         text = "DNS Servers",
-        style = MaterialTheme.typography.headlineMedium,
-        fontWeight = FontWeight.Bold,
-        modifier = Modifier.padding(top = 16.dp, bottom = 8.dp)
+        style = MaterialTheme.typography.headlineLarge,
+        fontWeight = FontWeight.ExtraBold,
+        modifier = Modifier.padding(top = 20.dp, bottom = 4.dp),
+        color = MaterialTheme.colorScheme.onBackground
     )
     Text(
         text = "Configure upstream DNS servers. Multiple servers are queried concurrently.",
@@ -127,12 +114,72 @@ private fun HeaderSection() {
 }
 
 @Composable
+private fun EmptyStateCard() {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(24.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainer
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(32.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(64.dp)
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(
+                        Brush.linearGradient(
+                            colors = listOf(
+                                MaterialTheme.colorScheme.primary.copy(alpha = 0.2f),
+                                MaterialTheme.colorScheme.primary.copy(alpha = 0.1f)
+                            )
+                        )
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    Icons.Default.Dns,
+                    contentDescription = null,
+                    modifier = Modifier.size(32.dp),
+                    tint = MaterialTheme.colorScheme.primary
+                )
+            }
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(
+                "No DNS servers configured",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = "Tap + to add a DNS server",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+@Composable
 private fun DnsServerCard(
     server: DnsServer,
     onToggle: () -> Unit,
     onDelete: () -> Unit
 ) {
-    Card(modifier = Modifier.fillMaxWidth()) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainer
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+    ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -144,37 +191,58 @@ private fun DnsServerCard(
                     Text(
                         text = server.name,
                         style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Medium
+                        fontWeight = FontWeight.SemiBold
                     )
                     Spacer(modifier = Modifier.width(8.dp))
-                    AssistChip(
+                    val typeColor = when (server.type) {
+                        DnsServerType.PLAIN -> MaterialTheme.colorScheme.primary
+                        DnsServerType.DOH -> MaterialTheme.colorScheme.tertiary
+                        DnsServerType.DOT -> MaterialTheme.colorScheme.secondary
+                    }
+                    val typeContainerColor = when (server.type) {
+                        DnsServerType.PLAIN -> MaterialTheme.colorScheme.primaryContainer
+                        DnsServerType.DOH -> MaterialTheme.colorScheme.tertiaryContainer
+                        DnsServerType.DOT -> MaterialTheme.colorScheme.secondaryContainer
+                    }
+                    SuggestionChip(
                         onClick = { },
-                        label = { Text(server.type.name) },
-                        modifier = Modifier.height(24.dp)
+                        label = {
+                            Text(
+                                server.type.name,
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Medium
+                            )
+                        },
+                        colors = SuggestionChipDefaults.suggestionChipColors(
+                            containerColor = typeContainerColor,
+                            labelColor = typeColor
+                        ),
+                        border = null
                     )
                 }
-                Spacer(modifier = Modifier.height(4.dp))
+                Spacer(modifier = Modifier.height(6.dp))
                 Text(
                     text = server.address,
-                    style = MaterialTheme.typography.bodySmall,
+                    style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
             IconButton(onClick = onToggle) {
                 Icon(
-                    imageVector = if (server.isEnabled) Icons.Default.CheckCircle else Icons.Default.Cancel,
+                    imageVector = if (server.isEnabled) Icons.Filled.CheckCircle else Icons.Outlined.Cancel,
                     contentDescription = if (server.isEnabled) "Enabled" else "Disabled",
                     tint = if (server.isEnabled)
                         MaterialTheme.colorScheme.primary
                     else
-                        MaterialTheme.colorScheme.error
+                        MaterialTheme.colorScheme.error.copy(alpha = 0.7f),
+                    modifier = Modifier.size(28.dp)
                 )
             }
             IconButton(onClick = onDelete) {
                 Icon(
-                    Icons.Default.Delete,
+                    Icons.Outlined.Delete,
                     contentDescription = "Delete",
-                    tint = MaterialTheme.colorScheme.error
+                    tint = MaterialTheme.colorScheme.error.copy(alpha = 0.7f)
                 )
             }
         }
@@ -194,15 +262,22 @@ private fun AddDnsServerDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Add DNS Server") },
+        shape = RoundedCornerShape(28.dp),
+        title = {
+            Text(
+                "Add DNS Server",
+                fontWeight = FontWeight.Bold
+            )
+        },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
                 OutlinedTextField(
                     value = name,
                     onValueChange = { name = it },
                     label = { Text("Name") },
                     singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp)
                 )
                 OutlinedTextField(
                     value = address,
@@ -210,7 +285,8 @@ private fun AddDnsServerDialog(
                     label = { Text("Address") },
                     placeholder = { Text("1.1.1.1 or https://...") },
                     singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp)
                 )
                 ExposedDropdownMenuBox(
                     expanded = expanded,
@@ -224,7 +300,8 @@ private fun AddDnsServerDialog(
                         trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
                         modifier = Modifier
                             .fillMaxWidth()
-                            .menuAnchor()
+                            .menuAnchor(),
+                        shape = RoundedCornerShape(16.dp)
                     )
                     ExposedDropdownMenu(
                         expanded = expanded,
@@ -244,9 +321,10 @@ private fun AddDnsServerDialog(
             }
         },
         confirmButton = {
-            TextButton(
+            Button(
                 onClick = { onAdd(name, address, selectedType) },
-                enabled = name.isNotBlank() && address.isNotBlank()
+                enabled = name.isNotBlank() && address.isNotBlank(),
+                shape = RoundedCornerShape(14.dp)
             ) {
                 Text("Add")
             }
