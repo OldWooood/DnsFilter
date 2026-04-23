@@ -59,7 +59,7 @@ class DnsVpnService : VpnService() {
     private val processingDispatcher = Dispatchers.IO.limitedParallelism(4)
 
     // Packet buffer 对象池，减少高并发时的内存分配压力
-    private val packetPool = ArrayBlockingQueue<ByteArray>(16)
+    private val packetPool = ArrayBlockingQueue<ByteArray>(256)
 
     private fun obtainPacket(): ByteArray = packetPool.poll() ?: ByteArray(MTU)
     private fun recyclePacket(packet: ByteArray) { packetPool.offer(packet) }
@@ -276,17 +276,14 @@ class DnsVpnService : VpnService() {
         val response = processDnsQuery(dnsPayload, srcIp, srcPort)
 
         if (response != null) {
-            // Build the full IP/UDP packet
-            val fullResponse = buildIPv4FullResponse(packet, ihl, srcPort, response)
-            // Log response details for debugging
-            AppLog.d(TAG, "Response packet: src=${fullResponse[12].toInt() and 0xFF}.${fullResponse[13].toInt() and 0xFF}.${fullResponse[14].toInt() and 0xFF}.${fullResponse[15].toInt() and 0xFF}, " +
-                    "dst=${fullResponse[16].toInt() and 0xFF}.${fullResponse[17].toInt() and 0xFF}.${fullResponse[18].toInt() and 0xFF}.${fullResponse[19].toInt() and 0xFF}, " +
-                    "UDP src=${((fullResponse[20].toInt() and 0xFF) shl 8) or (fullResponse[21].toInt() and 0xFF)}, " +
-                    "UDP dst=${((fullResponse[22].toInt() and 0xFF) shl 8) or (fullResponse[23].toInt() and 0xFF)}")
+            // 复用原始 packet 数组：把 DNS 响应写回 payload 位置，patch IP/UDP header
+            response.copyInto(packet, destinationOffset = ihl + 8)
+            patchIPv4Response(packet, ihl, srcPort, response.size)
+            val responseLength = ihl + 8 + response.size
             synchronized(outputStream) {
                 try {
-                    outputStream.write(fullResponse)
-                    AppLog.d(TAG, "Successfully sent IPv4 DNS response to $srcIp:$srcPort, length: ${fullResponse.size}")
+                    outputStream.write(packet, 0, responseLength)
+                    AppLog.d(TAG, "Successfully sent IPv4 DNS response to $srcIp:$srcPort, length: $responseLength")
                 } catch (e: Exception) {
                     AppLog.e(TAG, "Failed to send DNS response: ${e.message}")
                 }
@@ -336,12 +333,18 @@ class DnsVpnService : VpnService() {
         val response = processDnsQuery(dnsPayload, srcIp, srcPort)
 
         if (response != null) {
-            // Build the full IPv6/UDP packet
-            val fullResponse = buildIPv6FullResponse(packet, srcPort, response)
+            // 复用原始 packet 数组：把 DNS 响应写回 payload 位置，patch IPv6/UDP header
+            response.copyInto(packet, destinationOffset = ipv6HeaderLength + 8)
+            patchIPv6Response(packet, srcPort, response.size)
+            val responseLength = ipv6HeaderLength + 8 + response.size
             synchronized(outputStream) {
-                outputStream.write(fullResponse)
+                try {
+                    outputStream.write(packet, 0, responseLength)
+                    AppLog.d(TAG, "Sent IPv6 DNS response to $srcIp:$srcPort, length: $responseLength")
+                } catch (e: Exception) {
+                    AppLog.e(TAG, "Failed to send IPv6 DNS response: ${e.message}")
+                }
             }
-            AppLog.d(TAG, "Sent IPv6 DNS response to $srcIp:$srcPort, length: ${fullResponse.size}")
         } else {
             AppLog.w(TAG, "No DNS response generated")
         }
@@ -675,83 +678,162 @@ class DnsVpnService : VpnService() {
         return dnsResponse
     }
 
-    private fun buildIPv4FullResponse(originalPacket: ByteArray, ipHeaderLength: Int, srcPort: Int, dnsResponse: ByteArray): ByteArray {
-        // Response IP header is always exactly 20 bytes (standard header, no options)
-        val responseIpHeaderLength = 20
-        val totalLength = responseIpHeaderLength + 8 + dnsResponse.size
-        val packet = ByteBuffer.allocate(totalLength)
+    private fun patchIPv4Response(packet: ByteArray, ipHeaderLength: Int, srcPort: Int, dnsResponseLength: Int) {
+        // 在原始 packet 上直接 patch 为响应包：交换 src/dst IP、更新 checksum、交换 UDP port
+        val totalLength = ipHeaderLength + 8 + dnsResponseLength
+        val udpLength = 8 + dnsResponseLength
 
-        // Build IP header
-        // Version (4) and IHL (5 = 20 bytes)
-        packet.put(0x45.toByte())
-        // TOS
-        packet.put(0x00.toByte())
-        // Total length
-        packet.put(((totalLength shr 8) and 0xFF).toByte())
-        packet.put((totalLength and 0xFF).toByte())
-        // ID (copy from original)
-        packet.put(originalPacket[4])
-        packet.put(originalPacket[5])
-        // Flags and Fragment (copy from original)
-        packet.put(originalPacket[6])
-        packet.put(originalPacket[7])
-        // TTL (64 is a reasonable default)
-        packet.put(64.toByte())
-        // Protocol (UDP = 17)
-        packet.put(17.toByte())
-        // Header checksum (computed later)
-        packet.put(0x00.toByte())
-        packet.put(0x00.toByte())
+        // Update IP total length (bytes 2-3)
+        packet[2] = ((totalLength shr 8) and 0xFF).toByte()
+        packet[3] = (totalLength and 0xFF).toByte()
 
-        // 交换源和目的IP地址
-        // 原始包：src=客户端IP (bytes 12-15), dst=VPN_DNS_V4 (bytes 16-19)
-        // 响应包：src=VPN_DNS_V4, dst=客户端IP
-        val vpnDnsIpBytes = VPN_DNS_V4.split(".").map { it.toInt().toByte() }.toByteArray()
-        
-        // 源IP（响应包中应该是虚拟DNS地址）
+        // Swap src/dst IP: bytes 12-15 <-> bytes 16-19
         for (i in 0 until 4) {
-            packet.put(vpnDnsIpBytes[i])
-        }
-        // 目的IP（响应包中应该是客户端IP）
-        for (i in 0 until 4) {
-            packet.put(originalPacket[12 + i]) // 原始包的源IP
+            val tmp = packet[12 + i]
+            packet[12 + i] = packet[16 + i]
+            packet[16 + i] = tmp
         }
 
-        // UDP header
-        // Source port = 53 (DNS)
-        packet.put(((DNS_PORT shr 8) and 0xFF).toByte())
-        packet.put((DNS_PORT and 0xFF).toByte())
-        // Destination port = original source port
-        packet.put(((srcPort shr 8) and 0xFF).toByte())
-        packet.put((srcPort and 0xFF).toByte())
-        // UDP length
-        val udpLength = 8 + dnsResponse.size
-        packet.put(((udpLength shr 8) and 0xFF).toByte())
-        packet.put((udpLength and 0xFF).toByte())
-        // UDP checksum (computed later)
-        packet.put(0x00.toByte())
-        packet.put(0x00.toByte())
+        // Update TTL (byte 8)
+        packet[8] = 64.toByte()
 
-        // DNS payload
-        packet.put(dnsResponse)
+        // Zero IP checksum (bytes 10-11) then recalculate
+        packet[10] = 0
+        packet[11] = 0
+        val ipChecksum = computeIpv4HeaderChecksum(packet, ipHeaderLength)
+        packet[10] = ((ipChecksum shr 8) and 0xFF).toByte()
+        packet[11] = (ipChecksum and 0xFF).toByte()
 
-        val result = ByteArray(packet.position())
-        packet.flip()
-        packet.get(result)
+        // UDP header at offset ipHeaderLength
+        val udpOff = ipHeaderLength
 
-        // Compute IPv4 header checksum and write it back
-        val checksum = computeIpv4HeaderChecksum(result, responseIpHeaderLength)
-        result[10] = ((checksum shr 8) and 0xFF).toByte()
-        result[11] = (checksum and 0xFF).toByte()
+        // Swap UDP src/dst port: src=53, dst=原始 srcPort
+        packet[udpOff]     = ((DNS_PORT shr 8) and 0xFF).toByte()
+        packet[udpOff + 1] = (DNS_PORT and 0xFF).toByte()
+        packet[udpOff + 2] = ((srcPort shr 8) and 0xFF).toByte()
+        packet[udpOff + 3] = (srcPort and 0xFF).toByte()
 
-        // Compute UDP checksum and write it back
-        val udpChecksumValue = computeUdpChecksum(result, responseIpHeaderLength)
-        val udpChecksumOffset = responseIpHeaderLength + 6
-        result[udpChecksumOffset] = ((udpChecksumValue shr 8) and 0xFF).toByte()
-        result[udpChecksumOffset + 1] = (udpChecksumValue and 0xFF).toByte()
-        return result
+        // Update UDP length (bytes udpOff+4..5)
+        packet[udpOff + 4] = ((udpLength shr 8) and 0xFF).toByte()
+        packet[udpOff + 5] = (udpLength and 0xFF).toByte()
+
+        // Zero UDP checksum then recalculate using personalDnsfilter approach
+        packet[udpOff + 6] = 0
+        packet[udpOff + 7] = 0
+
+        // personalDnsfilter trick: temporarily modify IPv4 header bytes 8-11 to pseudo-header
+        val saved8 = packet[8]
+        val saved9 = packet[9]
+        val saved10 = packet[10]
+        val saved11 = packet[11]
+
+        packet[8] = 0      // zero field in pseudo header
+        packet[9] = 17     // protocol = UDP
+        packet[10] = ((udpLength shr 8) and 0xFF).toByte()
+        packet[11] = (udpLength and 0xFF).toByte()
+
+        val udpChecksum = computeGenericChecksum(packet, 8, totalLength - 8)
+
+        packet[8] = saved8
+        packet[9] = saved9
+        packet[10] = saved10
+        packet[11] = saved11
+
+        packet[udpOff + 6] = ((udpChecksum shr 8) and 0xFF).toByte()
+        packet[udpOff + 7] = (udpChecksum and 0xFF).toByte()
     }
 
+    private fun patchIPv6Response(packet: ByteArray, srcPort: Int, dnsResponseLength: Int) {
+        // 在原始 packet 上直接 patch 为 IPv6 响应包
+        val payloadLength = 8 + dnsResponseLength
+        val totalLength = 40 + payloadLength
+
+        // Update Payload Length (bytes 4-5)
+        packet[4] = ((payloadLength shr 8) and 0xFF).toByte()
+        packet[5] = (payloadLength and 0xFF).toByte()
+
+        // Update Hop Limit (byte 7)
+        packet[7] = 64.toByte()
+
+        // Swap src/dst IPv6: bytes 8-23 <-> bytes 24-39
+        for (i in 0 until 16) {
+            val tmp = packet[8 + i]
+            packet[8 + i] = packet[24 + i]
+            packet[24 + i] = tmp
+        }
+
+        // UDP header at offset 40
+        // Swap src/dst port
+        packet[40] = ((DNS_PORT shr 8) and 0xFF).toByte()
+        packet[41] = (DNS_PORT and 0xFF).toByte()
+        packet[42] = ((srcPort shr 8) and 0xFF).toByte()
+        packet[43] = (srcPort and 0xFF).toByte()
+
+        // Update UDP length (bytes 44-45)
+        packet[44] = ((payloadLength shr 8) and 0xFF).toByte()
+        packet[45] = (payloadLength and 0xFF).toByte()
+
+        // Zero UDP checksum then recalculate
+        packet[46] = 0
+        packet[47] = 0
+        val udpChecksum = computeIpv6UdpChecksum(packet, totalLength)
+        packet[46] = ((udpChecksum shr 8) and 0xFF).toByte()
+        packet[47] = (udpChecksum and 0xFF).toByte()
+    }
+
+    /**
+     * 参考 personalDnsfilter 的 IPv6 UDP checksum 计算方式：
+     * 临时把 IPv6 header 前 8 bytes 改写成伪头部格式，
+     * 然后对整个 packet（从 offset 0 开始，长度 totalLength）计算 checksum，
+     * 最后恢复原 header。
+     */
+    private fun computeIpv6UdpChecksum(packet: ByteArray, totalLength: Int): Int {
+        // 保存 IPv6 header 前 8 bytes
+        val saved = ByteArray(8)
+        for (i in 0 until 8) saved[i] = packet[i]
+
+        val udpLength = totalLength - 40
+
+        // 临时构造伪头部到前 8 bytes（big-endian int 0 + int 1）
+        // int 0 (bytes 0-3) = UDP length
+        // int 1 (bytes 4-7) = 17 (protocol)
+        packet[0] = 0
+        packet[1] = 0
+        packet[2] = ((udpLength shr 8) and 0xFF).toByte()
+        packet[3] = (udpLength and 0xFF).toByte()
+        packet[4] = 0
+        packet[5] = 0
+        packet[6] = 0
+        packet[7] = 17.toByte()
+
+        val checksum = computeGenericChecksum(packet, 0, totalLength)
+
+        // 恢复原 header
+        for (i in 0 until 8) packet[i] = saved[i]
+
+        return if (checksum == 0) 0xFFFF else checksum
+    }
+
+    private fun computeGenericChecksum(data: ByteArray, offset: Int, length: Int): Int {
+        var sum = 0
+        var i = 0
+        while (i + 1 < length) {
+            val word = ((data[offset + i].toInt() and 0xFF) shl 8) or (data[offset + i + 1].toInt() and 0xFF)
+            sum += word
+            if (sum > 0xFFFF) {
+                sum = (sum and 0xFFFF) + 1
+            }
+            i += 2
+        }
+        if (i < length) {
+            val word = (data[offset + i].toInt() and 0xFF) shl 8
+            sum += word
+            if (sum > 0xFFFF) {
+                sum = (sum and 0xFFFF) + 1
+            }
+        }
+        return sum.inv() and 0xFFFF
+    }
     private fun computeIpv4HeaderChecksum(packet: ByteArray, headerLength: Int): Int {
         var sum = 0
         var i = 0
@@ -767,146 +849,6 @@ class DnsVpnService : VpnService() {
             }
             i += 2
         }
-        return sum.inv() and 0xFFFF
-    }
-
-    private fun computeUdpChecksum(packet: ByteArray, ipHeaderLength: Int): Int {
-        val udpOffset = ipHeaderLength
-        val udpLength = ((packet[udpOffset + 4].toInt() and 0xFF) shl 8) or (packet[udpOffset + 5].toInt() and 0xFF)
-
-        var sum = 0
-
-        // Pseudo-header: source IP, dest IP, zero, protocol, UDP length
-        for (i in 12 until 20 step 2) {
-            val word = ((packet[i].toInt() and 0xFF) shl 8) or (packet[i + 1].toInt() and 0xFF)
-            sum += word
-        }
-        sum += 17 // Protocol UDP
-        sum += udpLength
-
-        // UDP header and payload
-        var i = udpOffset
-        val end = udpOffset + udpLength
-        while (i + 1 < end) {
-            val word = ((packet[i].toInt() and 0xFF) shl 8) or (packet[i + 1].toInt() and 0xFF)
-            sum += word
-            if (sum > 0xFFFF) {
-                sum = (sum and 0xFFFF) + 1
-            }
-            i += 2
-        }
-        if (i < end) {
-            // Odd byte padding
-            val word = (packet[i].toInt() and 0xFF) shl 8
-            sum += word
-            if (sum > 0xFFFF) {
-                sum = (sum and 0xFFFF) + 1
-            }
-        }
-
-        return sum.inv() and 0xFFFF
-    }
-
-    private fun buildIPv6FullResponse(originalPacket: ByteArray, srcPort: Int, dnsResponse: ByteArray): ByteArray {
-        // IPv6 header is 40 bytes, UDP header is 8 bytes
-        val totalLength = 40 + 8 + dnsResponse.size
-        val packet = ByteBuffer.allocate(totalLength)
-
-        // IPv6 Header
-        // Version (6) + Traffic Class (8 bits) + Flow Label (20 bits) = first 4 bytes
-        packet.put(0x60.toByte()) // Version 6, traffic class = 0
-        packet.put(0x00.toByte())
-        packet.put(0x00.toByte())
-        packet.put(0x00.toByte())
-        // Payload Length (UDP header + DNS response)
-        val payloadLength = 8 + dnsResponse.size
-        packet.put(((payloadLength shr 8) and 0xFF).toByte())
-        packet.put((payloadLength and 0xFF).toByte())
-        // Next Header (UDP = 17)
-        packet.put(17.toByte())
-        // Hop Limit
-        packet.put(64.toByte())
-
-        // 源地址应该是虚拟DNS地址 fd00::10
-        val srcAddr = byteArrayOf(
-            0xfd.toByte(), 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10
-        )
-        packet.put(srcAddr)
-
-        // Destination address (from original packet, bytes 24-39) - 16 bytes
-        packet.put(originalPacket, 24, 16)
-
-        // UDP header
-        // Source port = 53 (DNS)
-        packet.put(((DNS_PORT shr 8) and 0xFF).toByte())
-        packet.put((DNS_PORT and 0xFF).toByte())
-        // Destination port = original source port
-        packet.put(((srcPort shr 8) and 0xFF).toByte())
-        packet.put((srcPort and 0xFF).toByte())
-        // UDP length
-        val udpLength = 8 + dnsResponse.size
-        packet.put(((udpLength shr 8) and 0xFF).toByte())
-        packet.put((udpLength and 0xFF).toByte())
-        // UDP checksum (computed later) - placeholder
-        packet.put(0x00.toByte())
-        packet.put(0x00.toByte())
-
-        // DNS payload
-        packet.put(dnsResponse)
-
-        val result = ByteArray(packet.position())
-        packet.flip()
-        packet.get(result)
-
-        // Compute UDP checksum for IPv6
-        val udpChecksum = computeIpv6UdpChecksum(result, srcAddr, 24)
-        result[42] = ((udpChecksum shr 8) and 0xFF).toByte()
-        result[43] = (udpChecksum and 0xFF).toByte()
-
-        return result
-    }
-
-    private fun computeIpv6UdpChecksum(packet: ByteArray, srcAddr: ByteArray, dstAddrOffset: Int): Int {
-        // IPv6 pseudo-header: src IP (16) + dst IP (16) + UDP length (4) + Next Header (3 bytes padded)
-        var sum = 0
-
-        // Source address
-        for (i in srcAddr.indices step 2) {
-            val word = ((srcAddr[i].toInt() and 0xFF) shl 8) or (srcAddr[i + 1].toInt() and 0xFF)
-            sum += word
-        }
-        // Destination address
-        for (i in 0 until 16 step 2) {
-            val word = ((packet[24 + i].toInt() and 0xFF) shl 8) or (packet[24 + i + 1].toInt() and 0xFF)
-            sum += word
-        }
-        // UDP length
-        val udpLength = ((packet[42].toInt() and 0xFF) shl 8) or (packet[43].toInt() and 0xFF)
-        sum += udpLength
-        // Next header (17 = UDP)
-        sum += 17
-
-        // UDP header + payload
-        var i = 40 // Start of UDP header
-        val end = 40 + udpLength
-        while (i + 1 < end) {
-            val word = ((packet[i].toInt() and 0xFF) shl 8) or (packet[i + 1].toInt() and 0xFF)
-            sum += word
-            if (sum > 0xFFFF) {
-                sum = (sum and 0xFFFF) + 1
-            }
-            i += 2
-        }
-        if (i < end) {
-            // Odd byte padding
-            val word = (packet[i].toInt() and 0xFF) shl 8
-            sum += word
-            if (sum > 0xFFFF) {
-                sum = (sum and 0xFFFF) + 1
-            }
-        }
-
         return sum.inv() and 0xFFFF
     }
 

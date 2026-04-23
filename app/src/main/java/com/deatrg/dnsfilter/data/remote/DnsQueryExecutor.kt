@@ -63,8 +63,8 @@ class DnsQueryExecutor(
                 return cached.responseIp
             }
             dnsCache.remove(key)
+            return null
         }
-        return null
     }
 
     private fun putToCache(domain: String, qtype: Int, responseIp: String) {
@@ -174,7 +174,7 @@ class DnsQueryExecutor(
         return wrapper.lock.withLock {
             if (!wrapper.isValid) {
                 // Socket 已失效（如上次超时），移除并回退到一次性 socket
-                udpSockets.remove(serverAddress)
+                udpSockets.remove(serverAddress, wrapper)
                 return@withLock queryPlainDnsFresh(domain, serverAddress, qtype, timeoutMs)
             }
 
@@ -203,12 +203,12 @@ class DnsQueryExecutor(
                 // 超时后 socket 可能收到延迟响应，废弃避免污染下次查询
                 wrapper.isValid = false
                 try { wrapper.socket.close() } catch (_: Exception) {}
-                udpSockets.remove(serverAddress)
+                udpSockets.remove(serverAddress, wrapper)
                 DnsQueryResult(success = false, responseIp = null, responseTime = 0, error = "Timeout")
             } catch (e: Exception) {
                 wrapper.isValid = false
                 try { wrapper.socket.close() } catch (_: Exception) {}
-                udpSockets.remove(serverAddress)
+                udpSockets.remove(serverAddress, wrapper)
                 DnsQueryResult(success = false, responseIp = null, responseTime = 0, error = e.message)
             }
         }
