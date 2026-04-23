@@ -6,6 +6,8 @@ import com.deatrg.dnsfilter.domain.model.DnsServer
 import com.deatrg.dnsfilter.domain.model.DnsServerType
 import kotlinx.coroutines.*
 import kotlinx.coroutines.selects.select
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import okhttp3.*
 import java.io.IOException
 import java.net.DatagramPacket
@@ -13,6 +15,7 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.SocketTimeoutException
 import java.util.LinkedHashMap
+import java.util.concurrent.ConcurrentHashMap
 
 class DnsQueryExecutor(
     private val okHttpClient: OkHttpClient,
@@ -26,6 +29,17 @@ class DnsQueryExecutor(
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    // 每个服务器复用一个 UDP socket，减少重复创建和 VPN protect 开销
+    private class ReusableUdpSocket(
+        val socket: DatagramSocket,
+        val lock: Mutex = Mutex()
+    ) {
+        @Volatile
+        var isValid = true
+    }
+
+    private val udpSockets = ConcurrentHashMap<String, ReusableUdpSocket>()
 
     // DNS 响应缓存（LRU，最大 4096 条）
     private val dnsCache = object : LinkedHashMap<String, CachedDnsResult>(DNS_CACHE_SIZE, 0.75f, true) {
@@ -150,7 +164,63 @@ class DnsQueryExecutor(
         serverAddress: String,
         qtype: Int,
         timeoutMs: Long
-    ): DnsQueryResult = withContext(Dispatchers.IO) {
+    ): DnsQueryResult {
+        val wrapper = udpSockets.getOrPut(serverAddress) {
+            val socket = DatagramSocket()
+            socketProtector?.invoke(socket)
+            ReusableUdpSocket(socket)
+        }
+
+        return wrapper.lock.withLock {
+            if (!wrapper.isValid) {
+                // Socket 已失效（如上次超时），移除并回退到一次性 socket
+                udpSockets.remove(serverAddress)
+                return@withLock queryPlainDnsFresh(domain, serverAddress, qtype, timeoutMs)
+            }
+
+            try {
+                wrapper.socket.soTimeout = timeoutMs.toInt()
+
+                val request = buildDnsQuery(domain, qtype)
+                val address = InetAddress.getByName(serverAddress)
+                val requestPacket = DatagramPacket(request, request.size, address, 53)
+                wrapper.socket.send(requestPacket)
+
+                val responseBuffer = ByteArray(512)
+                val responsePacket = DatagramPacket(responseBuffer, responseBuffer.size)
+                wrapper.socket.receive(responsePacket)
+
+                AppLog.d(TAG, "Raw DNS response from $serverAddress, length=${responsePacket.length}")
+                AppLog.d(TAG, "DNS response bytes: ${responsePacket.data.take(minOf(32, responsePacket.length)).joinToString { String.format("%02X", it) }}")
+
+                val responseIp = parseDnsResponse(responsePacket.data, responsePacket.length, qtype)
+                if (responseIp != null) {
+                    DnsQueryResult(success = true, responseIp = responseIp, responseTime = 0, error = null)
+                } else {
+                    DnsQueryResult(success = false, responseIp = null, responseTime = 0, error = "Failed to parse DNS response")
+                }
+            } catch (e: SocketTimeoutException) {
+                // 超时后 socket 可能收到延迟响应，废弃避免污染下次查询
+                wrapper.isValid = false
+                try { wrapper.socket.close() } catch (_: Exception) {}
+                udpSockets.remove(serverAddress)
+                DnsQueryResult(success = false, responseIp = null, responseTime = 0, error = "Timeout")
+            } catch (e: Exception) {
+                wrapper.isValid = false
+                try { wrapper.socket.close() } catch (_: Exception) {}
+                udpSockets.remove(serverAddress)
+                DnsQueryResult(success = false, responseIp = null, responseTime = 0, error = e.message)
+            }
+        }
+    }
+
+    // 降级路径：使用一次性 socket（避免延迟响应污染复用 socket）
+    private fun queryPlainDnsFresh(
+        domain: String,
+        serverAddress: String,
+        qtype: Int,
+        timeoutMs: Long
+    ): DnsQueryResult {
         var socket: DatagramSocket? = null
         try {
             socket = DatagramSocket()
@@ -166,30 +236,16 @@ class DnsQueryExecutor(
             val responsePacket = DatagramPacket(responseBuffer, responseBuffer.size)
             socket.receive(responsePacket)
 
-            // Log raw DNS response for debugging
-            AppLog.d(TAG, "Raw DNS response from $serverAddress, length=${responsePacket.length}")
-            AppLog.d(TAG, "DNS response bytes: ${responsePacket.data.take(minOf(32, responsePacket.length)).joinToString { String.format("%02X", it) }}")
-
             val responseIp = parseDnsResponse(responsePacket.data, responsePacket.length, qtype)
-            if (responseIp != null) {
-                DnsQueryResult(
-                    success = true,
-                    responseIp = responseIp,
-                    responseTime = 0,
-                    error = null
-                )
+            return if (responseIp != null) {
+                DnsQueryResult(success = true, responseIp = responseIp, responseTime = 0, error = null)
             } else {
-                DnsQueryResult(
-                    success = false,
-                    responseIp = null,
-                    responseTime = 0,
-                    error = "Failed to parse DNS response"
-                )
+                DnsQueryResult(success = false, responseIp = null, responseTime = 0, error = "Failed to parse DNS response")
             }
         } catch (e: SocketTimeoutException) {
-            DnsQueryResult(success = false, responseIp = null, responseTime = 0, error = "Timeout")
+            return DnsQueryResult(success = false, responseIp = null, responseTime = 0, error = "Timeout")
         } catch (e: Exception) {
-            DnsQueryResult(success = false, responseIp = null, responseTime = 0, error = e.message)
+            return DnsQueryResult(success = false, responseIp = null, responseTime = 0, error = e.message)
         } finally {
             socket?.close()
         }
@@ -424,6 +480,10 @@ class DnsQueryExecutor(
 
     fun shutdown() {
         scope.cancel()
+        udpSockets.values.forEach {
+            try { it.socket.close() } catch (_: Exception) {}
+        }
+        udpSockets.clear()
     }
 }
 

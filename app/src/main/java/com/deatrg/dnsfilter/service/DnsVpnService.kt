@@ -2,6 +2,7 @@ package com.deatrg.dnsfilter.service
 
 import android.app.*
 import android.content.Intent
+import android.graphics.drawable.Icon
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -14,8 +15,6 @@ import com.deatrg.dnsfilter.domain.model.DnsServer
 import com.deatrg.dnsfilter.domain.model.DnsServerType
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import okhttp3.OkHttpClient
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -24,6 +23,7 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.nio.ByteBuffer
+import java.util.concurrent.ArrayBlockingQueue
 
 class DnsVpnService : VpnService() {
 
@@ -53,9 +53,15 @@ class DnsVpnService : VpnService() {
     private var statisticsBuffer: StatisticsBuffer? = null
     private var servers: List<DnsServer> = emptyList()
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    
-    // 限制并发处理数量，防止创建过多协程
-    private val processingSemaphore = Semaphore(1024)
+
+    // 固定并发度 dispatcher，避免每个包都创建协程并竞争 Semaphore
+    private val processingDispatcher = Dispatchers.IO.limitedParallelism(4)
+
+    // Packet buffer 对象池，减少高并发时的内存分配压力
+    private val packetPool = ArrayBlockingQueue<ByteArray>(16)
+
+    private fun obtainPacket(): ByteArray = packetPool.poll() ?: ByteArray(MTU)
+    private fun recyclePacket(packet: ByteArray) { packetPool.offer(packet) }
 
     private data class DnsQuestion(
         val domain: String,
@@ -168,36 +174,37 @@ class DnsVpnService : VpnService() {
         val vpnInterface = this.vpnInterface ?: return
         val inputStream = FileInputStream(vpnInterface.fileDescriptor)
         val outputStream = FileOutputStream(vpnInterface.fileDescriptor)
-        val packet = ByteArray(MTU)
 
         AppLog.d(TAG, "DNS loop started")
 
         try {
             while (isRunning) {
+                val packet = obtainPacket()
                 val length = inputStream.read(packet)
                 if (length > 0) {
                     val version = packet[0].toInt() shr 4
                     val protocol = packet[9].toInt() and 0xFF
                     AppLog.d(TAG, "Packet received: version=$version, protocol=$protocol, length=$length")
 
-                    val packetCopy = packet.copyOf(length)
                     if (version != 4 && version != 6) {
                         AppLog.d(TAG, "Unknown packet version=$version, byte0=${String.format("%02X", packet[0])}, byte1=${String.format("%02X", packet[1])}")
                     }
-                    // 使用 Semaphore 限制并发处理数量
-                    scope.launch {
-                        processingSemaphore.withPermit {
-                            try {
-                                processPacket(packetCopy, length, outputStream)
-                            } catch (e: Exception) {
-                                AppLog.e(TAG, "Error processing packet: ${e.message}")
-                            }
+                    scope.launch(processingDispatcher) {
+                        try {
+                            processPacket(packet, length, outputStream)
+                        } catch (e: Exception) {
+                            AppLog.e(TAG, "Error processing packet: ${e.message}")
+                        } finally {
+                            recyclePacket(packet)
                         }
                     }
-                } else if (length == 0) {
-                    // In blocking mode, read should block until data is available
-                    // If it returns 0, it means immediate return with no data
-                    AppLog.w(TAG, "read() returned 0, no data available")
+                } else {
+                    recyclePacket(packet)
+                    if (length == 0) {
+                        // In blocking mode, read should block until data is available
+                        // If it returns 0, it means immediate return with no data
+                        AppLog.w(TAG, "read() returned 0, no data available")
+                    }
                 }
             }
         } catch (e: InterruptedIOException) {
@@ -206,6 +213,7 @@ class DnsVpnService : VpnService() {
         } catch (e: Exception) {
             AppLog.e(TAG, "Error in DNS loop", e)
         } finally {
+            packetPool.clear()
             AppLog.d(TAG, "DNS loop stopped")
         }
     }
@@ -277,7 +285,6 @@ class DnsVpnService : VpnService() {
             synchronized(outputStream) {
                 try {
                     outputStream.write(fullResponse)
-                    outputStream.flush()
                     AppLog.d(TAG, "Successfully sent IPv4 DNS response to $srcIp:$srcPort, length: ${fullResponse.size}")
                 } catch (e: Exception) {
                     AppLog.e(TAG, "Failed to send DNS response: ${e.message}")
@@ -332,7 +339,6 @@ class DnsVpnService : VpnService() {
             val fullResponse = buildIPv6FullResponse(packet, srcPort, response)
             synchronized(outputStream) {
                 outputStream.write(fullResponse)
-                outputStream.flush()
             }
             AppLog.d(TAG, "Sent IPv6 DNS response to $srcIp:$srcPort, length: ${fullResponse.size}")
         } else {
@@ -922,12 +928,18 @@ class DnsVpnService : VpnService() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val stopAction = Notification.Action.Builder(
+            Icon.createWithResource(this, android.R.drawable.ic_media_pause),
+            "Stop",
+            stopPendingIntent
+        ).build()
+
         return Notification.Builder(this, "dnsfilter_channel")
             .setContentTitle("DnsFilter Active")
             .setContentText("DNS filtering is enabled")
             .setSmallIcon(android.R.drawable.ic_lock_idle_lock)
             .setContentIntent(pendingIntent)
-            .addAction(android.R.drawable.ic_media_pause, "Stop", stopPendingIntent)
+            .addAction(stopAction)
             .setOngoing(true)
             .build()
     }

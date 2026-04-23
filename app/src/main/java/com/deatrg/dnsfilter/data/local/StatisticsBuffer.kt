@@ -24,9 +24,11 @@ class StatisticsBuffer(
     val statistics: StateFlow<DnsStatistics> = _statistics.asStateFlow()
 
     private var flushJob: Job? = null
+    private val lastUpdateTime = AtomicLong(0)
 
     companion object {
         private const val FLUSH_INTERVAL_MS = 5000L // 5秒批量写入一次
+        private const val UI_UPDATE_INTERVAL_MS = 1000L // 1秒节流更新 UI，避免频繁重组
     }
 
     /**
@@ -101,6 +103,11 @@ class StatisticsBuffer(
     }
 
     private fun updateFlow() {
+        val now = System.currentTimeMillis()
+        val last = lastUpdateTime.get()
+        if (now - last < UI_UPDATE_INTERVAL_MS) return
+        if (!lastUpdateTime.compareAndSet(last, now)) return
+
         val total = _totalQueries.get()
         val blocked = _blockedQueries.get()
         val allowed = _allowedQueries.get()
