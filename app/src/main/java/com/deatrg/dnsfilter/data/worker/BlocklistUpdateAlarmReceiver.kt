@@ -4,7 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.os.PowerManager
-import android.util.Log
+import com.deatrg.dnsfilter.AppLog
 import com.deatrg.dnsfilter.ServiceLocator
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -26,12 +26,12 @@ class BlocklistUpdateAlarmReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         when (intent.action) {
             Intent.ACTION_BOOT_COMPLETED -> {
-                Log.d(TAG, "Boot completed, rescheduling blocklist update alarm")
+                AppLog.d(TAG, "Boot completed, rescheduling blocklist update alarm")
                 BlocklistUpdateAlarmScheduler(context).scheduleDailyUpdate()
             }
 
             ACTION_UPDATE_BLOCKLIST -> {
-                Log.d(TAG, "Alarm fired, starting blocklist update")
+                AppLog.d(TAG, "Alarm fired, starting blocklist update")
                 val pendingResult = goAsync()
 
                 val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -52,15 +52,15 @@ class BlocklistUpdateAlarmReceiver : BroadcastReceiver() {
                         // 检查并更新过期的 blocklist
                         repository.checkAndUpdate()
 
-                        Log.d(TAG, "Blocklist update completed successfully")
+                        AppLog.d(TAG, "Blocklist update completed successfully")
                     } catch (e: Exception) {
-                        Log.e(TAG, "Blocklist update failed", e)
+                        AppLog.e(TAG, "Blocklist update failed", e)
                     } finally {
                         // 调度次日 alarm
                         try {
                             BlocklistUpdateAlarmScheduler(context).scheduleDailyUpdate()
                         } catch (e: Exception) {
-                            Log.e(TAG, "Failed to reschedule next alarm", e)
+                            AppLog.e(TAG, "Failed to reschedule next alarm", e)
                         }
 
                         if (wakeLock.isHeld) {

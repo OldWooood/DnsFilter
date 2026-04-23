@@ -5,7 +5,7 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.os.Build
-import android.util.Log
+import com.deatrg.dnsfilter.AppLog
 
 /**
  * Blocklist 更新调度器（AlarmManager 原生实现）
@@ -25,7 +25,7 @@ class BlocklistUpdateAlarmScheduler(private val context: Context) {
      * 调度每天自动更新任务（当地时间 12:00）
      */
     fun scheduleDailyUpdate() {
-        Log.d(TAG, "Scheduling daily blocklist update alarm at 12:00")
+        AppLog.d(TAG, "Scheduling daily blocklist update alarm at 12:00")
 
         val triggerAtMillis = calculateNextNoon()
         val pendingIntent = createDailyPendingIntent()
@@ -41,14 +41,14 @@ class BlocklistUpdateAlarmScheduler(private val context: Context) {
                         triggerAtMillis,
                         pendingIntent
                     )
-                    Log.d(TAG, "Exact alarm scheduled at $triggerAtMillis")
+                    AppLog.d(TAG, "Exact alarm scheduled at $triggerAtMillis")
                 } else {
                     alarmManager.setAndAllowWhileIdle(
                         AlarmManager.RTC_WAKEUP,
                         triggerAtMillis,
                         pendingIntent
                     )
-                    Log.d(TAG, "Inexact alarm scheduled at $triggerAtMillis (exact alarm permission not granted)")
+                    AppLog.d(TAG, "Inexact alarm scheduled at $triggerAtMillis (exact alarm permission not granted)")
                 }
             }
 
@@ -58,7 +58,7 @@ class BlocklistUpdateAlarmScheduler(private val context: Context) {
                     triggerAtMillis,
                     pendingIntent
                 )
-                Log.d(TAG, "Exact alarm scheduled at $triggerAtMillis")
+                AppLog.d(TAG, "Exact alarm scheduled at $triggerAtMillis")
             }
 
             else -> {
@@ -67,7 +67,7 @@ class BlocklistUpdateAlarmScheduler(private val context: Context) {
                     triggerAtMillis,
                     pendingIntent
                 )
-                Log.d(TAG, "Exact alarm scheduled at $triggerAtMillis")
+                AppLog.d(TAG, "Exact alarm scheduled at $triggerAtMillis")
             }
         }
     }
@@ -76,7 +76,7 @@ class BlocklistUpdateAlarmScheduler(private val context: Context) {
      * 取消每日更新任务
      */
     fun cancelDailyUpdate() {
-        Log.d(TAG, "Cancelling daily blocklist update alarm")
+        AppLog.d(TAG, "Cancelling daily blocklist update alarm")
         alarmManager.cancel(createDailyPendingIntent())
     }
 
@@ -84,7 +84,7 @@ class BlocklistUpdateAlarmScheduler(private val context: Context) {
      * 手动触发一次立即更新（延迟 1 秒确保 alarm 能注册成功）
      */
     fun triggerImmediateUpdate() {
-        Log.d(TAG, "Triggering immediate blocklist update alarm")
+        AppLog.d(TAG, "Triggering immediate blocklist update alarm")
 
         val triggerAtMillis = System.currentTimeMillis() + 1000L
         val intent = Intent(context, BlocklistUpdateAlarmReceiver::class.java).apply {

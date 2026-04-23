@@ -4,7 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
-import android.util.Log
+import com.deatrg.dnsfilter.AppLog
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -19,6 +19,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
+@OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class DashboardViewModel(
     private val context: Context,
     private val preferencesManager: PreferencesManager,
@@ -29,7 +30,7 @@ class DashboardViewModel(
     companion object {
         private const val TAG = "DashboardViewModel"
         private const val VPN_STATE_TIMEOUT_MS = 5000L
-        private const val POLL_INTERVAL_MS = 100L
+        private const val POLL_INTERVAL_MS = 1000L
     }
 
     // VPN实际运行状态（从Service读取）
@@ -61,14 +62,25 @@ class DashboardViewModel(
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), DnsStatistics())
 
     init {
-        // 定期检查VPN实际运行状态并同步到UI（暂停时不轮询，省电）
+        // 定期检查VPN实际运行状态并同步到UI（使用 Flow 实现真正暂停，彻底消除后台高频唤醒）
         viewModelScope.launch {
-            while (true) {
-                if (!_isPaused.value) {
+            _isPaused
+                .flatMapLatest { paused ->
+                    if (paused) {
+                        // 完全停止发射，协程无限挂起，不消耗 CPU
+                        flow { delay(Long.MAX_VALUE) }
+                    } else {
+                        flow {
+                            while (true) {
+                                emit(Unit)
+                                delay(POLL_INTERVAL_MS)
+                            }
+                        }
+                    }
+                }
+                .collect {
                     updateVpnRunningState()
                 }
-                delay(POLL_INTERVAL_MS)
-            }
         }
 
         // 加载统计信息初始值
@@ -77,7 +89,7 @@ class DashboardViewModel(
         }
 
         // 初始化：从本地缓存加载 blocklist（不下载）
-        // 注意：不在这里调用 checkForUpdates()，由 WorkManager 负责定时更新
+        // 注意：不在这里调用 checkForUpdates()，由 AlarmManager 负责定时更新
         viewModelScope.launch {
             filterListRepository.loadFilterLists()
         }
@@ -95,7 +107,7 @@ class DashboardViewModel(
      */
     fun toggleVpn(targetEnabled: Boolean) {
         viewModelScope.launch {
-            Log.d(TAG, "toggleVpn: target=$targetEnabled, current=${_isVpnActuallyRunning.value}")
+            AppLog.d(TAG, "toggleVpn: target=$targetEnabled, current=${_isVpnActuallyRunning.value}")
             
             if (_isVpnActuallyRunning.value == targetEnabled) {
                 return@launch
@@ -116,7 +128,7 @@ class DashboardViewModel(
                     val hasData = ensureFilterListsLoaded()
                     
                     if (!hasData) {
-                        Log.e(TAG, "No filter lists available, cannot start VPN")
+                        AppLog.e(TAG, "No filter lists available, cannot start VPN")
                         // 可以在这里显示错误提示
                         return@launch
                     }
@@ -137,9 +149,9 @@ class DashboardViewModel(
                     
                     if (success) {
                         preferencesManager.setVpnEnabled(true)
-                        Log.d(TAG, "VPN started successfully")
+                        AppLog.d(TAG, "VPN started successfully")
                     } else {
-                        Log.e(TAG, "VPN start timeout")
+                        AppLog.e(TAG, "VPN start timeout")
                     }
                 } else {
                     // 停止 VPN
@@ -154,13 +166,13 @@ class DashboardViewModel(
                         preferencesManager.setVpnEnabled(false)
                         // 刷新统计信息到磁盘
                         statisticsBuffer.flush()
-                        Log.d(TAG, "VPN stopped successfully")
+                        AppLog.d(TAG, "VPN stopped successfully")
                     } else {
-                        Log.e(TAG, "VPN stop timeout")
+                        AppLog.e(TAG, "VPN stop timeout")
                     }
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Error toggling VPN", e)
+                AppLog.e(TAG, "Error toggling VPN", e)
             } finally {
                 _isVpnProcessing.value = false
             }
@@ -174,12 +186,12 @@ class DashboardViewModel(
     private suspend fun ensureFilterListsLoaded(): Boolean {
         // 如果已经加载且有数据，直接返回
         if (domainFilter.isLoaded.value && domainFilter.filterListCount.value > 0) {
-            Log.d(TAG, "Filter lists already loaded: ${domainFilter.filterListCount.value} domains")
+            AppLog.d(TAG, "Filter lists already loaded: ${domainFilter.filterListCount.value} domains")
             return true
         }
 
         // 需要加载（从缓存或下载）
-        Log.d(TAG, "Loading filter lists...")
+        AppLog.d(TAG, "Loading filter lists...")
         val loaded = domainFilter.loadFilterLists()
 
         return loaded

@@ -1,7 +1,7 @@
 package com.deatrg.dnsfilter.data.remote
 
 import android.util.Base64
-import android.util.Log
+import com.deatrg.dnsfilter.AppLog
 import com.deatrg.dnsfilter.domain.model.DnsServer
 import com.deatrg.dnsfilter.domain.model.DnsServerType
 import kotlinx.coroutines.*
@@ -68,7 +68,7 @@ class DnsQueryExecutor(
     ): DnsQueryResult = withContext(Dispatchers.IO) {
         // 先检查缓存
         getFromCache(domain, qtype)?.let { cachedIp ->
-            Log.d(TAG, "DNS cache hit: domain=$domain qtype=$qtype ip=$cachedIp")
+            AppLog.d(TAG, "DNS cache hit: domain=$domain qtype=$qtype ip=$cachedIp")
             return@withContext DnsQueryResult(
                 success = true,
                 responseIp = cachedIp,
@@ -110,7 +110,7 @@ class DnsQueryExecutor(
                     deferreds.forEach { it.cancel() }
                     // 缓存结果
                     result.first.responseIp?.let { putToCache(domain, qtype, it) }
-                    Log.d(TAG, "DNS success: domain=$domain qtype=$qtype ip=${result.first.responseIp} time=${result.second}ms")
+                    AppLog.d(TAG, "DNS success: domain=$domain qtype=$qtype ip=${result.first.responseIp} time=${result.second}ms")
                     return@coroutineScope DnsQueryResult(
                         success = true,
                         responseIp = result.first.responseIp,
@@ -124,7 +124,7 @@ class DnsQueryExecutor(
                 deferreds.remove(completed.first)
             }
 
-            Log.e(TAG, "DNS failed: domain=$domain qtype=$qtype error=$firstError")
+            AppLog.e(TAG, "DNS failed: domain=$domain qtype=$qtype error=$firstError")
             return@coroutineScope DnsQueryResult(
                 success = false,
                 responseIp = null,
@@ -167,8 +167,8 @@ class DnsQueryExecutor(
             socket.receive(responsePacket)
 
             // Log raw DNS response for debugging
-            Log.d(TAG, "Raw DNS response from $serverAddress, length=${responsePacket.length}")
-            Log.d(TAG, "DNS response bytes: ${responsePacket.data.take(minOf(32, responsePacket.length)).joinToString { String.format("%02X", it) }}")
+            AppLog.d(TAG, "Raw DNS response from $serverAddress, length=${responsePacket.length}")
+            AppLog.d(TAG, "DNS response bytes: ${responsePacket.data.take(minOf(32, responsePacket.length)).joinToString { String.format("%02X", it) }}")
 
             val responseIp = parseDnsResponse(responsePacket.data, responsePacket.length, qtype)
             if (responseIp != null) {

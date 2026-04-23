@@ -1,7 +1,7 @@
 package com.deatrg.dnsfilter.data.remote
 
 import android.content.Context
-import android.util.Log
+import com.deatrg.dnsfilter.AppLog
 import com.deatrg.dnsfilter.data.local.BlocklistCacheManager
 import com.deatrg.dnsfilter.domain.model.FilterList
 import kotlinx.coroutines.*
@@ -74,7 +74,7 @@ class DomainFilter(private val context: Context) {
         // 如果没有启用的过滤列表，直接标记为已加载（空 blocklist 是合法状态）
         if (filterListsToLoad.isEmpty()) {
             _isLoaded.value = true
-            Log.d(TAG, "No filter lists enabled, marking as loaded with empty blocklist")
+            AppLog.d(TAG, "No filter lists enabled, marking as loaded with empty blocklist")
             return@withContext
         }
         
@@ -85,7 +85,7 @@ class DomainFilter(private val context: Context) {
             if (cachedDomains != null) {
                 addDomainsToBlocklist(cachedDomains)
                 totalLoaded += cachedDomains.size
-                Log.d(TAG, "Loaded ${cachedDomains.size} domains from cache for ${filterList.name}")
+                AppLog.d(TAG, "Loaded ${cachedDomains.size} domains from cache for ${filterList.name}")
             }
         }
         
@@ -93,7 +93,7 @@ class DomainFilter(private val context: Context) {
         // 只要有数据就标记为已加载（允许部分列表失败）
         if (totalLoaded > 0) {
             _isLoaded.value = true
-            Log.d(TAG, "Total loaded from cache: $totalLoaded domains")
+            AppLog.d(TAG, "Total loaded from cache: $totalLoaded domains")
         }
     }
 
@@ -103,7 +103,7 @@ class DomainFilter(private val context: Context) {
      */
     suspend fun downloadFilterList(filterList: FilterList): Int? = withContext(Dispatchers.IO) {
         try {
-            Log.d(TAG, "Downloading filter list: ${filterList.name} from ${filterList.url}")
+            AppLog.d(TAG, "Downloading filter list: ${filterList.name} from ${filterList.url}")
             val url = URL(filterList.url)
             val domains = mutableSetOf<String>()
             
@@ -124,10 +124,10 @@ class DomainFilter(private val context: Context) {
             // 保存到缓存
             cacheManager.saveBlocklist(filterList, domains)
             
-            Log.d(TAG, "Downloaded ${domains.size} domains for ${filterList.name}")
+            AppLog.d(TAG, "Downloaded ${domains.size} domains for ${filterList.name}")
             domains.size
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to download ${filterList.name}", e)
+            AppLog.e(TAG, "Failed to download ${filterList.name}", e)
             null
         }
     }
@@ -162,7 +162,7 @@ class DomainFilter(private val context: Context) {
             _filterListCount.value = blockedDomains.size + blockedPatterns.size
             updatedLists.isNotEmpty()
         } catch (e: Exception) {
-            Log.e(TAG, "Error checking for updates", e)
+            AppLog.e(TAG, "Error checking for updates", e)
             false
         }
     }
@@ -178,7 +178,7 @@ class DomainFilter(private val context: Context) {
         // 如果没有需要加载的列表，直接返回 true（空 blocklist 是合法状态）
         if (filterListsToLoad.isEmpty()) {
             _isLoaded.value = true
-            Log.d(TAG, "No filter lists to load, returning success with empty blocklist")
+            AppLog.d(TAG, "No filter lists to load, returning success with empty blocklist")
             return@withContext true
         }
 
@@ -212,7 +212,7 @@ class DomainFilter(private val context: Context) {
                     } else {
                         // 下载失败，尝试使用旧缓存
                         if (hasCache) {
-                            Log.w(TAG, "Download failed for ${filterList.name}, using old cache")
+                            AppLog.w(TAG, "Download failed for ${filterList.name}, using old cache")
                             cacheManager.loadBlocklist(filterList)
                         } else {
                             null
@@ -232,7 +232,7 @@ class DomainFilter(private val context: Context) {
             val hasAnyData = blockedDomains.isNotEmpty() || blockedPatterns.isNotEmpty()
             _isLoaded.value = hasAnyData
 
-            Log.d(TAG, "loadFilterLists completed: ${blockedDomains.size} domains, loaded=$loadedCount/${filterListsToLoad.size}")
+            AppLog.d(TAG, "loadFilterLists completed: ${blockedDomains.size} domains, loaded=$loadedCount/${filterListsToLoad.size}")
             hasAnyData
         } finally {
             _isLoading.value = false

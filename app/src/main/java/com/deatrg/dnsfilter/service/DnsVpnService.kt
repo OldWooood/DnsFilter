@@ -5,7 +5,7 @@ import android.content.Intent
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
-import android.util.Log
+import com.deatrg.dnsfilter.AppLog
 import com.deatrg.dnsfilter.ServiceLocator
 import com.deatrg.dnsfilter.data.local.StatisticsBuffer
 import com.deatrg.dnsfilter.data.remote.DomainFilter
@@ -81,7 +81,7 @@ class DnsVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        Log.d(TAG, "onStartCommand action=${intent?.action}")
+        AppLog.d(TAG, "onStartCommand action=${intent?.action}")
         when (intent?.action) {
             ACTION_START -> startVpn()
             ACTION_STOP -> stopVpn()
@@ -91,13 +91,13 @@ class DnsVpnService : VpnService() {
 
     private fun startVpn() {
         if (isRunning) return
-        Log.d(TAG, "Starting VPN service")
+        AppLog.d(TAG, "Starting VPN service")
 
         // Load servers synchronously BEFORE starting VPN
         runBlocking {
             val prefsManager = ServiceLocator.providePreferencesManager()
             servers = prefsManager.dnsServers.first().filter { it.isEnabled }
-            Log.d(TAG, "Loaded ${servers.size} DNS servers")
+            AppLog.d(TAG, "Loaded ${servers.size} DNS servers")
         }
 
         val builder = Builder()
@@ -134,11 +134,11 @@ class DnsVpnService : VpnService() {
             isServiceRunning = true
             startForeground(NOTIFICATION_ID, createNotification())
             scope.launch { runDnsLoop() }
-            Log.d(TAG, "VPN established successfully")
+            AppLog.d(TAG, "VPN established successfully")
         } else {
             isRunning = false
             isServiceRunning = false
-            Log.e(TAG, "Failed to establish VPN interface")
+            AppLog.e(TAG, "Failed to establish VPN interface")
         }
     }
 
@@ -153,7 +153,7 @@ class DnsVpnService : VpnService() {
             try {
                 statisticsBuffer?.flush()
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to flush statistics", e)
+                AppLog.e(TAG, "Failed to flush statistics", e)
             }
         }
 
@@ -161,7 +161,7 @@ class DnsVpnService : VpnService() {
         dnsQueryExecutor?.shutdown()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
-        Log.d(TAG, "VPN stopped")
+        AppLog.d(TAG, "VPN stopped")
     }
 
     private fun runDnsLoop() {
@@ -170,7 +170,7 @@ class DnsVpnService : VpnService() {
         val outputStream = FileOutputStream(vpnInterface.fileDescriptor)
         val packet = ByteArray(MTU)
 
-        Log.d(TAG, "DNS loop started")
+        AppLog.d(TAG, "DNS loop started")
 
         try {
             while (isRunning) {
@@ -178,11 +178,11 @@ class DnsVpnService : VpnService() {
                 if (length > 0) {
                     val version = packet[0].toInt() shr 4
                     val protocol = packet[9].toInt() and 0xFF
-                    Log.d(TAG, "Packet received: version=$version, protocol=$protocol, length=$length")
+                    AppLog.d(TAG, "Packet received: version=$version, protocol=$protocol, length=$length")
 
                     val packetCopy = packet.copyOf(length)
                     if (version != 4 && version != 6) {
-                        Log.d(TAG, "Unknown packet version=$version, byte0=${String.format("%02X", packet[0])}, byte1=${String.format("%02X", packet[1])}")
+                        AppLog.d(TAG, "Unknown packet version=$version, byte0=${String.format("%02X", packet[0])}, byte1=${String.format("%02X", packet[1])}")
                     }
                     // 使用 Semaphore 限制并发处理数量
                     scope.launch {
@@ -190,30 +190,30 @@ class DnsVpnService : VpnService() {
                             try {
                                 processPacket(packetCopy, length, outputStream)
                             } catch (e: Exception) {
-                                Log.e(TAG, "Error processing packet: ${e.message}")
+                                AppLog.e(TAG, "Error processing packet: ${e.message}")
                             }
                         }
                     }
                 } else if (length == 0) {
                     // In blocking mode, read should block until data is available
                     // If it returns 0, it means immediate return with no data
-                    Log.w(TAG, "read() returned 0, no data available")
+                    AppLog.w(TAG, "read() returned 0, no data available")
                 }
             }
         } catch (e: InterruptedIOException) {
             // 正常停止，vpnInterface.close() 会中断 read()
-            Log.d(TAG, "DNS loop interrupted by stop")
+            AppLog.d(TAG, "DNS loop interrupted by stop")
         } catch (e: Exception) {
-            Log.e(TAG, "Error in DNS loop", e)
+            AppLog.e(TAG, "Error in DNS loop", e)
         } finally {
-            Log.d(TAG, "DNS loop stopped")
+            AppLog.d(TAG, "DNS loop stopped")
         }
     }
 
     private suspend fun processPacket(packet: ByteArray, length: Int, outputStream: FileOutputStream) {
         // Check minimum length for IP header
         if (length < 40) {
-            Log.d(TAG, "Packet too short: $length bytes")
+            AppLog.d(TAG, "Packet too short: $length bytes")
             return
         }
 
@@ -223,7 +223,7 @@ class DnsVpnService : VpnService() {
         when (version) {
             4 -> processIPv4Packet(packet, length, outputStream)
             6 -> processIPv6Packet(packet, length, outputStream)
-            else -> Log.d(TAG, "Unknown IP version: $version, skipping")
+            else -> AppLog.d(TAG, "Unknown IP version: $version, skipping")
         }
     }
 
@@ -231,14 +231,14 @@ class DnsVpnService : VpnService() {
         // Get protocol (byte 9) - 17 = UDP
         val protocol = packet[9].toInt() and 0xFF
         if (protocol != 17) {
-            Log.d(TAG, "Non-UDP IPv4 packet, protocol=$protocol, skipping")
+            AppLog.d(TAG, "Non-UDP IPv4 packet, protocol=$protocol, skipping")
             return
         }
 
         // Calculate IP header length
         val ihl = (packet[0].toInt() and 0x0F) * 4
         if (length < ihl + 8) {
-            Log.d(TAG, "Packet too short for UDP header")
+            AppLog.d(TAG, "Packet too short for UDP header")
             return
         }
 
@@ -248,7 +248,7 @@ class DnsVpnService : VpnService() {
 
         // Only handle DNS (port 53)
         if (dstPort != DNS_PORT) {
-            Log.d(TAG, "Non-DNS UDP packet, dstPort=$dstPort, skipping")
+            AppLog.d(TAG, "Non-DNS UDP packet, dstPort=$dstPort, skipping")
             return
         }
 
@@ -261,7 +261,7 @@ class DnsVpnService : VpnService() {
 
         if (dnsPayload.isEmpty()) return
 
-        Log.d(TAG, "IPv4 DNS query from $srcIp:$srcPort to $dstIp, DNS length: ${dnsPayload.size}")
+        AppLog.d(TAG, "IPv4 DNS query from $srcIp:$srcPort to $dstIp, DNS length: ${dnsPayload.size}")
 
         // Process DNS query
         val response = processDnsQuery(dnsPayload, srcIp, srcPort)
@@ -270,7 +270,7 @@ class DnsVpnService : VpnService() {
             // Build the full IP/UDP packet
             val fullResponse = buildIPv4FullResponse(packet, ihl, srcPort, response)
             // Log response details for debugging
-            Log.d(TAG, "Response packet: src=${fullResponse[12].toInt() and 0xFF}.${fullResponse[13].toInt() and 0xFF}.${fullResponse[14].toInt() and 0xFF}.${fullResponse[15].toInt() and 0xFF}, " +
+            AppLog.d(TAG, "Response packet: src=${fullResponse[12].toInt() and 0xFF}.${fullResponse[13].toInt() and 0xFF}.${fullResponse[14].toInt() and 0xFF}.${fullResponse[15].toInt() and 0xFF}, " +
                     "dst=${fullResponse[16].toInt() and 0xFF}.${fullResponse[17].toInt() and 0xFF}.${fullResponse[18].toInt() and 0xFF}.${fullResponse[19].toInt() and 0xFF}, " +
                     "UDP src=${((fullResponse[20].toInt() and 0xFF) shl 8) or (fullResponse[21].toInt() and 0xFF)}, " +
                     "UDP dst=${((fullResponse[22].toInt() and 0xFF) shl 8) or (fullResponse[23].toInt() and 0xFF)}")
@@ -278,13 +278,13 @@ class DnsVpnService : VpnService() {
                 try {
                     outputStream.write(fullResponse)
                     outputStream.flush()
-                    Log.d(TAG, "Successfully sent IPv4 DNS response to $srcIp:$srcPort, length: ${fullResponse.size}")
+                    AppLog.d(TAG, "Successfully sent IPv4 DNS response to $srcIp:$srcPort, length: ${fullResponse.size}")
                 } catch (e: Exception) {
-                    Log.e(TAG, "Failed to send DNS response: ${e.message}")
+                    AppLog.e(TAG, "Failed to send DNS response: ${e.message}")
                 }
             }
         } else {
-            Log.w(TAG, "No DNS response generated")
+            AppLog.w(TAG, "No DNS response generated")
         }
     }
 
@@ -292,14 +292,14 @@ class DnsVpnService : VpnService() {
         // In IPv6, byte 6 is "Next Header" - 17 = UDP
         val nextHeader = packet[6].toInt() and 0xFF
         if (nextHeader != 17) {
-            Log.d(TAG, "Non-UDP IPv6 packet, nextHeader=$nextHeader, skipping")
+            AppLog.d(TAG, "Non-UDP IPv6 packet, nextHeader=$nextHeader, skipping")
             return
         }
 
         // IPv6 fixed header is 40 bytes
         val ipv6HeaderLength = 40
         if (length < ipv6HeaderLength + 8) {
-            Log.d(TAG, "Packet too short for IPv6 UDP header")
+            AppLog.d(TAG, "Packet too short for IPv6 UDP header")
             return
         }
 
@@ -309,7 +309,7 @@ class DnsVpnService : VpnService() {
 
         // Only handle DNS (port 53)
         if (dstPort != DNS_PORT) {
-            Log.d(TAG, "Non-DNS IPv6 UDP packet, dstPort=$dstPort, skipping")
+            AppLog.d(TAG, "Non-DNS IPv6 UDP packet, dstPort=$dstPort, skipping")
             return
         }
 
@@ -322,7 +322,7 @@ class DnsVpnService : VpnService() {
 
         if (dnsPayload.isEmpty()) return
 
-        Log.d(TAG, "IPv6 DNS query from $srcIp:$srcPort to $dstIp, DNS length: ${dnsPayload.size}")
+        AppLog.d(TAG, "IPv6 DNS query from $srcIp:$srcPort to $dstIp, DNS length: ${dnsPayload.size}")
 
         // Process DNS query
         val response = processDnsQuery(dnsPayload, srcIp, srcPort)
@@ -334,9 +334,9 @@ class DnsVpnService : VpnService() {
                 outputStream.write(fullResponse)
                 outputStream.flush()
             }
-            Log.d(TAG, "Sent IPv6 DNS response to $srcIp:$srcPort, length: ${fullResponse.size}")
+            AppLog.d(TAG, "Sent IPv6 DNS response to $srcIp:$srcPort, length: ${fullResponse.size}")
         } else {
-            Log.w(TAG, "No DNS response generated")
+            AppLog.w(TAG, "No DNS response generated")
         }
     }
 
@@ -355,16 +355,16 @@ class DnsVpnService : VpnService() {
         
         // Parse domain from DNS query
         val question = parseDnsQuery(dnsPayload) ?: run {
-            Log.e(TAG, "Failed to parse DNS query")
+            AppLog.e(TAG, "Failed to parse DNS query")
             return null
         }
 
-        Log.d(TAG, "Query for domain: ${question.domain}, qtype=${question.qtype}, servers=${servers.size}")
+        AppLog.d(TAG, "Query for domain: ${question.domain}, qtype=${question.qtype}, servers=${servers.size}")
 
         // Check if domain is blocked
         val blockResult = domainFilter?.isDomainBlocked(question.domain)
         if (blockResult?.isBlocked == true) {
-            Log.d(TAG, "Domain ${question.domain} is blocked: ${blockResult.reason}")
+            AppLog.d(TAG, "Domain ${question.domain} is blocked: ${blockResult.reason}")
             
             // Update statistics（被拦截的请求不计入平均响应时间）
             statisticsBuffer?.recordQuery(blocked = true, responseTime = 0, includeInAvg = false)
@@ -374,7 +374,7 @@ class DnsVpnService : VpnService() {
 
         // Ensure servers are available
         if (servers.isEmpty()) {
-            Log.e(TAG, "No DNS servers available")
+            AppLog.e(TAG, "No DNS servers available")
             return buildErrorDnsResponse(dnsPayload, 0x0002) // SERVFAIL
         }
 
@@ -382,7 +382,7 @@ class DnsVpnService : VpnService() {
         val result = dnsQueryExecutor?.query(question.domain, servers, question.qtype)
 
         if (result?.success == true && result.responseIp != null) {
-            Log.d(TAG, "DNS response: ${question.domain} -> ${result.responseIp} (${result.responseTime}ms)")
+            AppLog.d(TAG, "DNS response: ${question.domain} -> ${result.responseIp} (${result.responseTime}ms)")
 
             // 只有真实发送的上游请求才计入平均响应时间，缓存命中不计入
             val includeInAvg = !result.fromCache
@@ -392,7 +392,7 @@ class DnsVpnService : VpnService() {
             return buildDnsResponse(dnsPayload, question.qtype, result.responseIp)
         }
 
-        Log.e(TAG, "DNS query failed: ${result?.error}")
+        AppLog.e(TAG, "DNS query failed: ${result?.error}")
         return buildErrorDnsResponse(dnsPayload, 0x0002) // SERVFAIL
     }
 
