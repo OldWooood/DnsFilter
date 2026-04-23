@@ -4,6 +4,14 @@
     public static int v(...);
 }
 
+# AppLog wraps android.util.Log; treat all its methods as no-side-effect in release
+-assumenosideeffects class com.deatrg.dnsfilter.AppLog {
+    public static int d(...);
+    public static int e(...);
+    public static int w(...);
+    public static int i(...);
+}
+
 # Add project specific ProGuard rules here.
 
 # Keep Application class (referenced in manifest)
