@@ -1,7 +1,7 @@
 package com.deatrg.dnsfilter.data.worker
 
 import android.content.Context
-import android.util.Log
+import com.deatrg.dnsfilter.AppLog
 import androidx.work.*
 import java.util.concurrent.TimeUnit
 
@@ -24,7 +24,7 @@ class BlocklistUpdateScheduler(private val context: Context) {
      * 使用 PeriodicWorkRequest 确保任务每天执行一次
      */
     fun scheduleDailyUpdate() {
-        Log.d(TAG, "Scheduling daily blocklist update")
+        AppLog.d(TAG, "Scheduling daily blocklist update")
 
         val constraints = Constraints.Builder()
             .setRequiredNetworkType(NetworkType.CONNECTED) // 需要网络连接
@@ -49,14 +49,14 @@ class BlocklistUpdateScheduler(private val context: Context) {
             dailyUpdateRequest
         )
 
-        Log.d(TAG, "Daily blocklist update scheduled successfully")
+        AppLog.d(TAG, "Daily blocklist update scheduled successfully")
     }
 
     /**
      * 取消每日更新任务
      */
     fun cancelDailyUpdate() {
-        Log.d(TAG, "Cancelling daily blocklist update")
+        AppLog.d(TAG, "Cancelling daily blocklist update")
         WorkManager.getInstance(context).cancelUniqueWork(BlocklistUpdateWorker.WORK_NAME)
     }
 
@@ -64,7 +64,7 @@ class BlocklistUpdateScheduler(private val context: Context) {
      * 手动触发一次立即更新
      */
     fun triggerImmediateUpdate() {
-        Log.d(TAG, "Triggering immediate blocklist update")
+        AppLog.d(TAG, "Triggering immediate blocklist update")
 
         val constraints = Constraints.Builder()
             .setRequiredNetworkType(NetworkType.CONNECTED)

@@ -224,26 +224,18 @@ private fun StatusCard(
                     label = "icon_scale"
                 )
 
-                val infiniteTransition = rememberInfiniteTransition(label = "pulse")
-                val pulseAlpha by infiniteTransition.animateFloat(
-                    initialValue = 0.12f,
-                    targetValue = 0.28f,
-                    animationSpec = infiniteFloatTween,
-                    label = "pulse_alpha"
-                )
-
                 Box(
                     modifier = Modifier.size(72.dp),
                     contentAlignment = Alignment.Center
                 ) {
-                    // Glow ring
+                    // 静态 glow ring（移除无限动画，避免后台持续消耗 CPU）
                     if (isRunning) {
                         Box(
                             modifier = Modifier
                                 .fillMaxSize()
                                 .scale(scale)
                                 .clip(CircleShape)
-                                .background(contentColor.copy(alpha = pulseAlpha))
+                                .background(contentColor.copy(alpha = 0.2f))
                         )
                     }
                     // Icon background
@@ -598,7 +590,4 @@ private fun formatLargeNumber(number: Long): String {
     }
 }
 
-private val infiniteFloatTween = infiniteRepeatable<Float>(
-    animation = tween(1500, easing = FastOutSlowInEasing),
-    repeatMode = RepeatMode.Reverse
-)
+

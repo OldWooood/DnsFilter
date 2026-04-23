@@ -1,7 +1,7 @@
 package com.deatrg.dnsfilter.data.worker
 
 import android.content.Context
-import android.util.Log
+import com.deatrg.dnsfilter.AppLog
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import com.deatrg.dnsfilter.ServiceLocator
@@ -24,7 +24,7 @@ class BlocklistUpdateWorker(
     }
 
     override suspend fun doWork(): Result {
-        Log.d(TAG, "Starting daily blocklist update")
+        AppLog.d(TAG, "Starting daily blocklist update")
 
         return try {
             val repository = ServiceLocator.provideFilterListRepository()
@@ -35,10 +35,10 @@ class BlocklistUpdateWorker(
             // 检查并更新过期的 blocklist
             repository.checkAndUpdate()
 
-            Log.d(TAG, "Daily blocklist update completed successfully")
+            AppLog.d(TAG, "Daily blocklist update completed successfully")
             Result.success()
         } catch (e: Exception) {
-            Log.e(TAG, "Daily blocklist update failed", e)
+            AppLog.e(TAG, "Daily blocklist update failed", e)
             // 网络错误等临时性问题，重试
             if (runAttemptCount < 3) {
                 Result.retry()
