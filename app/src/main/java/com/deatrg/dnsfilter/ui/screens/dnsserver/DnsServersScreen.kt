@@ -19,8 +19,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.deatrg.dnsfilter.R
 import com.deatrg.dnsfilter.domain.model.DnsServer
 import com.deatrg.dnsfilter.domain.model.DnsServerType
+import androidx.compose.ui.res.stringResource
 
 @Composable
 fun DnsServersScreen(
@@ -37,7 +39,7 @@ fun DnsServersScreen(
                 containerColor = MaterialTheme.colorScheme.primary,
                 contentColor = MaterialTheme.colorScheme.onPrimary
             ) {
-                Icon(Icons.Default.Add, contentDescription = "Add DNS Server")
+                Icon(Icons.Default.Add, contentDescription = stringResource(R.string.dns_server_add))
             }
         }
     ) { padding ->
@@ -79,7 +81,7 @@ fun DnsServersScreen(
             ) {
                 Icon(Icons.Default.Refresh, contentDescription = null)
                 Spacer(modifier = Modifier.width(8.dp))
-                Text("Reset to Defaults")
+                Text(stringResource(R.string.dns_servers_reset_defaults))
             }
             Spacer(modifier = Modifier.height(8.dp))
         }
@@ -99,14 +101,14 @@ fun DnsServersScreen(
 @Composable
 private fun HeaderSection() {
     Text(
-        text = "DNS Servers",
+        text = stringResource(R.string.dns_servers_title),
         style = MaterialTheme.typography.headlineLarge,
         fontWeight = FontWeight.ExtraBold,
         modifier = Modifier.padding(top = 20.dp, bottom = 4.dp),
         color = MaterialTheme.colorScheme.onBackground
     )
     Text(
-        text = "Configure upstream DNS servers. Multiple servers are queried concurrently.",
+        text = stringResource(R.string.dns_servers_subtitle),
         style = MaterialTheme.typography.bodyMedium,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
         modifier = Modifier.padding(bottom = 16.dp)
@@ -152,13 +154,13 @@ private fun EmptyStateCard() {
             }
             Spacer(modifier = Modifier.height(16.dp))
             Text(
-                "No DNS servers configured",
+                stringResource(R.string.dns_servers_empty_title),
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = "Tap + to add a DNS server",
+                text = stringResource(R.string.dns_servers_empty_hint),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -230,7 +232,7 @@ private fun DnsServerCard(
             IconButton(onClick = onToggle) {
                 Icon(
                     imageVector = if (server.isEnabled) Icons.Filled.CheckCircle else Icons.Outlined.Cancel,
-                    contentDescription = if (server.isEnabled) "Enabled" else "Disabled",
+                    contentDescription = if (server.isEnabled) stringResource(R.string.dns_server_enabled) else stringResource(R.string.dns_server_disabled),
                     tint = if (server.isEnabled)
                         MaterialTheme.colorScheme.primary
                     else
@@ -241,7 +243,7 @@ private fun DnsServerCard(
             IconButton(onClick = onDelete) {
                 Icon(
                     Icons.Outlined.Delete,
-                    contentDescription = "Delete",
+                    contentDescription = stringResource(R.string.dns_server_delete),
                     tint = MaterialTheme.colorScheme.error.copy(alpha = 0.7f)
                 )
             }
@@ -265,7 +267,7 @@ private fun AddDnsServerDialog(
         shape = RoundedCornerShape(28.dp),
         title = {
             Text(
-                "Add DNS Server",
+                stringResource(R.string.dns_server_add),
                 fontWeight = FontWeight.Bold
             )
         },
@@ -274,7 +276,7 @@ private fun AddDnsServerDialog(
                 OutlinedTextField(
                     value = name,
                     onValueChange = { name = it },
-                    label = { Text("Name") },
+                    label = { Text(stringResource(R.string.dns_server_name)) },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(16.dp)
@@ -282,8 +284,8 @@ private fun AddDnsServerDialog(
                 OutlinedTextField(
                     value = address,
                     onValueChange = { address = it },
-                    label = { Text("Address") },
-                    placeholder = { Text("1.1.1.1 or https://...") },
+                    label = { Text(stringResource(R.string.dns_server_address)) },
+                    placeholder = { Text(stringResource(R.string.dns_server_address_placeholder)) },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(16.dp)
@@ -296,7 +298,7 @@ private fun AddDnsServerDialog(
                         value = selectedType.name,
                         onValueChange = { },
                         readOnly = true,
-                        label = { Text("Type") },
+                        label = { Text(stringResource(R.string.dns_server_type)) },
                         trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
                         modifier = Modifier
                             .fillMaxWidth()
@@ -326,12 +328,12 @@ private fun AddDnsServerDialog(
                 enabled = name.isNotBlank() && address.isNotBlank(),
                 shape = RoundedCornerShape(14.dp)
             ) {
-                Text("Add")
+                Text(stringResource(R.string.action_add))
             }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) {
-                Text("Cancel")
+                Text(stringResource(R.string.action_cancel))
             }
         }
     )

@@ -23,6 +23,7 @@ import com.deatrg.dnsfilter.ui.screens.dashboard.DashboardScreen
 import com.deatrg.dnsfilter.ui.screens.dnsserver.DnsServersScreen
 import com.deatrg.dnsfilter.ui.screens.filterlist.FilterListsScreen
 import com.deatrg.dnsfilter.ui.theme.DnsFilterTheme
+import androidx.compose.ui.res.stringResource
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -65,12 +66,12 @@ private fun MainScreen() {
                             ) { isSelected ->
                                 Icon(
                                     imageVector = if (isSelected) screen.filledIcon else screen.icon,
-                                    contentDescription = screen.title,
+                                    contentDescription = stringResource(screen.titleRes),
                                     modifier = Modifier.size(24.dp)
                                 )
                             }
                         },
-                        label = { Text(screen.title, style = MaterialTheme.typography.labelMedium) },
+                        label = { Text(stringResource(screen.titleRes), style = MaterialTheme.typography.labelMedium) },
                         selected = selected,
                         onClick = {
                             navController.navigate(screen.route) {
