@@ -7,6 +7,7 @@ import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import com.deatrg.dnsfilter.AppLog
+import com.deatrg.dnsfilter.R
 import com.deatrg.dnsfilter.ServiceLocator
 import com.deatrg.dnsfilter.data.local.StatisticsBuffer
 import com.deatrg.dnsfilter.data.remote.DomainFilter
@@ -930,13 +931,13 @@ class DnsVpnService : VpnService() {
 
         val stopAction = Notification.Action.Builder(
             Icon.createWithResource(this, android.R.drawable.ic_media_pause),
-            "Stop",
+            getString(R.string.notification_action_stop),
             stopPendingIntent
         ).build()
 
         return Notification.Builder(this, "dnsfilter_channel")
-            .setContentTitle("DnsFilter Active")
-            .setContentText("DNS filtering is enabled")
+            .setContentTitle(getString(R.string.notification_title))
+            .setContentText(getString(R.string.notification_text))
             .setSmallIcon(android.R.drawable.ic_lock_idle_lock)
             .setContentIntent(pendingIntent)
             .addAction(stopAction)
@@ -948,10 +949,10 @@ class DnsVpnService : VpnService() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 "dnsfilter_channel",
-                "DnsFilter Service",
+                getString(R.string.notification_channel_name),
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "DNS filtering service notification"
+                description = getString(R.string.notification_channel_description)
             }
 
             val notificationManager = getSystemService(NotificationManager::class.java)

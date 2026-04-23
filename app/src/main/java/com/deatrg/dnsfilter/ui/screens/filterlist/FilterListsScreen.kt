@@ -19,7 +19,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.deatrg.dnsfilter.R
 import com.deatrg.dnsfilter.domain.model.FilterList
+import androidx.compose.ui.res.stringResource
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -41,7 +43,7 @@ fun FilterListsScreen(
                 containerColor = MaterialTheme.colorScheme.primary,
                 contentColor = MaterialTheme.colorScheme.onPrimary
             ) {
-                Icon(Icons.Default.Add, contentDescription = "Add Filter List")
+                Icon(Icons.Default.Add, contentDescription = stringResource(R.string.filter_list_add))
             }
         }
     ) { padding ->
@@ -98,11 +100,11 @@ fun FilterListsScreen(
             shape = RoundedCornerShape(28.dp),
             title = {
                 Text(
-                    "Delete Filter List",
+                    stringResource(R.string.filter_list_delete_title),
                     fontWeight = FontWeight.Bold
                 )
             },
-            text = { Text("Are you sure you want to delete \"${filterList.name}\"?") },
+            text = { Text(stringResource(R.string.filter_list_delete_message, filterList.name)) },
             confirmButton = {
                 TextButton(
                     onClick = {
@@ -110,12 +112,12 @@ fun FilterListsScreen(
                         filterListToDelete = null
                     }
                 ) {
-                    Text("Delete", color = MaterialTheme.colorScheme.error)
+                    Text(stringResource(R.string.filter_list_delete), color = MaterialTheme.colorScheme.error)
                 }
             },
             dismissButton = {
                 TextButton(onClick = { filterListToDelete = null }) {
-                    Text("Cancel")
+                    Text(stringResource(R.string.action_cancel))
                 }
             }
         )
@@ -128,7 +130,7 @@ private fun HeaderSection(
     isLoaded: Boolean
 ) {
     Text(
-        text = "Filter Lists",
+        text = stringResource(R.string.filter_lists_title),
         style = MaterialTheme.typography.headlineLarge,
         fontWeight = FontWeight.ExtraBold,
         modifier = Modifier.padding(top = 20.dp, bottom = 4.dp),
@@ -142,7 +144,7 @@ private fun HeaderSection(
         verticalAlignment = Alignment.CenterVertically
     ) {
         Text(
-            text = if (isLoaded) "$filterCount domains blocked" else "Loading...",
+            text = if (isLoaded) stringResource(R.string.filter_lists_domains_blocked, filterCount) else stringResource(R.string.filter_lists_loading),
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -194,13 +196,13 @@ private fun EmptyStateCard() {
             }
             Spacer(modifier = Modifier.height(16.dp))
             Text(
-                "No filter lists configured",
+                stringResource(R.string.filter_lists_empty_title),
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = "Tap + to add a filter list",
+                text = stringResource(R.string.filter_lists_empty_hint),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -244,7 +246,7 @@ private fun FilterListCard(
                             onClick = { },
                             label = {
                                 Text(
-                                    "Built-in",
+                                    stringResource(R.string.filter_list_built_in),
                                     style = MaterialTheme.typography.labelSmall,
                                     fontWeight = FontWeight.Medium
                                 )
@@ -268,7 +270,7 @@ private fun FilterListCard(
                 if (item.lastUpdated != null) {
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "Updated: ${dateFormat.format(Date(item.lastUpdated))}",
+                        text = stringResource(R.string.filter_list_updated, dateFormat.format(Date(item.lastUpdated))),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
                     )
@@ -277,7 +279,7 @@ private fun FilterListCard(
             IconButton(onClick = onToggle) {
                 Icon(
                     imageVector = if (filterList.isEnabled) Icons.Filled.Shield else Icons.Outlined.Shield,
-                    contentDescription = if (filterList.isEnabled) "Enabled" else "Disabled",
+                    contentDescription = if (filterList.isEnabled) stringResource(R.string.filter_list_enabled) else stringResource(R.string.filter_list_disabled),
                     tint = if (filterList.isEnabled)
                         MaterialTheme.colorScheme.primary
                     else
@@ -289,7 +291,7 @@ private fun FilterListCard(
                 IconButton(onClick = onDelete) {
                     Icon(
                         Icons.Outlined.Delete,
-                        contentDescription = "Delete",
+                        contentDescription = stringResource(R.string.filter_list_delete),
                         tint = MaterialTheme.colorScheme.error.copy(alpha = 0.7f)
                     )
                 }
@@ -311,7 +313,7 @@ private fun AddFilterListDialog(
         shape = RoundedCornerShape(28.dp),
         title = {
             Text(
-                "Add Filter List",
+                stringResource(R.string.filter_list_add),
                 fontWeight = FontWeight.Bold
             )
         },
@@ -320,7 +322,7 @@ private fun AddFilterListDialog(
                 OutlinedTextField(
                     value = name,
                     onValueChange = { name = it },
-                    label = { Text("Name") },
+                    label = { Text(stringResource(R.string.filter_list_name)) },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(16.dp)
@@ -328,14 +330,14 @@ private fun AddFilterListDialog(
                 OutlinedTextField(
                     value = url,
                     onValueChange = { url = it },
-                    label = { Text("URL") },
-                    placeholder = { Text("https://...") },
+                    label = { Text(stringResource(R.string.filter_list_url)) },
+                    placeholder = { Text(stringResource(R.string.filter_list_url_placeholder)) },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(16.dp)
                 )
                 Text(
-                    text = "Supports AdAway-format blocklists (.txt or hosts files)",
+                    text = stringResource(R.string.filter_list_format_hint),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -347,12 +349,12 @@ private fun AddFilterListDialog(
                 enabled = name.isNotBlank() && url.isNotBlank(),
                 shape = RoundedCornerShape(14.dp)
             ) {
-                Text("Add")
+                Text(stringResource(R.string.action_add))
             }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) {
-                Text("Cancel")
+                Text(stringResource(R.string.action_cancel))
             }
         }
     )

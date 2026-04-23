@@ -1,3 +1,74 @@
 <resources>
     <string name="app_name">DnsFilter</string>
+
+    <!-- Navigation -->
+    <string name="nav_dashboard">Dashboard</string>
+    <string name="nav_dns">DNS</string>
+    <string name="nav_filters">Filters</string>
+
+    <!-- Dashboard -->
+    <string name="dashboard_title">Dashboard</string>
+    <string name="dashboard_snackbar_no_dns_servers">Please enable at least one DNS server</string>
+    <string name="status_downloading_blocklist">Downloading blocklist%1$s…</string>
+    <string name="status_stopping">Stopping…</string>
+    <string name="status_starting">Starting…</string>
+    <string name="status_protection_active">Protection Active</string>
+    <string name="status_protection_inactive">Protection Inactive</string>
+    <string name="status_dns_filtering_enabled">DNS filtering is enabled</string>
+    <string name="status_dns_filtering_no_blocklist">DNS filtering enabled (no blocklist)</string>
+    <string name="status_downloading_filter_rules">Downloading filter rules%1$s…</string>
+    <string name="status_tap_enable_no_blocklist">Tap to enable protection (no blocklist configured)</string>
+    <string name="status_tap_enable">Tap to enable protection</string>
+    <string name="action_stop">STOP</string>
+    <string name="action_start">START</string>
+
+    <!-- Statistics -->
+    <string name="statistics_title">Statistics</string>
+    <string name="stat_total">Total</string>
+    <string name="stat_blocked">Blocked</string>
+    <string name="stat_block_rate">Block Rate</string>
+    <string name="stat_avg_response">Avg Response</string>
+
+    <!-- DNS Servers -->
+    <string name="dns_servers_title">DNS Servers</string>
+    <string name="dns_servers_subtitle">Configure upstream DNS servers. Multiple servers are queried concurrently.</string>
+    <string name="dns_servers_empty_title">No DNS servers configured</string>
+    <string name="dns_servers_empty_hint">Tap + to add a DNS server</string>
+    <string name="dns_server_add">Add DNS Server</string>
+    <string name="dns_server_name">Name</string>
+    <string name="dns_server_address">Address</string>
+    <string name="dns_server_address_placeholder">1.1.1.1 or https://…</string>
+    <string name="dns_server_type">Type</string>
+    <string name="dns_server_enabled">Enabled</string>
+    <string name="dns_server_disabled">Disabled</string>
+    <string name="dns_server_delete">Delete</string>
+    <string name="dns_servers_reset_defaults">Reset to Defaults</string>
+    <string name="action_add">Add</string>
+    <string name="action_cancel">Cancel</string>
+
+    <!-- Filter Lists -->
+    <string name="filter_lists_title">Filter Lists</string>
+    <string name="filter_lists_domains_blocked">%1$d domains blocked</string>
+    <string name="filter_lists_loading">Loading…</string>
+    <string name="filter_lists_empty_title">No filter lists configured</string>
+    <string name="filter_lists_empty_hint">Tap + to add a filter list</string>
+    <string name="filter_list_add">Add Filter List</string>
+    <string name="filter_list_name">Name</string>
+    <string name="filter_list_url">URL</string>
+    <string name="filter_list_url_placeholder">https://…</string>
+    <string name="filter_list_format_hint">Supports AdAway-format blocklists (.txt or hosts files)</string>
+    <string name="filter_list_built_in">Built-in</string>
+    <string name="filter_list_updated">Updated: %1$s</string>
+    <string name="filter_list_enabled">Enabled</string>
+    <string name="filter_list_disabled">Disabled</string>
+    <string name="filter_list_delete">Delete</string>
+    <string name="filter_list_delete_title">Delete Filter List</string>
+    <string name="filter_list_delete_message">Are you sure you want to delete "%1$s"?</string>
+
+    <!-- Service Notification -->
+    <string name="notification_channel_name">DnsFilter Service</string>
+    <string name="notification_channel_description">DNS filtering service notification</string>
+    <string name="notification_title">DnsFilter Active</string>
+    <string name="notification_text">DNS filtering is enabled</string>
+    <string name="notification_action_stop">Stop</string>
 </resources>

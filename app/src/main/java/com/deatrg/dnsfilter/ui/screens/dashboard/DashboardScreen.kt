@@ -34,7 +34,9 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.deatrg.dnsfilter.R
 import com.deatrg.dnsfilter.domain.model.DnsStatistics
+import androidx.compose.ui.res.stringResource
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -50,6 +52,7 @@ fun DashboardScreen(
     val isFilterLoading by viewModel.isFilterLoading.collectAsStateWithLifecycle(initialValue = false)
     val downloadProgress by viewModel.downloadProgress.collectAsStateWithLifecycle(initialValue = null)
     val snackbarHostState = remember { SnackbarHostState() }
+    val context = LocalContext.current
 
     val vpnPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
@@ -61,7 +64,7 @@ fun DashboardScreen(
 
     LaunchedEffect(Unit) {
         viewModel.showNoDnsServersError.collect {
-            snackbarHostState.showSnackbar("Please enable at least one DNS server")
+            snackbarHostState.showSnackbar(context.getString(R.string.dashboard_snackbar_no_dns_servers))
         }
     }
 
@@ -139,7 +142,7 @@ private fun HeaderSection() {
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
         Text(
-            text = "Dashboard",
+            text = stringResource(R.string.dashboard_title),
             style = MaterialTheme.typography.headlineMedium,
             fontWeight = FontWeight.ExtraBold,
             color = MaterialTheme.colorScheme.onBackground
@@ -266,11 +269,11 @@ private fun StatusCard(
                 val hasNoFilters = filterCount == 0 && !isFilterLoading
 
                 val statusText = when {
-                    isProcessing && isFilterLoading && filterCount == 0 -> "Downloading blocklist$progressText..."
-                    isProcessing && isRunning -> "Stopping..."
-                    isProcessing && !isRunning -> "Starting..."
-                    isRunning -> "Protection Active"
-                    else -> "Protection Inactive"
+                    isProcessing && isFilterLoading && filterCount == 0 -> stringResource(R.string.status_downloading_blocklist, progressText)
+                    isProcessing && isRunning -> stringResource(R.string.status_stopping)
+                    isProcessing && !isRunning -> stringResource(R.string.status_starting)
+                    isRunning -> stringResource(R.string.status_protection_active)
+                    else -> stringResource(R.string.status_protection_inactive)
                 }
 
                 Text(
@@ -282,10 +285,10 @@ private fun StatusCard(
 
                 Text(
                     text = when {
-                        isRunning -> if (filterCount > 0) "DNS filtering is enabled" else "DNS filtering enabled (no blocklist)"
-                        isFilterLoading && filterCount == 0 -> "Downloading filter rules$progressText..."
-                        hasNoFilters -> "Tap to enable protection (no blocklist configured)"
-                        else -> "Tap to enable protection"
+                        isRunning -> if (filterCount > 0) stringResource(R.string.status_dns_filtering_enabled) else stringResource(R.string.status_dns_filtering_no_blocklist)
+                        isFilterLoading && filterCount == 0 -> stringResource(R.string.status_downloading_filter_rules, progressText)
+                        hasNoFilters -> stringResource(R.string.status_tap_enable_no_blocklist)
+                        else -> stringResource(R.string.status_tap_enable)
                     },
                     style = MaterialTheme.typography.bodySmall,
                     color = contentColor.copy(alpha = 0.85f)
@@ -338,7 +341,7 @@ private fun StatusCard(
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = if (isRunning) "STOP" else "START",
+                        text = if (isRunning) stringResource(R.string.action_stop) else stringResource(R.string.action_start),
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = FontWeight.Bold
                     )
@@ -352,7 +355,7 @@ private fun StatusCard(
 private fun StatisticsSection(statistics: DnsStatistics?) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text(
-            text = "Statistics",
+            text = stringResource(R.string.statistics_title),
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.onBackground
@@ -366,7 +369,7 @@ private fun StatisticsSection(statistics: DnsStatistics?) {
             ) {
                 ModernStatCard(
                     modifier = Modifier.weight(1f),
-                    title = "Total",
+                    title = stringResource(R.string.stat_total),
                     value = formatLargeNumber(statistics?.totalQueries ?: 0),
                     icon = Icons.Outlined.QueryStats,
                     containerColor = MaterialTheme.colorScheme.surfaceContainer,
@@ -374,7 +377,7 @@ private fun StatisticsSection(statistics: DnsStatistics?) {
                 )
                 ModernStatCard(
                     modifier = Modifier.weight(1f),
-                    title = "Blocked",
+                    title = stringResource(R.string.stat_blocked),
                     value = formatLargeNumber(statistics?.blockedQueries ?: 0),
                     icon = Icons.Outlined.Block,
                     containerColor = MaterialTheme.colorScheme.surfaceContainer,
@@ -395,7 +398,7 @@ private fun StatisticsSection(statistics: DnsStatistics?) {
 
                 BlockRateStatCard(
                     modifier = Modifier.weight(1f),
-                    title = "拦截率",
+                    title = stringResource(R.string.stat_block_rate),
                     value = blockRateText,
                     progress = blockRate / 100f,
                     icon = Icons.Outlined.Security,
@@ -404,7 +407,7 @@ private fun StatisticsSection(statistics: DnsStatistics?) {
                 )
                 ModernStatCard(
                     modifier = Modifier.weight(1f),
-                    title = "Avg Response",
+                    title = stringResource(R.string.stat_avg_response),
                     value = "${statistics?.averageResponseTime ?: 0}ms",
                     icon = Icons.Outlined.Speed,
                     containerColor = MaterialTheme.colorScheme.surfaceContainer,
