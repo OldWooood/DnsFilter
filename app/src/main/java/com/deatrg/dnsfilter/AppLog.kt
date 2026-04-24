@@ -15,6 +15,12 @@ object AppLog {
         }
     }
 
+    inline fun d(tag: String, msg: () -> String) {
+        if (BuildConfig.DEBUG) {
+            Log.d(tag, msg())
+        }
+    }
+
     @JvmStatic
     fun d(tag: String, msg: String, tr: Throwable) {
         if (BuildConfig.DEBUG) {
@@ -29,6 +35,12 @@ object AppLog {
         }
     }
 
+    inline fun e(tag: String, msg: () -> String) {
+        if (BuildConfig.DEBUG) {
+            Log.e(tag, msg())
+        }
+    }
+
     @JvmStatic
     fun e(tag: String, msg: String, tr: Throwable) {
         if (BuildConfig.DEBUG) {
@@ -40,6 +52,12 @@ object AppLog {
     fun w(tag: String, msg: String) {
         if (BuildConfig.DEBUG) {
             Log.w(tag, msg)
+        }
+    }
+
+    inline fun w(tag: String, msg: () -> String) {
+        if (BuildConfig.DEBUG) {
+            Log.w(tag, msg())
         }
     }
 
