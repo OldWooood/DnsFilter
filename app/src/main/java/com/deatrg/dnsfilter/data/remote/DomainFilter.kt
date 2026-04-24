@@ -26,13 +26,12 @@ class DomainFilter(
     private val cacheManager = BlocklistCacheManager(context)
 
     private data class BlocklistSnapshot(
-        val blockedDomains: Set<String> = emptySet(),
-        val blockedPatterns: List<Regex> = emptyList()
+        val blockedDomains: Set<String> = emptySet()
     ) {
         val totalCount: Int
-            get() = blockedDomains.size + blockedPatterns.size
+            get() = blockedDomains.size
 
-        fun hasData(): Boolean = blockedDomains.isNotEmpty() || blockedPatterns.isNotEmpty()
+        fun hasData(): Boolean = blockedDomains.isNotEmpty()
     }
 
     private val snapshotRef = AtomicReference(BlocklistSnapshot())
@@ -94,19 +93,18 @@ class DomainFilter(
         // 从本地缓存加载
         var totalLoaded = 0
         val newBlockedDomains = HashSet<String>()
-        val newBlockedPatterns = mutableListOf<Regex>()
+        val cachedBlocklists = loadCachedBlocklists(filterListsToLoad)
         filterListsToLoad.forEach { filterList ->
-            val cachedDomains = cacheManager.loadBlocklist(filterList)
+            val cachedDomains = cachedBlocklists[filterList]
             if (cachedDomains != null) {
-                addDomainsToBlocklist(cachedDomains, newBlockedDomains, newBlockedPatterns)
+                addDomainsToBlocklist(cachedDomains, newBlockedDomains)
                 totalLoaded += cachedDomains.size
                 AppLog.d(TAG, "Loaded ${cachedDomains.size} domains from cache for ${filterList.name}")
             }
         }
 
         val snapshot = BlocklistSnapshot(
-            blockedDomains = newBlockedDomains,
-            blockedPatterns = newBlockedPatterns
+            blockedDomains = newBlockedDomains
         )
         publishSnapshot(snapshot)
 
@@ -122,6 +120,10 @@ class DomainFilter(
      * @return 下载的域名数量，null 表示下载失败
      */
     suspend fun downloadFilterList(filterList: FilterList): Int? = withContext(Dispatchers.IO) {
+        downloadFilterListDomains(filterList)?.size
+    }
+
+    private suspend fun downloadFilterListDomains(filterList: FilterList): Set<String>? = withContext(Dispatchers.IO) {
         try {
             AppLog.d(TAG, "Downloading filter list: ${filterList.name} from ${filterList.url}")
             val domains = mutableSetOf<String>()
@@ -155,7 +157,7 @@ class DomainFilter(
             cacheManager.saveBlocklist(filterList, domains)
             
             AppLog.d(TAG, "Downloaded ${domains.size} domains for ${filterList.name}")
-            domains.size
+            domains
         } catch (e: Exception) {
             AppLog.e(TAG, "Failed to download ${filterList.name}", e)
             null
@@ -218,7 +220,6 @@ class DomainFilter(
         try {
             var loadedCount = 0
             val newBlockedDomains = HashSet<String>()
-            val newBlockedPatterns = mutableListOf<Regex>()
 
             filterListsToLoad.forEach { filterList ->
                 val hasCache = cacheManager.hasCache(filterList)
@@ -228,10 +229,10 @@ class DomainFilter(
                     cacheManager.loadBlocklist(filterList)
                 } else {
                     // 需要下载
-                    val count = downloadFilterList(filterList)
-                    if (count != null) {
+                    val downloadedDomains = downloadFilterListDomains(filterList)
+                    if (downloadedDomains != null) {
                         loadedCount++
-                        cacheManager.loadBlocklist(filterList)
+                        downloadedDomains
                     } else {
                         // 下载失败，尝试使用旧缓存
                         if (hasCache) {
@@ -243,14 +244,13 @@ class DomainFilter(
                     }
                 }
 
-                domains?.let { addDomainsToBlocklist(it, newBlockedDomains, newBlockedPatterns) }
+                domains?.let { addDomainsToBlocklist(it, newBlockedDomains) }
                 downloadedCount.incrementAndGet()
                 _downloadProgress.value = Pair(downloadedCount.get(), filterListsToLoad.size)
             }
 
             val snapshot = BlocklistSnapshot(
-                blockedDomains = newBlockedDomains,
-                blockedPatterns = newBlockedPatterns
+                blockedDomains = newBlockedDomains
             )
             publishSnapshot(snapshot)
 
@@ -289,23 +289,17 @@ class DomainFilter(
      * 从缓存重新加载所有列表
      */
     suspend fun reloadAllFromCache() = withContext(Dispatchers.IO) {
-        // 预计算总大小以避免 rehash
-        var totalDomains = 0
-        filterListsToLoad.forEach { filterList ->
-            cacheManager.loadBlocklist(filterList)?.let { totalDomains += it.size }
-        }
+        val cachedBlocklists = loadCachedBlocklists(filterListsToLoad)
+        val totalDomains = cachedBlocklists.values.sumOf { it.size }
 
         // 使用预分配容量创建新集合
         val newBlockedDomains = HashSet<String>(totalDomains.coerceAtLeast(1000))
-        val newBlockedPatterns = mutableListOf<Regex>()
 
         filterListsToLoad.forEach { filterList ->
-            val cachedDomains = cacheManager.loadBlocklist(filterList)
+            val cachedDomains = cachedBlocklists[filterList]
             if (cachedDomains != null) {
                 cachedDomains.forEach { domain ->
-                    if (domain.contains("*")) {
-                        newBlockedPatterns.add(createPattern(domain))
-                    } else {
+                    if (!domain.contains("*")) {
                         newBlockedDomains.add(domain)
                     }
                 }
@@ -314,44 +308,49 @@ class DomainFilter(
 
         publishSnapshot(
             BlocklistSnapshot(
-                blockedDomains = newBlockedDomains,
-                blockedPatterns = newBlockedPatterns
+                blockedDomains = newBlockedDomains
             )
         )
     }
 
     private fun addDomainsToBlocklist(
         domains: Set<String>,
-        blockedDomains: MutableSet<String>,
-        blockedPatterns: MutableList<Regex>
+        blockedDomains: MutableSet<String>
     ) {
         domains.forEach { domain ->
-            if (domain.contains("*")) {
-                blockedPatterns.add(createPattern(domain))
-            } else {
+            if (!domain.contains("*")) {
                 blockedDomains.add(domain)
             }
         }
     }
 
     private fun parseHostLine(line: String): String? {
-        val parts = line.split(Regex("\\s+"))
-        return if (parts.size >= 2) {
-            val ip = parts[0]
-            val domain = parts[1]
-            if ((ip == "0.0.0.0" || ip == "127.0.0.1") && domain.isNotEmpty()) {
-                domain.lowercase()
-            } else null
-        } else if (line.contains(".") && !line.startsWith("#")) {
-            line.lowercase().trimEnd('.')
-        } else null
-    }
+        if (line.isEmpty() || line[0] == '#') return null
 
-    private fun createPattern(domain: String): Regex {
-        val regexPattern = domain
-            .replace(".", "\\.")
-            .replace("*", ".*")
-        return Regex("^$regexPattern$", RegexOption.IGNORE_CASE)
+        val firstWhitespace = line.indexOfFirst { it.isWhitespace() }
+        if (firstWhitespace >= 0) {
+            val ip = line.substring(0, firstWhitespace)
+            if (ip != "0.0.0.0" && ip != "127.0.0.1") return null
+
+            var domainStart = firstWhitespace + 1
+            while (domainStart < line.length && line[domainStart].isWhitespace()) {
+                domainStart++
+            }
+            if (domainStart >= line.length) return null
+
+            var domainEnd = domainStart
+            while (domainEnd < line.length && !line[domainEnd].isWhitespace()) {
+                domainEnd++
+            }
+            val domain = line.substring(domainStart, domainEnd).lowercase().trimEnd('.')
+            return if (domain.isNotEmpty()) domain else null
+        }
+
+        return if (line.contains(".")) {
+            line.lowercase().trimEnd('.')
+        } else {
+            null
+        }
     }
 
     fun isDomainBlocked(domain: String): BlockResult {
@@ -398,13 +397,6 @@ class DomainFilter(
             checkDomain = checkDomain.substringAfter(".")
         }
 
-        // Check regex patterns
-        for (pattern in snapshot.blockedPatterns) {
-            if (pattern.matches(domain)) {
-                return BlockResult(true, "blocked_pattern")
-            }
-        }
-
         return BlockResult(false, null)
     }
 
@@ -427,6 +419,14 @@ class DomainFilter(
 
     fun shutdown() {
         scope.cancel()
+    }
+
+    private suspend fun loadCachedBlocklists(filterLists: List<FilterList>): Map<FilterList, Set<String>> {
+        val loaded = LinkedHashMap<FilterList, Set<String>>(filterLists.size)
+        filterLists.forEach { filterList ->
+            cacheManager.loadBlocklist(filterList)?.let { loaded[filterList] = it }
+        }
+        return loaded
     }
 }
 

@@ -1,6 +1,5 @@
 package com.deatrg.dnsfilter.data.remote
 
-import android.util.Base64
 import com.deatrg.dnsfilter.AppLog
 import com.deatrg.dnsfilter.domain.model.DnsServer
 import com.deatrg.dnsfilter.domain.model.DnsServerType
@@ -10,12 +9,15 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -23,6 +25,7 @@ import java.net.InetAddress
 import java.net.SocketTimeoutException
 import java.util.LinkedHashMap
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 
 class DnsQueryExecutor(
     private val okHttpClient: OkHttpClient,
@@ -33,6 +36,11 @@ class DnsQueryExecutor(
         private const val TAG = "DnsQueryExecutor"
         private const val DNS_CACHE_SIZE = 4096
         private const val DNS_CACHE_TTL_MS = 5 * 60 * 1000L // 5 minutes
+        private const val DEFAULT_SERVER_RTT_MS = 180L
+        private const val FAILURE_PENALTY_MS = 300L
+        private const val HEDGE_MIN_DELAY_MS = 80L
+        private const val HEDGE_MAX_DELAY_MS = 220L
+        private val DNS_MESSAGE_MEDIA_TYPE = "application/dns-message".toMediaType()
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -57,7 +65,20 @@ class DnsQueryExecutor(
         val qclass: Int
     )
 
+    private data class ServerStats(
+        var ewmaRttMs: Double = DEFAULT_SERVER_RTT_MS.toDouble(),
+        var consecutiveFailures: Int = 0
+    )
+
+    private data class ServerQueryOutcome(
+        val server: DnsServer,
+        val result: DnsQueryResult,
+        val elapsedMs: Long
+    )
+
     private val udpSockets = ConcurrentHashMap<String, ReusableUdpSocket>()
+    private val serverAddressCache = ConcurrentHashMap<String, InetAddress>()
+    private val serverStats = ConcurrentHashMap<String, ServerStats>()
 
     // DNS 响应缓存（LRU，最大 4096 条）
     private val dnsCache = object : LinkedHashMap<String, CachedDnsResponse>(DNS_CACHE_SIZE, 0.75f, true) {
@@ -106,7 +127,7 @@ class DnsQueryExecutor(
         timeoutMs: Long = 3000
     ): DnsQueryResult = withContext(Dispatchers.IO) {
         getFromCache(domain, qtype, qclass, query)?.let { cachedResponse ->
-            AppLog.d(TAG, "DNS cache hit: domain=$domain qtype=$qtype")
+            AppLog.d(TAG) { "DNS cache hit: domain=$domain qtype=$qtype" }
             return@withContext DnsQueryResult(
                 success = true,
                 responseBytes = cachedResponse,
@@ -127,40 +148,49 @@ class DnsQueryExecutor(
         }
 
         coroutineScope {
-            val deferreds = activeServers.map { server ->
+            val rankedServers = rankServers(activeServers)
+            val hedgeDelayMs = calculateHedgeDelayMs(rankedServers.firstOrNull())
+            val deferreds = rankedServers.mapIndexed { index, server ->
                 async {
+                    if (index > 0) {
+                        delay(hedgeDelayMs * index)
+                    }
                     val startTime = System.currentTimeMillis()
                     val result = queryServer(query, server, timeoutMs)
-                    Pair(result, System.currentTimeMillis() - startTime)
+                    ServerQueryOutcome(server, result, System.currentTimeMillis() - startTime)
                 }
             }.toMutableList()
 
             var firstError: String? = null
             while (deferreds.isNotEmpty()) {
-                val completed = select<Pair<kotlinx.coroutines.Deferred<Pair<DnsQueryResult, Long>>, Pair<DnsQueryResult, Long>>> {
+                val completed = select<Pair<kotlinx.coroutines.Deferred<ServerQueryOutcome>, ServerQueryOutcome>> {
                     deferreds.forEach { deferred ->
                         deferred.onAwait { result -> Pair(deferred, result) }
                     }
                 }
                 val result = completed.second
-                if (result.first.success) {
+                recordServerResult(result.server, result.elapsedMs, result.result.success)
+
+                if (result.result.success) {
                     deferreds.forEach { it.cancel() }
-                    result.first.responseBytes?.let { putToCache(domain, qtype, qclass, it) }
-                    AppLog.d(TAG, "DNS success: domain=$domain qtype=$qtype time=${result.second}ms")
+                    result.result.responseBytes?.let { putToCache(domain, qtype, qclass, it) }
+                    AppLog.d(TAG) {
+                        "DNS success: domain=$domain qtype=$qtype server=${result.server.name} time=${result.elapsedMs}ms"
+                    }
                     return@coroutineScope DnsQueryResult(
                         success = true,
-                        responseBytes = result.first.responseBytes,
-                        responseTime = result.second,
+                        responseBytes = result.result.responseBytes,
+                        responseTime = result.elapsedMs,
                         error = null,
                         fromCache = false
                     )
                 } else if (firstError == null) {
-                    firstError = result.first.error
+                    firstError = result.result.error
                 }
                 deferreds.remove(completed.first)
             }
 
-            AppLog.e(TAG, "DNS failed: domain=$domain qtype=$qtype error=$firstError")
+            AppLog.e(TAG) { "DNS failed: domain=$domain qtype=$qtype error=$firstError" }
             return@coroutineScope DnsQueryResult(
                 success = false,
                 responseBytes = null,
@@ -176,7 +206,7 @@ class DnsQueryExecutor(
         timeoutMs: Long
     ): DnsQueryResult = when (server.type) {
         DnsServerType.PLAIN -> queryPlainDns(request, server.address, timeoutMs)
-        DnsServerType.DOH -> queryDoH(request, server.address)
+        DnsServerType.DOH -> queryDoH(request, server.address, timeoutMs)
         DnsServerType.DOT -> queryDoT(server.address, timeoutMs)
     }
 
@@ -185,10 +215,11 @@ class DnsQueryExecutor(
         serverAddress: String,
         timeoutMs: Long
     ): DnsQueryResult {
-        val expectedAddress = InetAddress.getByName(serverAddress)
+        val expectedAddress = getServerAddress(serverAddress)
         val wrapper = udpSockets.getOrPut(serverAddress) {
             val socket = DatagramSocket()
             socketProtector?.invoke(socket)
+            socket.connect(expectedAddress, 53)
             ReusableUdpSocket(socket)
         }
 
@@ -201,7 +232,7 @@ class DnsQueryExecutor(
             try {
                 wrapper.socket.soTimeout = timeoutMs.toInt()
 
-                val requestPacket = DatagramPacket(request, request.size, expectedAddress, 53)
+                val requestPacket = DatagramPacket(request, request.size)
                 wrapper.socket.send(requestPacket)
 
                 val responseBuffer = ByteArray(2048)
@@ -264,9 +295,10 @@ class DnsQueryExecutor(
         try {
             socket = DatagramSocket()
             socketProtector?.invoke(socket)
+            socket.connect(expectedAddress, 53)
             socket.soTimeout = timeoutMs.toInt()
 
-            val requestPacket = DatagramPacket(request, request.size, expectedAddress, 53)
+            val requestPacket = DatagramPacket(request, request.size)
             socket.send(requestPacket)
 
             val responseBuffer = ByteArray(2048)
@@ -294,23 +326,20 @@ class DnsQueryExecutor(
 
     private suspend fun queryDoH(
         request: ByteArray,
-        url: String
+        url: String,
+        timeoutMs: Long = 3000
     ): DnsQueryResult = withContext(Dispatchers.IO) {
-        val encodedQuery = Base64.encodeToString(request, Base64.URL_SAFE or Base64.NO_WRAP)
-        val dohUrl = if (url.contains("?")) {
-            "$url&dns=$encodedQuery"
-        } else {
-            "$url?dns=$encodedQuery"
-        }
-
         val httpRequest = Request.Builder()
-            .url(dohUrl)
+            .url(url)
             .addHeader("Accept", "application/dns-message")
-            .get()
+            .addHeader("Content-Type", "application/dns-message")
+            .post(request.toRequestBody(DNS_MESSAGE_MEDIA_TYPE))
             .build()
 
         try {
-            okHttpClient.newCall(httpRequest).execute().use { response ->
+            val call = okHttpClient.newCall(httpRequest)
+            call.timeout().timeout(timeoutMs, TimeUnit.MILLISECONDS)
+            call.execute().use { response ->
                 if (!response.isSuccessful) {
                     return@withContext DnsQueryResult(false, null, 0, "HTTP ${response.code}")
                 }
@@ -344,6 +373,43 @@ class DnsQueryExecutor(
             responseTime = 0,
             error = "DoT not yet implemented for $serverAddress within ${timeoutMs}ms"
         )
+    }
+
+    private fun getServerAddress(serverAddress: String): InetAddress {
+        return serverAddressCache.getOrPut(serverAddress) {
+            InetAddress.getByName(serverAddress)
+        }
+    }
+
+    private fun rankServers(servers: List<DnsServer>): List<DnsServer> {
+        return servers.sortedBy { server ->
+            val stats = serverStats[server.address]
+            if (stats == null) {
+                DEFAULT_SERVER_RTT_MS.toDouble()
+            } else {
+                stats.ewmaRttMs + stats.consecutiveFailures * FAILURE_PENALTY_MS
+            }
+        }
+    }
+
+    private fun calculateHedgeDelayMs(firstServer: DnsServer?): Long {
+        if (firstServer == null) return HEDGE_MIN_DELAY_MS
+        val base = serverStats[firstServer.address]?.ewmaRttMs?.toLong() ?: DEFAULT_SERVER_RTT_MS
+        return (base * 3 / 4).coerceIn(HEDGE_MIN_DELAY_MS, HEDGE_MAX_DELAY_MS)
+    }
+
+    private fun recordServerResult(server: DnsServer, elapsedMs: Long, success: Boolean) {
+        val stats = serverStats.getOrPut(server.address) { ServerStats() }
+        synchronized(stats) {
+            if (success) {
+                val measured = elapsedMs.coerceAtLeast(1).toDouble()
+                stats.ewmaRttMs = stats.ewmaRttMs * 0.7 + measured * 0.3
+                stats.consecutiveFailures = 0
+            } else {
+                stats.consecutiveFailures = (stats.consecutiveFailures + 1).coerceAtMost(8)
+                stats.ewmaRttMs = (stats.ewmaRttMs + FAILURE_PENALTY_MS).coerceAtMost(2_000.0)
+            }
+        }
     }
 
     private fun isExpectedResponseSource(

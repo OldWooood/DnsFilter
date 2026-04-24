@@ -5,7 +5,6 @@ import com.deatrg.dnsfilter.domain.model.FilterList
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.*
-import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 
 /**
@@ -32,6 +31,9 @@ class BlocklistCacheManager(private val context: Context) {
             if (!exists()) mkdirs()
         }
     }
+    private val metaLock = Any()
+    @Volatile
+    private var metaCache: MutableMap<String, CacheMeta>? = null
 
     /**
      * 获取缓存文件
@@ -128,6 +130,9 @@ class BlocklistCacheManager(private val context: Context) {
      */
     suspend fun clearAllCache() = withContext(Dispatchers.IO) {
         cacheDir.listFiles()?.forEach { it.delete() }
+        synchronized(metaLock) {
+            metaCache = mutableMapOf()
+        }
     }
 
     /**
@@ -138,26 +143,34 @@ class BlocklistCacheManager(private val context: Context) {
     }
 
     private fun updateMeta(filterList: FilterList, domainCount: Int) {
-        val metaMap = loadAllMeta().toMutableMap()
-        metaMap[filterList.url] = CacheMeta(
-            url = filterList.url,
-            lastUpdated = System.currentTimeMillis(),
-            domainCount = domainCount
-        )
-        saveAllMeta(metaMap)
+        val snapshot = synchronized(metaLock) {
+            val metaMap = getOrLoadMetaCache()
+            metaMap[filterList.url] = CacheMeta(
+                url = filterList.url,
+                lastUpdated = System.currentTimeMillis(),
+                domainCount = domainCount
+            )
+            metaMap.toMap()
+        }
+        saveAllMeta(snapshot)
     }
 
     private fun getMeta(url: String): CacheMeta? {
-        return loadAllMeta()[url]
+        return synchronized(metaLock) {
+            getOrLoadMetaCache()[url]
+        }
     }
 
     private fun removeMeta(url: String) {
-        val metaMap = loadAllMeta().toMutableMap()
-        metaMap.remove(url)
-        saveAllMeta(metaMap)
+        val snapshot = synchronized(metaLock) {
+            val metaMap = getOrLoadMetaCache()
+            metaMap.remove(url)
+            metaMap.toMap()
+        }
+        saveAllMeta(snapshot)
     }
 
-    private fun loadAllMeta(): Map<String, CacheMeta> {
+    private fun loadAllMetaFromDisk(): Map<String, CacheMeta> {
         val metaFile = getMetaFile()
         if (!metaFile.exists()) return emptyMap()
         
@@ -169,6 +182,16 @@ class BlocklistCacheManager(private val context: Context) {
         } catch (e: Exception) {
             emptyMap()
         }
+    }
+
+    private fun getOrLoadMetaCache(): MutableMap<String, CacheMeta> {
+        val cached = metaCache
+        if (cached != null) {
+            return cached
+        }
+        val loaded = loadAllMetaFromDisk().toMutableMap()
+        metaCache = loaded
+        return loaded
     }
 
     private fun saveAllMeta(metaMap: Map<String, CacheMeta>) {
