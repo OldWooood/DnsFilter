@@ -56,8 +56,9 @@ class DnsVpnService : VpnService() {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var serversJob: Job? = null
 
-    // 固定并发度 dispatcher，避免每个包都创建协程并竞争 Semaphore
-    private val processingDispatcher = Dispatchers.IO.limitedParallelism(4)
+    // 根据 CPU 核心数动态计算并发度，避免每个包都创建协程并竞争 Semaphore
+    private val workerCount = (Runtime.getRuntime().availableProcessors() * 2).coerceIn(4, 16)
+    private val processingDispatcher = Dispatchers.IO.limitedParallelism(workerCount)
 
     // Packet buffer 对象池，减少高并发时的内存分配压力
     private val packetPool = ArrayBlockingQueue<ByteArray>(256)
@@ -183,7 +184,7 @@ class DnsVpnService : VpnService() {
         val inputStream = FileInputStream(vpnInterface.fileDescriptor)
         val outputStream = FileOutputStream(vpnInterface.fileDescriptor)
         val packetQueue = Channel<PacketTask>(capacity = PACKET_QUEUE_CAPACITY)
-        val workers = List(4) {
+        val workers = List(workerCount) {
             scope.launch(processingDispatcher) {
                 for (task in packetQueue) {
                     try {
