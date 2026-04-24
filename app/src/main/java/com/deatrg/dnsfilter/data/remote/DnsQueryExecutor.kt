@@ -4,11 +4,18 @@ import android.util.Base64
 import com.deatrg.dnsfilter.AppLog
 import com.deatrg.dnsfilter.domain.model.DnsServer
 import com.deatrg.dnsfilter.domain.model.DnsServerType
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import okhttp3.*
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import java.io.IOException
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -39,53 +46,70 @@ class DnsQueryExecutor(
         var isValid = true
     }
 
+    private data class CachedDnsResponse(
+        val response: ByteArray,
+        val timestamp: Long
+    )
+
+    private data class DnsQuestion(
+        val domain: String,
+        val qtype: Int,
+        val qclass: Int
+    )
+
     private val udpSockets = ConcurrentHashMap<String, ReusableUdpSocket>()
 
     // DNS 响应缓存（LRU，最大 4096 条）
-    private val dnsCache = object : LinkedHashMap<String, CachedDnsResult>(DNS_CACHE_SIZE, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CachedDnsResult>?): Boolean {
+    private val dnsCache = object : LinkedHashMap<String, CachedDnsResponse>(DNS_CACHE_SIZE, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CachedDnsResponse>?): Boolean {
             return size > DNS_CACHE_SIZE
         }
     }
 
-    private data class CachedDnsResult(
-        val responseIp: String,
-        val timestamp: Long
-    )
+    private fun getCacheKey(domain: String, qtype: Int, qclass: Int): String = "$domain:$qtype:$qclass"
 
-    private fun getCacheKey(domain: String, qtype: Int): String = "$domain:$qtype"
-
-    private fun getFromCache(domain: String, qtype: Int): String? {
-        val key = getCacheKey(domain, qtype)
+    private fun getFromCache(
+        domain: String,
+        qtype: Int,
+        qclass: Int,
+        query: ByteArray
+    ): ByteArray? {
+        val key = getCacheKey(domain, qtype, qclass)
         synchronized(dnsCache) {
             val cached = dnsCache[key]
             if (cached != null && System.currentTimeMillis() - cached.timestamp < DNS_CACHE_TTL_MS) {
-                return cached.responseIp
+                return patchResponseForClient(cached.response, query)
             }
             dnsCache.remove(key)
             return null
         }
     }
 
-    private fun putToCache(domain: String, qtype: Int, responseIp: String) {
-        val key = getCacheKey(domain, qtype)
+    private fun putToCache(
+        domain: String,
+        qtype: Int,
+        qclass: Int,
+        response: ByteArray
+    ) {
+        val key = getCacheKey(domain, qtype, qclass)
         synchronized(dnsCache) {
-            dnsCache[key] = CachedDnsResult(responseIp, System.currentTimeMillis())
+            dnsCache[key] = CachedDnsResponse(response.copyOf(), System.currentTimeMillis())
         }
     }
 
     suspend fun query(
         domain: String,
         servers: List<DnsServer>,
+        query: ByteArray,
         qtype: Int = 1,
+        qclass: Int = 1,
         timeoutMs: Long = 3000
     ): DnsQueryResult = withContext(Dispatchers.IO) {
-        // 先检查缓存
-        getFromCache(domain, qtype)?.let { cachedIp ->
-            AppLog.d(TAG, "DNS cache hit: domain=$domain qtype=$qtype ip=$cachedIp")
+        getFromCache(domain, qtype, qclass, query)?.let { cachedResponse ->
+            AppLog.d(TAG, "DNS cache hit: domain=$domain qtype=$qtype")
             return@withContext DnsQueryResult(
                 success = true,
-                responseIp = cachedIp,
+                responseBytes = cachedResponse,
                 responseTime = 0,
                 error = null,
                 fromCache = true
@@ -96,25 +120,24 @@ class DnsQueryExecutor(
         if (activeServers.isEmpty()) {
             return@withContext DnsQueryResult(
                 success = false,
-                responseIp = null,
+                responseBytes = null,
                 responseTime = 0,
                 error = "No DNS servers configured"
             )
         }
 
         coroutineScope {
-            // Query servers concurrently and return the first successful result
             val deferreds = activeServers.map { server ->
                 async {
                     val startTime = System.currentTimeMillis()
-                    val result = queryServer(domain, server, qtype, timeoutMs)
+                    val result = queryServer(query, server, timeoutMs)
                     Pair(result, System.currentTimeMillis() - startTime)
                 }
             }.toMutableList()
 
             var firstError: String? = null
             while (deferreds.isNotEmpty()) {
-                val completed = select<Pair<Deferred<Pair<DnsQueryResult, Long>>, Pair<DnsQueryResult, Long>>> {
+                val completed = select<Pair<kotlinx.coroutines.Deferred<Pair<DnsQueryResult, Long>>, Pair<DnsQueryResult, Long>>> {
                     deferreds.forEach { deferred ->
                         deferred.onAwait { result -> Pair(deferred, result) }
                     }
@@ -122,12 +145,11 @@ class DnsQueryExecutor(
                 val result = completed.second
                 if (result.first.success) {
                     deferreds.forEach { it.cancel() }
-                    // 缓存结果
-                    result.first.responseIp?.let { putToCache(domain, qtype, it) }
-                    AppLog.d(TAG, "DNS success: domain=$domain qtype=$qtype ip=${result.first.responseIp} time=${result.second}ms")
+                    result.first.responseBytes?.let { putToCache(domain, qtype, qclass, it) }
+                    AppLog.d(TAG, "DNS success: domain=$domain qtype=$qtype time=${result.second}ms")
                     return@coroutineScope DnsQueryResult(
                         success = true,
-                        responseIp = result.first.responseIp,
+                        responseBytes = result.first.responseBytes,
                         responseTime = result.second,
                         error = null,
                         fromCache = false
@@ -141,7 +163,7 @@ class DnsQueryExecutor(
             AppLog.e(TAG, "DNS failed: domain=$domain qtype=$qtype error=$firstError")
             return@coroutineScope DnsQueryResult(
                 success = false,
-                responseIp = null,
+                responseBytes = null,
                 responseTime = 0,
                 error = firstError ?: "All DNS queries failed"
             )
@@ -149,22 +171,21 @@ class DnsQueryExecutor(
     }
 
     private suspend fun queryServer(
-        domain: String,
+        request: ByteArray,
         server: DnsServer,
-        qtype: Int,
         timeoutMs: Long
     ): DnsQueryResult = when (server.type) {
-        DnsServerType.PLAIN -> queryPlainDns(domain, server.address, qtype, timeoutMs)
-        DnsServerType.DOH -> queryDoH(domain, server.address, qtype, timeoutMs)
-        DnsServerType.DOT -> queryDoT(domain, server.address, qtype, timeoutMs)
+        DnsServerType.PLAIN -> queryPlainDns(request, server.address, timeoutMs)
+        DnsServerType.DOH -> queryDoH(request, server.address)
+        DnsServerType.DOT -> queryDoT(server.address, timeoutMs)
     }
 
     private suspend fun queryPlainDns(
-        domain: String,
+        request: ByteArray,
         serverAddress: String,
-        qtype: Int,
         timeoutMs: Long
     ): DnsQueryResult {
+        val expectedAddress = InetAddress.getByName(serverAddress)
         val wrapper = udpSockets.getOrPut(serverAddress) {
             val socket = DatagramSocket()
             socketProtector?.invoke(socket)
@@ -173,52 +194,70 @@ class DnsQueryExecutor(
 
         return wrapper.lock.withLock {
             if (!wrapper.isValid) {
-                // Socket 已失效（如上次超时），移除并回退到一次性 socket
                 udpSockets.remove(serverAddress, wrapper)
-                return@withLock queryPlainDnsFresh(domain, serverAddress, qtype, timeoutMs)
+                return@withLock queryPlainDnsFresh(request, expectedAddress, timeoutMs)
             }
 
             try {
                 wrapper.socket.soTimeout = timeoutMs.toInt()
 
-                val request = buildDnsQuery(domain, qtype)
-                val address = InetAddress.getByName(serverAddress)
-                val requestPacket = DatagramPacket(request, request.size, address, 53)
+                val requestPacket = DatagramPacket(request, request.size, expectedAddress, 53)
                 wrapper.socket.send(requestPacket)
 
-                val responseBuffer = ByteArray(512)
+                val responseBuffer = ByteArray(2048)
                 val responsePacket = DatagramPacket(responseBuffer, responseBuffer.size)
                 wrapper.socket.receive(responsePacket)
 
-                AppLog.d(TAG, "Raw DNS response from $serverAddress, length=${responsePacket.length}")
-                AppLog.d(TAG, "DNS response bytes: ${responsePacket.data.take(minOf(32, responsePacket.length)).joinToString { String.format("%02X", it) }}")
-
-                val responseIp = parseDnsResponse(responsePacket.data, responsePacket.length, qtype)
-                if (responseIp != null) {
-                    DnsQueryResult(success = true, responseIp = responseIp, responseTime = 0, error = null)
-                } else {
-                    DnsQueryResult(success = false, responseIp = null, responseTime = 0, error = "Failed to parse DNS response")
+                if (!isExpectedResponseSource(responsePacket, expectedAddress)) {
+                    wrapper.isValid = false
+                    try {
+                        wrapper.socket.close()
+                    } catch (_: Exception) {
+                    }
+                    udpSockets.remove(serverAddress, wrapper)
+                    return@withLock DnsQueryResult(false, null, 0, "Unexpected DNS response source")
                 }
+
+                val responseBytes = responsePacket.data.copyOfRange(0, responsePacket.length)
+                if (!isValidDnsResponse(request, responseBytes)) {
+                    wrapper.isValid = false
+                    try {
+                        wrapper.socket.close()
+                    } catch (_: Exception) {
+                    }
+                    udpSockets.remove(serverAddress, wrapper)
+                    return@withLock DnsQueryResult(false, null, 0, "Mismatched DNS response")
+                }
+
+                DnsQueryResult(
+                    success = true,
+                    responseBytes = responseBytes,
+                    responseTime = 0,
+                    error = null
+                )
             } catch (e: SocketTimeoutException) {
-                // 超时后 socket 可能收到延迟响应，废弃避免污染下次查询
                 wrapper.isValid = false
-                try { wrapper.socket.close() } catch (_: Exception) {}
+                try {
+                    wrapper.socket.close()
+                } catch (_: Exception) {
+                }
                 udpSockets.remove(serverAddress, wrapper)
-                DnsQueryResult(success = false, responseIp = null, responseTime = 0, error = "Timeout")
+                DnsQueryResult(false, null, 0, "Timeout")
             } catch (e: Exception) {
                 wrapper.isValid = false
-                try { wrapper.socket.close() } catch (_: Exception) {}
+                try {
+                    wrapper.socket.close()
+                } catch (_: Exception) {
+                }
                 udpSockets.remove(serverAddress, wrapper)
-                DnsQueryResult(success = false, responseIp = null, responseTime = 0, error = e.message)
+                DnsQueryResult(false, null, 0, e.message)
             }
         }
     }
 
-    // 降级路径：使用一次性 socket（避免延迟响应污染复用 socket）
     private fun queryPlainDnsFresh(
-        domain: String,
-        serverAddress: String,
-        qtype: Int,
+        request: ByteArray,
+        expectedAddress: InetAddress,
         timeoutMs: Long
     ): DnsQueryResult {
         var socket: DatagramSocket? = null
@@ -227,215 +266,144 @@ class DnsQueryExecutor(
             socketProtector?.invoke(socket)
             socket.soTimeout = timeoutMs.toInt()
 
-            val request = buildDnsQuery(domain, qtype)
-            val address = InetAddress.getByName(serverAddress)
-            val requestPacket = DatagramPacket(request, request.size, address, 53)
+            val requestPacket = DatagramPacket(request, request.size, expectedAddress, 53)
             socket.send(requestPacket)
 
-            val responseBuffer = ByteArray(512)
+            val responseBuffer = ByteArray(2048)
             val responsePacket = DatagramPacket(responseBuffer, responseBuffer.size)
             socket.receive(responsePacket)
 
-            val responseIp = parseDnsResponse(responsePacket.data, responsePacket.length, qtype)
-            return if (responseIp != null) {
-                DnsQueryResult(success = true, responseIp = responseIp, responseTime = 0, error = null)
+            if (!isExpectedResponseSource(responsePacket, expectedAddress)) {
+                return DnsQueryResult(false, null, 0, "Unexpected DNS response source")
+            }
+
+            val responseBytes = responsePacket.data.copyOfRange(0, responsePacket.length)
+            return if (isValidDnsResponse(request, responseBytes)) {
+                DnsQueryResult(true, responseBytes, 0, null)
             } else {
-                DnsQueryResult(success = false, responseIp = null, responseTime = 0, error = "Failed to parse DNS response")
+                DnsQueryResult(false, null, 0, "Mismatched DNS response")
             }
         } catch (e: SocketTimeoutException) {
-            return DnsQueryResult(success = false, responseIp = null, responseTime = 0, error = "Timeout")
+            return DnsQueryResult(false, null, 0, "Timeout")
         } catch (e: Exception) {
-            return DnsQueryResult(success = false, responseIp = null, responseTime = 0, error = e.message)
+            return DnsQueryResult(false, null, 0, e.message)
         } finally {
             socket?.close()
         }
     }
 
     private suspend fun queryDoH(
-        domain: String,
-        url: String,
-        qtype: Int,
-        timeoutMs: Long
-    ): DnsQueryResult = suspendCancellableCoroutine { continuation ->
-        val request = buildDnsQuery(domain, qtype)
-        // Use URL_SAFE_NO_WRAP for DoH
+        request: ByteArray,
+        url: String
+    ): DnsQueryResult = withContext(Dispatchers.IO) {
         val encodedQuery = Base64.encodeToString(request, Base64.URL_SAFE or Base64.NO_WRAP)
-
         val dohUrl = if (url.contains("?")) {
             "$url&dns=$encodedQuery"
         } else {
             "$url?dns=$encodedQuery"
         }
 
-        val requestBuilder = Request.Builder()
+        val httpRequest = Request.Builder()
             .url(dohUrl)
             .addHeader("Accept", "application/dns-message")
             .get()
-
-        val call = okHttpClient.newCall(requestBuilder.build())
-
-        continuation.invokeOnCancellation {
-            call.cancel()
-        }
+            .build()
 
         try {
-            call.execute().use { response ->
-                if (response.isSuccessful) {
-                    val body = response.body?.bytes()
-                    if (body != null) {
-                        val responseIp = parseDnsResponse(body, body.size, qtype)
-                        if (responseIp != null) {
-                            continuation.resumeWith(Result.success(
-                                DnsQueryResult(
-                                    success = true,
-                                    responseIp = responseIp,
-                                    responseTime = 0,
-                                    error = null
-                                )
-                            ))
-                        } else {
-                            continuation.resumeWith(Result.success(
-                                DnsQueryResult(
-                                    success = false,
-                                    responseIp = null,
-                                    responseTime = 0,
-                                    error = "Failed to parse DoH response"
-                                )
-                            ))
-                        }
-                    } else {
-                        continuation.resumeWith(Result.success(
-                            DnsQueryResult(
-                                success = false,
-                                responseIp = null,
-                                responseTime = 0,
-                                error = "Empty response"
-                            )
-                        ))
-                    }
-                } else {
-                    continuation.resumeWith(Result.success(
-                        DnsQueryResult(
-                            success = false,
-                            responseIp = null,
-                            responseTime = 0,
-                            error = "HTTP ${response.code}"
-                        )
-                    ))
+            okHttpClient.newCall(httpRequest).execute().use { response ->
+                if (!response.isSuccessful) {
+                    return@withContext DnsQueryResult(false, null, 0, "HTTP ${response.code}")
                 }
+
+                val body = response.body?.bytes()
+                    ?: return@withContext DnsQueryResult(false, null, 0, "Empty response")
+
+                if (!isValidDnsResponse(request, body)) {
+                    return@withContext DnsQueryResult(false, null, 0, "Mismatched DoH response")
+                }
+
+                DnsQueryResult(
+                    success = true,
+                    responseBytes = body,
+                    responseTime = 0,
+                    error = null
+                )
             }
         } catch (e: IOException) {
-            continuation.resumeWith(Result.success(
-                DnsQueryResult(
-                    success = false,
-                    responseIp = null,
-                    responseTime = 0,
-                    error = e.message
-                )
-            ))
+            DnsQueryResult(false, null, 0, e.message)
         }
     }
 
     private suspend fun queryDoT(
-        domain: String,
         serverAddress: String,
-        qtype: Int,
         timeoutMs: Long
     ): DnsQueryResult = withContext(Dispatchers.IO) {
         DnsQueryResult(
             success = false,
-            responseIp = null,
+            responseBytes = null,
             responseTime = 0,
-            error = "DoT not yet implemented"
+            error = "DoT not yet implemented for $serverAddress within ${timeoutMs}ms"
         )
     }
 
-    private fun buildDnsQuery(domain: String, qtype: Int): ByteArray {
-        val transactionId = byteArrayOf(0x00, 0x01)
-        val flags = byteArrayOf(0x01, 0x00)
-        val questions = byteArrayOf(0x00, 0x01)
-        val answerRRs = byteArrayOf(0x00, 0x00)
-        val authorityRRs = byteArrayOf(0x00, 0x00)
-        val additionalRRs = byteArrayOf(0x00, 0x00)
-
-        val header = transactionId + flags + questions + answerRRs + authorityRRs + additionalRRs
-
-        val domainParts = domain.split(".")
-        val qdlist = domainParts.flatMap { part ->
-            listOf(part.length.toByte()) + part.toByteArray().toList()
-        }
-        val qdcount = qdlist.toByteArray() + byteArrayOf(0x00)
-
-        val queryType = byteArrayOf(((qtype shr 8) and 0xFF).toByte(), (qtype and 0xFF).toByte())
-        val queryClass = byteArrayOf(0x00, 0x01)
-
-        return header + qdcount + queryType + queryClass
+    private fun isExpectedResponseSource(
+        responsePacket: DatagramPacket,
+        expectedAddress: InetAddress
+    ): Boolean {
+        return responsePacket.port == 53 && responsePacket.address == expectedAddress
     }
 
-    private fun parseDnsResponse(data: ByteArray, length: Int, expectedType: Int): String? {
-        if (length < 12) return null
-        if (expectedType != 1 && expectedType != 28) return null
+    private fun isValidDnsResponse(
+        request: ByteArray,
+        response: ByteArray
+    ): Boolean {
+        if (request.size < 12 || response.size < 12) return false
 
-        val answerCount = ((data[6].toInt() and 0xFF) shl 8) or (data[7].toInt() and 0xFF)
-        if (answerCount == 0) return null
-
-        // Read QNAME
-        val questionNameResult = readDnsName(data, 12, length)
-        val questionName = questionNameResult?.first ?: return null
-        var offset = questionNameResult.second
-
-        // Skip QTYPE (2 bytes) and QCLASS (2 bytes)
-        if (offset + 4 > length) return null
-        offset += 4
-
-        var currentName = questionName
-
-        // Parse answer section
-        for (i in 0 until answerCount) {
-            if (offset >= length) break
-
-            val nameResult = readDnsName(data, offset, length) ?: return null
-            val name = nameResult.first
-            offset = nameResult.second
-
-            if (offset + 10 > length) break
-
-            // TYPE (2 bytes)
-            val type = ((data[offset].toInt() and 0xFF) shl 8) or (data[offset + 1].toInt() and 0xFF)
-            offset += 2
-
-            // CLASS (2 bytes)
-            offset += 2
-
-            // TTL (4 bytes)
-            offset += 4
-
-            // RDLENGTH (2 bytes)
-            if (offset + 2 > length) break
-            val rdLength = ((data[offset].toInt() and 0xFF) shl 8) or (data[offset + 1].toInt() and 0xFF)
-            offset += 2
-
-            if (offset + rdLength > length) break
-
-            if (type == 5) { // CNAME
-                val cnameResult = readDnsName(data, offset, length)
-                if (cnameResult != null && name.equals(currentName, ignoreCase = true)) {
-                    currentName = cnameResult.first
-                }
-            } else if (type == expectedType && name.equals(currentName, ignoreCase = true)) {
-                if (type == 1 && rdLength == 4) {
-                    return "${data[offset].toInt() and 0xFF}.${data[offset + 1].toInt() and 0xFF}.${data[offset + 2].toInt() and 0xFF}.${data[offset + 3].toInt() and 0xFF}"
-                }
-                if (type == 28 && rdLength == 16) {
-                    val addr = data.copyOfRange(offset, offset + 16)
-                    return InetAddress.getByAddress(addr).hostAddress
-                }
-            }
-
-            offset += rdLength
+        if (response[0] != request[0] || response[1] != request[1]) {
+            return false
         }
 
-        return null
+        val responseFlags = ((response[2].toInt() and 0xFF) shl 8) or (response[3].toInt() and 0xFF)
+        val qrBit = (responseFlags shr 15) and 1
+        if (qrBit != 1) return false
+
+        val requestQuestion = parseDnsQuestion(request) ?: return false
+        val responseQuestion = parseDnsQuestion(response) ?: return false
+
+        return requestQuestion.domain.equals(responseQuestion.domain, ignoreCase = true) &&
+            requestQuestion.qtype == responseQuestion.qtype &&
+            requestQuestion.qclass == responseQuestion.qclass
+    }
+
+    private fun patchResponseForClient(
+        response: ByteArray,
+        query: ByteArray
+    ): ByteArray {
+        val patched = response.copyOf()
+        if (patched.size >= 2 && query.size >= 2) {
+            patched[0] = query[0]
+            patched[1] = query[1]
+        }
+        if (patched.size > 2 && query.size > 2) {
+            patched[2] = ((patched[2].toInt() and 0xFE) or (query[2].toInt() and 0x01)).toByte()
+        }
+        return patched
+    }
+
+    private fun parseDnsQuestion(data: ByteArray): DnsQuestion? {
+        if (data.size < 12) return null
+
+        val questionCount = ((data[4].toInt() and 0xFF) shl 8) or (data[5].toInt() and 0xFF)
+        if (questionCount < 1) return null
+
+        val nameResult = readDnsName(data, 12, data.size) ?: return null
+        val domain = nameResult.first
+        val offset = nameResult.second
+        if (offset + 4 > data.size) return null
+
+        val qtype = ((data[offset].toInt() and 0xFF) shl 8) or (data[offset + 1].toInt() and 0xFF)
+        val qclass = ((data[offset + 2].toInt() and 0xFF) shl 8) or (data[offset + 3].toInt() and 0xFF)
+        return DnsQuestion(domain, qtype, qclass)
     }
 
     private fun readDnsName(data: ByteArray, offset: Int, length: Int): Pair<String, Int>? {
@@ -481,7 +449,10 @@ class DnsQueryExecutor(
     fun shutdown() {
         scope.cancel()
         udpSockets.values.forEach {
-            try { it.socket.close() } catch (_: Exception) {}
+            try {
+                it.socket.close()
+            } catch (_: Exception) {
+            }
         }
         udpSockets.clear()
     }
@@ -489,7 +460,7 @@ class DnsQueryExecutor(
 
 data class DnsQueryResult(
     val success: Boolean,
-    val responseIp: String?,
+    val responseBytes: ByteArray?,
     val responseTime: Long,
     val error: String?,
     val fromCache: Boolean = false

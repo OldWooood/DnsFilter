@@ -1,10 +1,10 @@
 package com.deatrg.dnsfilter.ui.screens.dashboard
 
-import android.content.Context
+import android.app.Application
 import android.content.Intent
 import android.net.VpnService
-import android.os.Build
 import com.deatrg.dnsfilter.AppLog
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -13,6 +13,7 @@ import com.deatrg.dnsfilter.data.local.PreferencesManager
 import com.deatrg.dnsfilter.data.local.StatisticsBuffer
 import com.deatrg.dnsfilter.data.remote.DomainFilter
 import com.deatrg.dnsfilter.data.repository.FilterListRepositoryImpl
+import com.deatrg.dnsfilter.domain.model.DnsServerType
 import com.deatrg.dnsfilter.domain.model.DnsStatistics
 import com.deatrg.dnsfilter.service.DnsVpnService
 import kotlinx.coroutines.delay
@@ -21,12 +22,12 @@ import kotlinx.coroutines.launch
 
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class DashboardViewModel(
-    private val context: Context,
+    application: Application,
     private val preferencesManager: PreferencesManager,
     private val statisticsBuffer: StatisticsBuffer,
     private val filterListRepository: FilterListRepositoryImpl,
     private val domainFilter: DomainFilter
-) : ViewModel() {
+) : AndroidViewModel(application) {
     companion object {
         private const val TAG = "DashboardViewModel"
         private const val VPN_STATE_TIMEOUT_MS = 5000L
@@ -108,6 +109,7 @@ class DashboardViewModel(
     fun toggleVpn(targetEnabled: Boolean) {
         viewModelScope.launch {
             AppLog.d(TAG, "toggleVpn: target=$targetEnabled, current=${_isVpnActuallyRunning.value}")
+            val appContext = getApplication<Application>()
             
             if (_isVpnActuallyRunning.value == targetEnabled) {
                 return@launch
@@ -118,7 +120,9 @@ class DashboardViewModel(
             try {
                 if (targetEnabled) {
                     // 1. 检查是否有启用的 DNS 服务器（直接从 preferences 读取当前值）
-                    val enabledCount = preferencesManager.dnsServers.first().count { it.isEnabled }
+                    val enabledCount = preferencesManager.dnsServers.first().count {
+                        it.isEnabled && it.type != DnsServerType.DOT
+                    }
                     if (enabledCount == 0) {
                         _showNoDnsServersError.emit(Unit)
                         return@launch
@@ -134,15 +138,11 @@ class DashboardViewModel(
                     }
 
                     // 2. 启动 VPN
-                    val intent = Intent(context, DnsVpnService::class.java).apply {
+                    val intent = Intent(appContext, DnsVpnService::class.java).apply {
                         action = DnsVpnService.ACTION_START
                     }
-                    
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        context.startForegroundService(intent)
-                    } else {
-                        context.startService(intent)
-                    }
+
+                    appContext.startForegroundService(intent)
 
                     // 等待Service状态变为目标状态
                     val success = waitForVpnState(true)
@@ -155,10 +155,10 @@ class DashboardViewModel(
                     }
                 } else {
                     // 停止 VPN
-                    val intent = Intent(context, DnsVpnService::class.java).apply {
+                    val intent = Intent(appContext, DnsVpnService::class.java).apply {
                         action = DnsVpnService.ACTION_STOP
                     }
-                    context.startService(intent)
+                    appContext.startService(intent)
                     
                     val success = waitForVpnState(false)
                     
@@ -214,7 +214,7 @@ class DashboardViewModel(
     }
 
     fun requestVpnPermission(): Intent? {
-        return VpnService.prepare(context)
+        return VpnService.prepare(getApplication())
     }
 
     /**
@@ -239,13 +239,13 @@ class DashboardViewModel(
         }
     }
 
-    class Factory(private val context: Context) : ViewModelProvider.Factory {
+    class Factory(private val application: Application) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: Class<T>): T {
             val prefs = ServiceLocator.providePreferencesManager()
             val filterRepo = ServiceLocator.provideFilterListRepository() as FilterListRepositoryImpl
             return DashboardViewModel(
-                context,
+                application,
                 prefs,
                 ServiceLocator.provideStatisticsBuffer(),
                 filterRepo,

@@ -9,6 +9,7 @@ import com.deatrg.dnsfilter.ServiceLocator
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 
 /**
  * AlarmManager 触发的 Blocklist 更新接收器
@@ -21,6 +22,7 @@ class BlocklistUpdateAlarmReceiver : BroadcastReceiver() {
         const val ACTION_UPDATE_BLOCKLIST = "com.deatrg.dnsfilter.ACTION_UPDATE_BLOCKLIST"
         private const val WAKE_LOCK_TAG = "DnsFilter::BlocklistUpdateWakeLock"
         private const val WAKE_LOCK_TIMEOUT_MS = 60_000L
+        private const val UPDATE_TIMEOUT_MS = 55_000L
     }
 
     override fun onReceive(context: Context, intent: Intent) {
@@ -44,13 +46,15 @@ class BlocklistUpdateAlarmReceiver : BroadcastReceiver() {
 
                 CoroutineScope(Dispatchers.IO).launch {
                     try {
-                        val repository = ServiceLocator.provideFilterListRepository()
+                        withTimeout(UPDATE_TIMEOUT_MS) {
+                            val repository = ServiceLocator.provideFilterListRepository()
 
-                        // 先加载本地保存的 filter 列表到 DomainFilter
-                        repository.loadFilterLists()
+                            // 先加载本地保存的 filter 列表到 DomainFilter
+                            repository.loadFilterLists()
 
-                        // 检查并更新过期的 blocklist
-                        repository.checkAndUpdate()
+                            // 检查并更新过期的 blocklist
+                            repository.checkAndUpdate()
+                        }
 
                         AppLog.d(TAG, "Blocklist update completed successfully")
                     } catch (e: Exception) {

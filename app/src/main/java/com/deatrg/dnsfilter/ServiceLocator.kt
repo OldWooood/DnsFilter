@@ -1,5 +1,6 @@
 package com.deatrg.dnsfilter
 
+import android.annotation.SuppressLint
 import android.content.Context
 import com.deatrg.dnsfilter.data.local.PreferencesManager
 import com.deatrg.dnsfilter.data.local.StatisticsBuffer
@@ -15,16 +16,20 @@ import kotlinx.coroutines.SupervisorJob
 import okhttp3.OkHttpClient
 import java.util.concurrent.TimeUnit
 
+@SuppressLint("StaticFieldLeak")
 object ServiceLocator {
+    @SuppressLint("StaticFieldLeak")
     @Volatile
     private var context: Context? = null
 
     @Volatile
     private var okHttpClient: OkHttpClient? = null
 
+    @SuppressLint("StaticFieldLeak")
     @Volatile
     private var preferencesManager: PreferencesManager? = null
 
+    @SuppressLint("StaticFieldLeak")
     @Volatile
     private var domainFilter: DomainFilter? = null
 
@@ -62,7 +67,10 @@ object ServiceLocator {
 
     fun provideDomainFilter(): DomainFilter {
         return domainFilter ?: synchronized(this) {
-            domainFilter ?: DomainFilter(getContext()).also { domainFilter = it }
+            domainFilter ?: DomainFilter(
+                getContext(),
+                provideOkHttpClient()
+            ).also { domainFilter = it }
         }
     }
 

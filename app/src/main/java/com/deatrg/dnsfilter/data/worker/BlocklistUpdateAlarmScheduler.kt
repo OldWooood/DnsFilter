@@ -51,18 +51,8 @@ class BlocklistUpdateAlarmScheduler(private val context: Context) {
                     AppLog.d(TAG, "Inexact alarm scheduled at $triggerAtMillis (exact alarm permission not granted)")
                 }
             }
-
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.M -> {
-                alarmManager.setExactAndAllowWhileIdle(
-                    AlarmManager.RTC_WAKEUP,
-                    triggerAtMillis,
-                    pendingIntent
-                )
-                AppLog.d(TAG, "Exact alarm scheduled at $triggerAtMillis")
-            }
-
             else -> {
-                alarmManager.setExact(
+                alarmManager.setExactAndAllowWhileIdle(
                     AlarmManager.RTC_WAKEUP,
                     triggerAtMillis,
                     pendingIntent
@@ -105,17 +95,8 @@ class BlocklistUpdateAlarmScheduler(private val context: Context) {
                     pendingIntent
                 )
             }
-
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.M -> {
-                alarmManager.setExactAndAllowWhileIdle(
-                    AlarmManager.RTC_WAKEUP,
-                    triggerAtMillis,
-                    pendingIntent
-                )
-            }
-
             else -> {
-                alarmManager.setExact(
+                alarmManager.setExactAndAllowWhileIdle(
                     AlarmManager.RTC_WAKEUP,
                     triggerAtMillis,
                     pendingIntent

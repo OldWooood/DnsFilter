@@ -49,7 +49,6 @@
 
     <!-- Filter Lists -->
     <string name="filter_lists_title">过滤列表</string>
-    <string name="filter_lists_domains_blocked">已拦截 %1$d 个域名</string>
     <string name="filter_lists_loading">加载中…</string>
     <string name="filter_lists_empty_title">未配置过滤列表</string>
     <string name="filter_lists_empty_hint">点击 + 添加过滤列表</string>
@@ -72,4 +71,8 @@
     <string name="notification_title">DnsFilter 运行中</string>
     <string name="notification_text">DNS 过滤已启用</string>
     <string name="notification_action_stop">停止</string>
+
+    <plurals name="filter_lists_domains_blocked">
+        <item quantity="other">已拦截 %1$d 个域名</item>
+    </plurals>
 </resources>

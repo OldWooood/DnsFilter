@@ -261,6 +261,9 @@ private fun AddDnsServerDialog(
     var address by remember { mutableStateOf("") }
     var selectedType by remember { mutableStateOf(DnsServerType.PLAIN) }
     var expanded by remember { mutableStateOf(false) }
+    val selectableTypes = remember {
+        DnsServerType.entries.filter { it != DnsServerType.DOT }
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -302,14 +305,14 @@ private fun AddDnsServerDialog(
                         trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
                         modifier = Modifier
                             .fillMaxWidth()
-                            .menuAnchor(),
+                            .menuAnchor(MenuAnchorType.PrimaryNotEditable),
                         shape = RoundedCornerShape(16.dp)
                     )
                     ExposedDropdownMenu(
                         expanded = expanded,
                         onDismissRequest = { expanded = false }
                     ) {
-                        DnsServerType.entries.forEach { type ->
+                        selectableTypes.forEach { type ->
                             DropdownMenuItem(
                                 text = { Text(type.name) },
                                 onClick = {
