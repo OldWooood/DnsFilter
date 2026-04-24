@@ -1,5 +1,6 @@
 package com.deatrg.dnsfilter.ui.screens.dashboard
 
+import android.app.Application
 import android.app.Activity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -42,7 +43,9 @@ import java.util.*
 
 @Composable
 fun DashboardScreen(
-    viewModel: DashboardViewModel = viewModel(factory = DashboardViewModel.Factory(LocalContext.current.applicationContext))
+    viewModel: DashboardViewModel = viewModel(
+        factory = DashboardViewModel.Factory(LocalContext.current.applicationContext as Application)
+    )
 ) {
     val isVpnActuallyRunning by viewModel.isVpnActuallyRunning.collectAsStateWithLifecycle(initialValue = false)
     val isVpnProcessing by viewModel.isVpnProcessing.collectAsStateWithLifecycle(initialValue = false)

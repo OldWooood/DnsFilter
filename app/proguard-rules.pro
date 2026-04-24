@@ -29,11 +29,6 @@
 # Keep DataStore
 -keepclassmembers class * extends com.google.protobuf.GeneratedMessageLite { *; }
 
-# WorkManager (R8 removes WorkDatabase class needed at runtime)
--keep class androidx.work.impl.** { *; }
--keep class androidx.work.WorkerFactory { *; }
--keep class androidx.work.impl.workers.** { *; }
-
 # OkHttp
 -dontwarn okhttp3.**
 -dontwarn okio.**

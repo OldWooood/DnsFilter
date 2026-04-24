@@ -19,6 +19,7 @@ class DnsServersViewModel(
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     fun addServer(name: String, address: String, type: DnsServerType) {
+        if (type == DnsServerType.DOT) return
         viewModelScope.launch {
             val server = DnsServer(
                 id = UUID.randomUUID().toString(),

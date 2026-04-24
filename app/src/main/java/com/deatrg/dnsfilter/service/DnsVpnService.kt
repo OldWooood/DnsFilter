@@ -52,8 +52,10 @@ class DnsVpnService : VpnService() {
     private var dnsQueryExecutor: DnsQueryExecutor? = null
     private var okHttpClient: OkHttpClient? = null
     private var statisticsBuffer: StatisticsBuffer? = null
+    @Volatile
     private var servers: List<DnsServer> = emptyList()
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var serversJob: Job? = null
 
     // 固定并发度 dispatcher，避免每个包都创建协程并竞争 Semaphore
     private val processingDispatcher = Dispatchers.IO.limitedParallelism(4)
@@ -100,11 +102,10 @@ class DnsVpnService : VpnService() {
         if (isRunning) return
         AppLog.d(TAG, "Starting VPN service")
 
-        // Load servers synchronously BEFORE starting VPN
+        val prefsManager = ServiceLocator.providePreferencesManager()
         runBlocking {
-            val prefsManager = ServiceLocator.providePreferencesManager()
-            servers = prefsManager.dnsServers.first().filter { it.isEnabled }
-            AppLog.d(TAG, "Loaded ${servers.size} DNS servers")
+            servers = prefsManager.dnsServers.first().filter(::isSupportedDnsServer)
+            AppLog.d(TAG, "Loaded ${servers.size} supported DNS servers")
         }
 
         val builder = Builder()
@@ -119,13 +120,11 @@ class DnsVpnService : VpnService() {
             // 这样只有DNS查询会进入VPN，其他流量走正常网络
             .addRoute(VPN_DNS_V4, 32)
             .addRoute(VPN_DNS_V6, 128)
-            .setMtu(3000)
+            .setMtu(MTU)
             .setBlocking(true)
 
-        // Android Q+ 默认将VPN视为计费网络，设置为false让系统从底层网络继承计费状态
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            builder.setMetered(false)
-        }
+        // minSdk = 29，可直接使用
+        builder.setMetered(false)
 
         // Exclude ourselves from VPN to avoid routing loops
         try {
@@ -139,6 +138,7 @@ class DnsVpnService : VpnService() {
         if (vpnInterface != null) {
             isRunning = true
             isServiceRunning = true
+            startDnsServerTracking(prefsManager)
             startForeground(NOTIFICATION_ID, createNotification())
             scope.launch { runDnsLoop() }
             AppLog.d(TAG, "VPN established successfully")
@@ -152,16 +152,19 @@ class DnsVpnService : VpnService() {
     private fun stopVpn() {
         isRunning = false
         isServiceRunning = false
+        serversJob?.cancel()
+        serversJob = null
         vpnInterface?.close()
         vpnInterface = null
 
-        // 刷新统计信息到磁盘（异步，不阻塞主线程）
-        scope.launch {
-            try {
-                statisticsBuffer?.flush()
-            } catch (e: Exception) {
-                AppLog.e(TAG, "Failed to flush statistics", e)
+        try {
+            runBlocking {
+                withContext(NonCancellable + Dispatchers.IO) {
+                    statisticsBuffer?.flush()
+                }
             }
+        } catch (e: Exception) {
+            AppLog.e(TAG, "Failed to flush statistics", e)
         }
 
         scope.cancel()
@@ -276,6 +279,10 @@ class DnsVpnService : VpnService() {
         val response = processDnsQuery(dnsPayload, srcIp, srcPort)
 
         if (response != null) {
+            if (ihl + 8 + response.size > packet.size) {
+                AppLog.e(TAG, "IPv4 DNS response too large for packet buffer: ${response.size}")
+                return
+            }
             // 复用原始 packet 数组：把 DNS 响应写回 payload 位置，patch IP/UDP header
             response.copyInto(packet, destinationOffset = ihl + 8)
             patchIPv4Response(packet, ihl, srcPort, response.size)
@@ -333,6 +340,10 @@ class DnsVpnService : VpnService() {
         val response = processDnsQuery(dnsPayload, srcIp, srcPort)
 
         if (response != null) {
+            if (ipv6HeaderLength + 8 + response.size > packet.size) {
+                AppLog.e(TAG, "IPv6 DNS response too large for packet buffer: ${response.size}")
+                return
+            }
             // 复用原始 packet 数组：把 DNS 响应写回 payload 位置，patch IPv6/UDP header
             response.copyInto(packet, destinationOffset = ipv6HeaderLength + 8)
             patchIPv6Response(packet, srcPort, response.size)
@@ -389,17 +400,23 @@ class DnsVpnService : VpnService() {
         }
 
         // Forward to upstream DNS
-        val result = dnsQueryExecutor?.query(question.domain, servers, question.qtype)
+        val result = dnsQueryExecutor?.query(
+            domain = question.domain,
+            servers = servers,
+            query = dnsPayload,
+            qtype = question.qtype,
+            qclass = question.qclass
+        )
 
-        if (result?.success == true && result.responseIp != null) {
-            AppLog.d(TAG, "DNS response: ${question.domain} -> ${result.responseIp} (${result.responseTime}ms)")
+        if (result?.success == true && result.responseBytes != null) {
+            AppLog.d(TAG, "DNS response: ${question.domain} (${result.responseTime}ms)")
 
             // 只有真实发送的上游请求才计入平均响应时间，缓存命中不计入
             val includeInAvg = !result.fromCache
             val recordedTime = if (result.fromCache) 0 else result.responseTime
             statisticsBuffer?.recordQuery(blocked = false, responseTime = recordedTime, includeInAvg = includeInAvg)
-            
-            return buildDnsResponse(dnsPayload, question.qtype, result.responseIp)
+
+            return result.responseBytes
         }
 
         AppLog.e(TAG, "DNS query failed: ${result?.error}")
@@ -853,7 +870,9 @@ class DnsVpnService : VpnService() {
     }
 
     private fun createNotification(): Notification {
-        val intent = Intent(this, DnsVpnService::class.java)
+        val intent = Intent(this, com.deatrg.dnsfilter.ui.MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
         val pendingIntent = PendingIntent.getActivity(
             this,
             0,
@@ -888,18 +907,16 @@ class DnsVpnService : VpnService() {
     }
 
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                "dnsfilter_channel",
-                getString(R.string.notification_channel_name),
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = getString(R.string.notification_channel_description)
-            }
-
-            val notificationManager = getSystemService(NotificationManager::class.java)
-            notificationManager.createNotificationChannel(channel)
+        val channel = NotificationChannel(
+            "dnsfilter_channel",
+            getString(R.string.notification_channel_name),
+            NotificationManager.IMPORTANCE_LOW
+        ).apply {
+            description = getString(R.string.notification_channel_description)
         }
+
+        val notificationManager = getSystemService(NotificationManager::class.java)
+        notificationManager.createNotificationChannel(channel)
     }
 
     override fun onDestroy() {
@@ -910,5 +927,19 @@ class DnsVpnService : VpnService() {
 
     override fun onBind(intent: Intent?): android.os.IBinder? {
         return super.onBind(intent)
+    }
+
+    private fun startDnsServerTracking(preferencesManager: com.deatrg.dnsfilter.data.local.PreferencesManager) {
+        serversJob?.cancel()
+        serversJob = scope.launch {
+            preferencesManager.dnsServers.collect { updatedServers ->
+                servers = updatedServers.filter(::isSupportedDnsServer)
+                AppLog.d(TAG, "Updated active DNS servers: ${servers.size}")
+            }
+        }
+    }
+
+    private fun isSupportedDnsServer(server: DnsServer): Boolean {
+        return server.isEnabled && server.type != DnsServerType.DOT
     }
 }

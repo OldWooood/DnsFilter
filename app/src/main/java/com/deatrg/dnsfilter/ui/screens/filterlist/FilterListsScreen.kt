@@ -21,6 +21,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.deatrg.dnsfilter.R
 import com.deatrg.dnsfilter.domain.model.FilterList
+import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import java.text.SimpleDateFormat
 import java.util.*
@@ -144,7 +145,11 @@ private fun HeaderSection(
         verticalAlignment = Alignment.CenterVertically
     ) {
         Text(
-            text = if (isLoaded) stringResource(R.string.filter_lists_domains_blocked, filterCount) else stringResource(R.string.filter_lists_loading),
+            text = if (isLoaded) {
+                pluralStringResource(R.plurals.filter_lists_domains_blocked, filterCount, filterCount)
+            } else {
+                stringResource(R.string.filter_lists_loading)
+            },
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )

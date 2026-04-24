@@ -5,6 +5,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -25,6 +26,7 @@ class StatisticsBuffer(
 
     private var flushJob: Job? = null
     private val lastUpdateTime = AtomicLong(0)
+    private val isInitialized = AtomicBoolean(false)
 
     companion object {
         private const val FLUSH_INTERVAL_MS = 5000L // 5秒批量写入一次
@@ -35,16 +37,18 @@ class StatisticsBuffer(
      * 从持久化存储加载初始值
      */
     suspend fun loadInitialValues() {
-        preferencesManager.statistics.collect { stats ->
-            _totalQueries.set(stats.totalQueries)
-            _blockedQueries.set(stats.blockedQueries)
-            _allowedQueries.set(stats.allowedQueries)
-            // 用旧数据反推总响应时间和计数，保持数据连续性
-            // 旧口径下所有查询都计入了平均，这里做近似恢复即可
-            _totalResponseTime.set(stats.totalQueries * stats.averageResponseTime)
-            _queryCount.set(stats.totalQueries)
+        if (!isInitialized.compareAndSet(false, true)) {
             updateFlow()
+            return
         }
+
+        val state = preferencesManager.getStatisticsState()
+        _totalQueries.set(state.statistics.totalQueries)
+        _blockedQueries.set(state.statistics.blockedQueries)
+        _allowedQueries.set(state.statistics.allowedQueries)
+        _totalResponseTime.set(state.totalResponseTime)
+        _queryCount.set(state.responseSampleCount)
+        updateFlow()
     }
 
     /**
@@ -85,7 +89,9 @@ class StatisticsBuffer(
                 blockedQueries = blocked,
                 allowedQueries = allowed,
                 averageResponseTime = avgResponse
-            )
+            ),
+            totalResponseTime = _totalResponseTime.get(),
+            responseSampleCount = _queryCount.get()
         )
     }
 

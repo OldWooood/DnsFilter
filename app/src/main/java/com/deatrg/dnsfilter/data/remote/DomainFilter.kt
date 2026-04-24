@@ -6,13 +6,17 @@ import com.deatrg.dnsfilter.data.local.BlocklistCacheManager
 import com.deatrg.dnsfilter.domain.model.FilterList
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import java.io.BufferedReader
-import java.io.InputStreamReader
-import java.net.URL
 import java.util.LinkedHashMap
+import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.AtomicInteger
 
-class DomainFilter(private val context: Context) {
+class DomainFilter(
+    private val context: Context,
+    private val okHttpClient: OkHttpClient
+) {
 
     companion object {
         private const val TAG = "DomainFilter"
@@ -20,9 +24,18 @@ class DomainFilter(private val context: Context) {
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val cacheManager = BlocklistCacheManager(context)
-    
-    private val blockedDomains = mutableSetOf<String>()
-    private val blockedPatterns = mutableListOf<Regex>()
+
+    private data class BlocklistSnapshot(
+        val blockedDomains: Set<String> = emptySet(),
+        val blockedPatterns: List<Regex> = emptyList()
+    ) {
+        val totalCount: Int
+            get() = blockedDomains.size + blockedPatterns.size
+
+        fun hasData(): Boolean = blockedDomains.isNotEmpty() || blockedPatterns.isNotEmpty()
+    }
+
+    private val snapshotRef = AtomicReference(BlocklistSnapshot())
 
     // LRU cache for allowed domains (O(1) lookup)
     private val okCache = object : LinkedHashMap<String, Boolean>(1000, 0.75f, true) {
@@ -68,11 +81,11 @@ class DomainFilter(private val context: Context) {
             okCache.clear()
             blockedCache.clear()
         }
-        blockedDomains.clear()
-        blockedPatterns.clear()
+        snapshotRef.set(BlocklistSnapshot())
         
         // 如果没有启用的过滤列表，直接标记为已加载（空 blocklist 是合法状态）
         if (filterListsToLoad.isEmpty()) {
+            _filterListCount.value = 0
             _isLoaded.value = true
             AppLog.d(TAG, "No filter lists enabled, marking as loaded with empty blocklist")
             return@withContext
@@ -80,16 +93,23 @@ class DomainFilter(private val context: Context) {
         
         // 从本地缓存加载
         var totalLoaded = 0
+        val newBlockedDomains = HashSet<String>()
+        val newBlockedPatterns = mutableListOf<Regex>()
         filterListsToLoad.forEach { filterList ->
             val cachedDomains = cacheManager.loadBlocklist(filterList)
             if (cachedDomains != null) {
-                addDomainsToBlocklist(cachedDomains)
+                addDomainsToBlocklist(cachedDomains, newBlockedDomains, newBlockedPatterns)
                 totalLoaded += cachedDomains.size
                 AppLog.d(TAG, "Loaded ${cachedDomains.size} domains from cache for ${filterList.name}")
             }
         }
-        
-        _filterListCount.value = blockedDomains.size + blockedPatterns.size
+
+        val snapshot = BlocklistSnapshot(
+            blockedDomains = newBlockedDomains,
+            blockedPatterns = newBlockedPatterns
+        )
+        publishSnapshot(snapshot)
+
         // 只要有数据就标记为已加载（允许部分列表失败）
         if (totalLoaded > 0) {
             _isLoaded.value = true
@@ -104,11 +124,21 @@ class DomainFilter(private val context: Context) {
     suspend fun downloadFilterList(filterList: FilterList): Int? = withContext(Dispatchers.IO) {
         try {
             AppLog.d(TAG, "Downloading filter list: ${filterList.name} from ${filterList.url}")
-            val url = URL(filterList.url)
             val domains = mutableSetOf<String>()
-            
-            url.openConnection().getInputStream().use { input ->
-                BufferedReader(InputStreamReader(input)).use { reader ->
+
+            val request = Request.Builder()
+                .url(filterList.url)
+                .get()
+                .build()
+
+            okHttpClient.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    AppLog.w(TAG, "Failed to download ${filterList.name}: HTTP ${response.code}")
+                    return@withContext null
+                }
+
+                val body = response.body ?: return@withContext null
+                BufferedReader(body.charStream()).use { reader ->
                     reader.lineSequence()
                         .map { it.trim() }
                         .filter { it.isNotEmpty() && !it.startsWith("#") }
@@ -159,7 +189,6 @@ class DomainFilter(private val context: Context) {
                 reloadAllFromCache()
             }
 
-            _filterListCount.value = blockedDomains.size + blockedPatterns.size
             updatedLists.isNotEmpty()
         } catch (e: Exception) {
             AppLog.e(TAG, "Error checking for updates", e)
@@ -187,15 +216,9 @@ class DomainFilter(private val context: Context) {
         val downloadedCount = AtomicInteger(0)
 
         try {
-            // 清除旧数据
-            synchronized(this@DomainFilter) {
-                okCache.clear()
-                blockedCache.clear()
-            }
-            blockedDomains.clear()
-            blockedPatterns.clear()
-
             var loadedCount = 0
+            val newBlockedDomains = HashSet<String>()
+            val newBlockedPatterns = mutableListOf<Regex>()
 
             filterListsToLoad.forEach { filterList ->
                 val hasCache = cacheManager.hasCache(filterList)
@@ -220,19 +243,23 @@ class DomainFilter(private val context: Context) {
                     }
                 }
 
-                domains?.let { addDomainsToBlocklist(it) }
+                domains?.let { addDomainsToBlocklist(it, newBlockedDomains, newBlockedPatterns) }
                 downloadedCount.incrementAndGet()
                 _downloadProgress.value = Pair(downloadedCount.get(), filterListsToLoad.size)
             }
 
-            _filterListCount.value = blockedDomains.size + blockedPatterns.size
+            val snapshot = BlocklistSnapshot(
+                blockedDomains = newBlockedDomains,
+                blockedPatterns = newBlockedPatterns
+            )
+            publishSnapshot(snapshot)
 
             // 只要有至少一个列表加载成功，或所有列表都有旧缓存，就视为成功
             // 允许部分列表失败，但至少要有一个列表的缓存
-            val hasAnyData = blockedDomains.isNotEmpty() || blockedPatterns.isNotEmpty()
+            val hasAnyData = snapshot.hasData()
             _isLoaded.value = hasAnyData
 
-            AppLog.d(TAG, "loadFilterLists completed: ${blockedDomains.size} domains, loaded=$loadedCount/${filterListsToLoad.size}")
+            AppLog.d(TAG, "loadFilterLists completed: ${snapshot.blockedDomains.size} domains, loaded=$loadedCount/${filterListsToLoad.size}")
             hasAnyData
         } finally {
             _isLoading.value = false
@@ -285,21 +312,19 @@ class DomainFilter(private val context: Context) {
             }
         }
 
-        // 原子性替换集合内容
-        synchronized(this@DomainFilter) {
-            okCache.clear()
-            blockedCache.clear()
-            blockedDomains.clear()
-            blockedPatterns.clear()
-            blockedDomains.addAll(newBlockedDomains)
-            blockedPatterns.addAll(newBlockedPatterns)
-        }
-
-        _filterListCount.value = blockedDomains.size + blockedPatterns.size
-        _isLoaded.value = blockedDomains.isNotEmpty() || blockedPatterns.isNotEmpty()
+        publishSnapshot(
+            BlocklistSnapshot(
+                blockedDomains = newBlockedDomains,
+                blockedPatterns = newBlockedPatterns
+            )
+        )
     }
 
-    private fun addDomainsToBlocklist(domains: Set<String>) {
+    private fun addDomainsToBlocklist(
+        domains: Set<String>,
+        blockedDomains: MutableSet<String>,
+        blockedPatterns: MutableList<Regex>
+    ) {
         domains.forEach { domain ->
             if (domain.contains("*")) {
                 blockedPatterns.add(createPattern(domain))
@@ -331,6 +356,7 @@ class DomainFilter(private val context: Context) {
 
     fun isDomainBlocked(domain: String): BlockResult {
         val normalizedDomain = domain.lowercase().trimEnd('.')
+        val snapshot = snapshotRef.get()
 
         synchronized(this) {
             // Check caches first (O(1))
@@ -344,7 +370,7 @@ class DomainFilter(private val context: Context) {
         }
 
         // Check if domain is blocked (may involve parent domain traversal)
-        val result = checkBlocked(normalizedDomain)
+        val result = checkBlocked(snapshot, normalizedDomain)
 
         synchronized(this) {
             if (result.isBlocked) {
@@ -357,29 +383,39 @@ class DomainFilter(private val context: Context) {
         return result
     }
 
-    private fun checkBlocked(domain: String): BlockResult {
+    private fun checkBlocked(snapshot: BlocklistSnapshot, domain: String): BlockResult {
         // O(1) lookup in HashSet
-        if (blockedDomains.contains(domain)) {
+        if (snapshot.blockedDomains.contains(domain)) {
             return BlockResult(true, "blocked_domain")
         }
 
         // Check parent domains (e.g., ad.example.com -> example.com -> .com)
         var checkDomain = domain
         while (checkDomain.contains(".")) {
-            if (blockedDomains.contains(checkDomain)) {
+            if (snapshot.blockedDomains.contains(checkDomain)) {
                 return BlockResult(true, "blocked_parent_domain")
             }
             checkDomain = checkDomain.substringAfter(".")
         }
 
         // Check regex patterns
-        for (pattern in blockedPatterns) {
+        for (pattern in snapshot.blockedPatterns) {
             if (pattern.matches(domain)) {
                 return BlockResult(true, "blocked_pattern")
             }
         }
 
         return BlockResult(false, null)
+    }
+
+    private fun publishSnapshot(snapshot: BlocklistSnapshot) {
+        synchronized(this@DomainFilter) {
+            okCache.clear()
+            blockedCache.clear()
+            snapshotRef.set(snapshot)
+        }
+        _filterListCount.value = snapshot.totalCount
+        _isLoaded.value = snapshot.hasData()
     }
 
     /**
