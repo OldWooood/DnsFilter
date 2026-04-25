@@ -9,9 +9,10 @@ import kotlinx.coroutines.flow.*
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.BufferedReader
-import java.util.LinkedHashMap
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.locks.ReentrantReadWriteLock
 
 class DomainFilter(
     private val context: Context,
@@ -36,19 +37,12 @@ class DomainFilter(
 
     private val snapshotRef = AtomicReference(BlocklistSnapshot())
 
-    // LRU cache for allowed domains (O(1) lookup)
-    private val okCache = object : LinkedHashMap<String, Boolean>(1000, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Boolean>?): Boolean {
-            return size > 10000
-        }
-    }
+    // 用 ReentrantReadWriteLock 替代 synchronized：读操作可并发，写操作独占
+    private val cacheLock = ReentrantReadWriteLock()
 
-    // LRU cache for blocked domains with reason
-    private val blockedCache = object : LinkedHashMap<String, String>(1000, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean {
-            return size > 10000
-        }
-    }
+    // ConcurrentHashMap 读操作完全无锁，仅在 publishSnapshot 写锁时阻塞
+    private val okCache = ConcurrentHashMap<String, Boolean>()
+    private val blockedCache = ConcurrentHashMap<String, String>()
 
     private val _isLoaded = MutableStateFlow(false)
     val isLoaded: StateFlow<Boolean> = _isLoaded.asStateFlow()
@@ -357,26 +351,29 @@ class DomainFilter(
         val normalizedDomain = domain.lowercase().trimEnd('.')
         val snapshot = snapshotRef.get()
 
-        synchronized(this) {
-            // Check caches first (O(1))
+        cacheLock.readLock().lock()
+        try {
             okCache[normalizedDomain]?.let {
                 return BlockResult(false, null)
             }
-
             blockedCache[normalizedDomain]?.let {
                 return BlockResult(true, it)
             }
+        } finally {
+            cacheLock.readLock().unlock()
         }
 
-        // Check if domain is blocked (may involve parent domain traversal)
         val result = checkBlocked(snapshot, normalizedDomain)
 
-        synchronized(this) {
+        cacheLock.readLock().lock()
+        try {
             if (result.isBlocked) {
                 blockedCache[normalizedDomain] = result.reason ?: "blocked"
             } else {
                 okCache[normalizedDomain] = true
             }
+        } finally {
+            cacheLock.readLock().unlock()
         }
 
         return result
@@ -401,10 +398,13 @@ class DomainFilter(
     }
 
     private fun publishSnapshot(snapshot: BlocklistSnapshot) {
-        synchronized(this@DomainFilter) {
+        cacheLock.writeLock().lock()
+        try {
             okCache.clear()
             blockedCache.clear()
             snapshotRef.set(snapshot)
+        } finally {
+            cacheLock.writeLock().unlock()
         }
         _filterListCount.value = snapshot.totalCount
         _isLoaded.value = snapshot.hasData()

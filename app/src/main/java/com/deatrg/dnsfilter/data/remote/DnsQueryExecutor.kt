@@ -34,8 +34,8 @@ class DnsQueryExecutor(
 
     companion object {
         private const val TAG = "DnsQueryExecutor"
-        private const val DNS_CACHE_SIZE = 4096
-        private const val DNS_CACHE_TTL_MS = 5 * 60 * 1000L // 5 minutes
+        private const val DNS_CACHE_SIZE = 16384
+        private const val DNS_CACHE_TTL_MS = 10 * 60 * 1000L // 10 minutes
         private const val DEFAULT_SERVER_RTT_MS = 180L
         private const val FAILURE_PENALTY_MS = 300L
         private const val HEDGE_MIN_DELAY_MS = 80L
@@ -80,12 +80,9 @@ class DnsQueryExecutor(
     private val serverAddressCache = ConcurrentHashMap<String, InetAddress>()
     private val serverStats = ConcurrentHashMap<String, ServerStats>()
 
-    // DNS 响应缓存（LRU，最大 4096 条）
-    private val dnsCache = object : LinkedHashMap<String, CachedDnsResponse>(DNS_CACHE_SIZE, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CachedDnsResponse>?): Boolean {
-            return size > DNS_CACHE_SIZE
-        }
-    }
+    // DNS 响应缓存（最大 16384 条，TTL 10 分钟）
+    // 用 ConcurrentHashMap 替代 LinkedHashMap + synchronized，读操作完全无锁
+    private val dnsCache = ConcurrentHashMap<String, CachedDnsResponse>()
 
     private fun getCacheKey(domain: String, qtype: Int, qclass: Int): String = "$domain:$qtype:$qclass"
 
@@ -105,14 +102,14 @@ class DnsQueryExecutor(
         query: ByteArray
     ): ByteArray? {
         val key = getCacheKey(domain, qtype, qclass)
-        synchronized(dnsCache) {
-            val cached = dnsCache[key]
-            if (cached != null && System.currentTimeMillis() - cached.timestamp < DNS_CACHE_TTL_MS) {
+        val cached = dnsCache[key]
+        if (cached != null) {
+            if (System.currentTimeMillis() - cached.timestamp < DNS_CACHE_TTL_MS) {
                 return patchResponseForClient(cached.response, query)
             }
             dnsCache.remove(key)
-            return null
         }
+        return null
     }
 
     private fun putToCache(
@@ -122,9 +119,11 @@ class DnsQueryExecutor(
         response: ByteArray
     ) {
         val key = getCacheKey(domain, qtype, qclass)
-        synchronized(dnsCache) {
-            dnsCache[key] = CachedDnsResponse(response.copyOf(), System.currentTimeMillis())
+        if (dnsCache.size > DNS_CACHE_SIZE) {
+            val now = System.currentTimeMillis()
+            dnsCache.entries.removeIf { now - it.value.timestamp > DNS_CACHE_TTL_MS }
         }
+        dnsCache[key] = CachedDnsResponse(response.copyOf(), System.currentTimeMillis())
     }
 
     suspend fun query(
