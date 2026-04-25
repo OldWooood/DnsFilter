@@ -40,8 +40,7 @@ class DomainFilter(
      */
     private data class FilterState(
         val snapshot: BlocklistSnapshot = BlocklistSnapshot(),
-        val okCache: ConcurrentHashMap<String, Boolean> = ConcurrentHashMap(),
-        val blockedCache: ConcurrentHashMap<String, String> = ConcurrentHashMap()
+        val cache: ConcurrentHashMap<String, Boolean> = ConcurrentHashMap()
     )
 
     private val stateRef = AtomicReference(FilterState())
@@ -349,22 +348,15 @@ class DomainFilter(
         val normalizedDomain = domain.lowercase().trimEnd('.')
         val state = stateRef.get()
 
-        // 查缓存（ConcurrentHashMap 无锁读）
-        state.okCache[normalizedDomain]?.let {
-            return BlockResult(false, null)
-        }
-        state.blockedCache[normalizedDomain]?.let {
-            return BlockResult(true, it)
+        // 查缓存：true=blocked, false=allowed
+        state.cache[normalizedDomain]?.let { isBlocked ->
+            return BlockResult(isBlocked, if (isBlocked) "cached" else null)
         }
 
         val result = checkBlocked(state.snapshot, normalizedDomain)
 
         // 写缓存（ConcurrentHashMap 内部保证线程安全）
-        if (result.isBlocked) {
-            state.blockedCache[normalizedDomain] = result.reason ?: "blocked"
-        } else {
-            state.okCache[normalizedDomain] = true
-        }
+        state.cache[normalizedDomain] = result.isBlocked
 
         return result
     }
