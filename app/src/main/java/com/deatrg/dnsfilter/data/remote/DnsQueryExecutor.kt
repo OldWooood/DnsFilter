@@ -89,6 +89,15 @@ class DnsQueryExecutor(
 
     private fun getCacheKey(domain: String, qtype: Int, qclass: Int): String = "$domain:$qtype:$qclass"
 
+    fun queryCache(
+        domain: String,
+        qtype: Int,
+        qclass: Int,
+        query: ByteArray
+    ): ByteArray? {
+        return getFromCache(domain, qtype, qclass, query)
+    }
+
     private fun getFromCache(
         domain: String,
         qtype: Int,
