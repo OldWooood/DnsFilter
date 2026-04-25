@@ -12,7 +12,6 @@ import java.io.BufferedReader
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.locks.ReentrantReadWriteLock
 
 class DomainFilter(
     private val context: Context,
@@ -35,14 +34,17 @@ class DomainFilter(
         fun hasData(): Boolean = blockedDomains.isNotEmpty()
     }
 
-    private val snapshotRef = AtomicReference(BlocklistSnapshot())
+    /**
+     * 打包 snapshot + caches 为一个不可变状态对象。
+     * publishSnapshot 时整体替换，保证一致性且无锁。
+     */
+    private data class FilterState(
+        val snapshot: BlocklistSnapshot = BlocklistSnapshot(),
+        val okCache: ConcurrentHashMap<String, Boolean> = ConcurrentHashMap(),
+        val blockedCache: ConcurrentHashMap<String, String> = ConcurrentHashMap()
+    )
 
-    // 用 ReentrantReadWriteLock 替代 synchronized：读操作可并发，写操作独占
-    private val cacheLock = ReentrantReadWriteLock()
-
-    // ConcurrentHashMap 读操作完全无锁，仅在 publishSnapshot 写锁时阻塞
-    private val okCache = ConcurrentHashMap<String, Boolean>()
-    private val blockedCache = ConcurrentHashMap<String, String>()
+    private val stateRef = AtomicReference(FilterState())
 
     private val _isLoaded = MutableStateFlow(false)
     val isLoaded: StateFlow<Boolean> = _isLoaded.asStateFlow()
@@ -70,11 +72,7 @@ class DomainFilter(
         _isLoading.value = false
         _downloadProgress.value = null
         _filterListCount.value = 0
-        synchronized(this@DomainFilter) {
-            okCache.clear()
-            blockedCache.clear()
-        }
-        snapshotRef.set(BlocklistSnapshot())
+        stateRef.set(FilterState())
         
         // 如果没有启用的过滤列表，直接标记为已加载（空 blocklist 是合法状态）
         if (filterListsToLoad.isEmpty()) {
@@ -349,31 +347,23 @@ class DomainFilter(
 
     fun isDomainBlocked(domain: String): BlockResult {
         val normalizedDomain = domain.lowercase().trimEnd('.')
-        val snapshot = snapshotRef.get()
+        val state = stateRef.get()
 
-        cacheLock.readLock().lock()
-        try {
-            okCache[normalizedDomain]?.let {
-                return BlockResult(false, null)
-            }
-            blockedCache[normalizedDomain]?.let {
-                return BlockResult(true, it)
-            }
-        } finally {
-            cacheLock.readLock().unlock()
+        // 查缓存（ConcurrentHashMap 无锁读）
+        state.okCache[normalizedDomain]?.let {
+            return BlockResult(false, null)
+        }
+        state.blockedCache[normalizedDomain]?.let {
+            return BlockResult(true, it)
         }
 
-        val result = checkBlocked(snapshot, normalizedDomain)
+        val result = checkBlocked(state.snapshot, normalizedDomain)
 
-        cacheLock.readLock().lock()
-        try {
-            if (result.isBlocked) {
-                blockedCache[normalizedDomain] = result.reason ?: "blocked"
-            } else {
-                okCache[normalizedDomain] = true
-            }
-        } finally {
-            cacheLock.readLock().unlock()
+        // 写缓存（ConcurrentHashMap 内部保证线程安全）
+        if (result.isBlocked) {
+            state.blockedCache[normalizedDomain] = result.reason ?: "blocked"
+        } else {
+            state.okCache[normalizedDomain] = true
         }
 
         return result
@@ -398,14 +388,8 @@ class DomainFilter(
     }
 
     private fun publishSnapshot(snapshot: BlocklistSnapshot) {
-        cacheLock.writeLock().lock()
-        try {
-            okCache.clear()
-            blockedCache.clear()
-            snapshotRef.set(snapshot)
-        } finally {
-            cacheLock.writeLock().unlock()
-        }
+        // 整体替换：新查询立刻看到新快照 + 空缓存，旧 state 丢弃给 GC
+        stateRef.set(FilterState(snapshot = snapshot))
         _filterListCount.value = snapshot.totalCount
         _isLoaded.value = snapshot.hasData()
     }
