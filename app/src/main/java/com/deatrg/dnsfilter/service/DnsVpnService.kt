@@ -17,6 +17,8 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import okhttp3.OkHttpClient
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -57,12 +59,14 @@ class DnsVpnService : VpnService() {
     private var serversJob: Job? = null
 
     // Fast path: 解析、拦截、缓存命中 —— 纯内存操作，Worker 数可多一些
+    // 直接用 Dispatchers.IO，避免 limitedParallelism 的额外调度开销
     private val fastWorkerCount = (Runtime.getRuntime().availableProcessors() * 2).coerceIn(4, 16)
-    private val fastDispatcher = Dispatchers.IO.limitedParallelism(fastWorkerCount)
 
     // Slow path: 上游 DNS 查询 —— 主要是 IO 等待，不需要太多 Worker
     private val slowWorkerCount = 4
-    private val slowDispatcher = Dispatchers.IO.limitedParallelism(slowWorkerCount)
+
+    // 协程友好的输出锁，synchronized 会让线程 BLOCKED 而占用 dispatcher 槽位
+    private val outputMutex = kotlinx.coroutines.sync.Mutex()
 
     // Packet buffer 对象池，减少高并发时的内存分配压力
     private val packetPool = ArrayBlockingQueue<ByteArray>(256)
@@ -201,7 +205,7 @@ class DnsVpnService : VpnService() {
         val upstreamQueue = Channel<UpstreamTask>(capacity = PACKET_QUEUE_CAPACITY)
 
         val fastWorkers = List(fastWorkerCount) {
-            scope.launch(fastDispatcher) {
+            scope.launch(Dispatchers.IO) {
                 for (task in packetQueue) {
                     try {
                         val handled = processPacketFast(task.packet, task.length, outputStream, upstreamQueue)
@@ -217,7 +221,7 @@ class DnsVpnService : VpnService() {
         }
 
         val slowWorkers = List(slowWorkerCount) {
-            scope.launch(slowDispatcher) {
+            scope.launch(Dispatchers.IO) {
                 for (task in upstreamQueue) {
                     try {
                         processUpstreamTask(task, outputStream)
@@ -348,7 +352,7 @@ class DnsVpnService : VpnService() {
                 response.copyInto(packet, destinationOffset = ihl + 8)
                 patchIPv4Response(packet, ihl, srcPort, response.size)
                 val responseLength = ihl + 8 + response.size
-                synchronized(outputStream) {
+                outputMutex.withLock {
                     outputStream.write(packet, 0, responseLength)
                 }
             }
@@ -369,7 +373,7 @@ class DnsVpnService : VpnService() {
                 cachedResponse.copyInto(packet, destinationOffset = ihl + 8)
                 patchIPv4Response(packet, ihl, srcPort, cachedResponse.size)
                 val responseLength = ihl + 8 + cachedResponse.size
-                synchronized(outputStream) {
+                outputMutex.withLock {
                     outputStream.write(packet, 0, responseLength)
                 }
             }
@@ -440,7 +444,7 @@ class DnsVpnService : VpnService() {
                 response.copyInto(packet, destinationOffset = ipv6HeaderLength + 8)
                 patchIPv6Response(packet, srcPort, response.size)
                 val responseLength = ipv6HeaderLength + 8 + response.size
-                synchronized(outputStream) {
+                outputMutex.withLock {
                     outputStream.write(packet, 0, responseLength)
                 }
             }
@@ -461,7 +465,7 @@ class DnsVpnService : VpnService() {
                 cachedResponse.copyInto(packet, destinationOffset = ipv6HeaderLength + 8)
                 patchIPv6Response(packet, srcPort, cachedResponse.size)
                 val responseLength = ipv6HeaderLength + 8 + cachedResponse.size
-                synchronized(outputStream) {
+                outputMutex.withLock {
                     outputStream.write(packet, 0, responseLength)
                 }
             }
