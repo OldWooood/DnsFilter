@@ -56,9 +56,13 @@ class DnsVpnService : VpnService() {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var serversJob: Job? = null
 
-    // 根据 CPU 核心数动态计算并发度，避免每个包都创建协程并竞争 Semaphore
-    private val workerCount = (Runtime.getRuntime().availableProcessors() * 2).coerceIn(4, 16)
-    private val processingDispatcher = Dispatchers.IO.limitedParallelism(workerCount)
+    // Fast path: 解析、拦截、缓存命中 —— 纯内存操作，Worker 数可多一些
+    private val fastWorkerCount = (Runtime.getRuntime().availableProcessors() * 2).coerceIn(4, 16)
+    private val fastDispatcher = Dispatchers.IO.limitedParallelism(fastWorkerCount)
+
+    // Slow path: 上游 DNS 查询 —— 主要是 IO 等待，不需要太多 Worker
+    private val slowWorkerCount = 4
+    private val slowDispatcher = Dispatchers.IO.limitedParallelism(slowWorkerCount)
 
     // Packet buffer 对象池，减少高并发时的内存分配压力
     private val packetPool = ArrayBlockingQueue<ByteArray>(256)
@@ -75,6 +79,16 @@ class DnsVpnService : VpnService() {
     private data class PacketTask(
         val packet: ByteArray,
         val length: Int
+    )
+
+    private data class UpstreamTask(
+        val packet: ByteArray,
+        val length: Int,
+        val dnsPayload: ByteArray,
+        val question: DnsQuestion,
+        val srcPort: Int,
+        val isIPv6: Boolean,
+        val ipHeaderLength: Int
     )
 
     override fun onCreate() {
@@ -184,13 +198,31 @@ class DnsVpnService : VpnService() {
         val inputStream = FileInputStream(vpnInterface.fileDescriptor)
         val outputStream = FileOutputStream(vpnInterface.fileDescriptor)
         val packetQueue = Channel<PacketTask>(capacity = PACKET_QUEUE_CAPACITY)
-        val workers = List(workerCount) {
-            scope.launch(processingDispatcher) {
+        val upstreamQueue = Channel<UpstreamTask>(capacity = PACKET_QUEUE_CAPACITY)
+
+        val fastWorkers = List(fastWorkerCount) {
+            scope.launch(fastDispatcher) {
                 for (task in packetQueue) {
                     try {
-                        processPacket(task.packet, task.length, outputStream)
+                        val handled = processPacketFast(task.packet, task.length, outputStream, upstreamQueue)
+                        if (handled) {
+                            recyclePacket(task.packet)
+                        }
                     } catch (e: Exception) {
-                        AppLog.e(TAG) { "Error processing packet: ${e.message}" }
+                        AppLog.e(TAG) { "Error in fast path: ${e.message}" }
+                        recyclePacket(task.packet)
+                    }
+                }
+            }
+        }
+
+        val slowWorkers = List(slowWorkerCount) {
+            scope.launch(slowDispatcher) {
+                for (task in upstreamQueue) {
+                    try {
+                        processUpstreamTask(task, outputStream)
+                    } catch (e: Exception) {
+                        AppLog.e(TAG) { "Error in slow path: ${e.message}" }
                     } finally {
                         recyclePacket(task.packet)
                     }
@@ -198,7 +230,7 @@ class DnsVpnService : VpnService() {
             }
         }
 
-        AppLog.d(TAG, "DNS loop started")
+        AppLog.d(TAG, "DNS loop started with $fastWorkerCount fast + $slowWorkerCount slow workers")
 
         try {
             while (isRunning) {
@@ -221,20 +253,19 @@ class DnsVpnService : VpnService() {
                 } else {
                     recyclePacket(packet)
                     if (length == 0) {
-                        // In blocking mode, read should block until data is available
-                        // If it returns 0, it means immediate return with no data
                         AppLog.w(TAG, "read() returned 0, no data available")
                     }
                 }
             }
         } catch (e: InterruptedIOException) {
-            // 正常停止，vpnInterface.close() 会中断 read()
             AppLog.d(TAG, "DNS loop interrupted by stop")
         } catch (e: Exception) {
             AppLog.e(TAG, "Error in DNS loop", e)
         } finally {
             packetQueue.close()
-            workers.joinAll()
+            upstreamQueue.close()
+            fastWorkers.joinAll()
+            slowWorkers.joinAll()
             try {
                 inputStream.close()
             } catch (_: Exception) {
@@ -248,52 +279,56 @@ class DnsVpnService : VpnService() {
         }
     }
 
-    private suspend fun processPacket(packet: ByteArray, length: Int, outputStream: FileOutputStream) {
-        // Check minimum length for IP header
+    private suspend fun processPacketFast(
+        packet: ByteArray,
+        length: Int,
+        outputStream: FileOutputStream,
+        upstreamQueue: Channel<UpstreamTask>
+    ): Boolean {
         if (length < 40) {
             AppLog.d(TAG) { "Packet too short: $length bytes" }
-            return
+            return true
         }
 
-        // Get IP version from first nibble
         val version = packet[0].toInt() shr 4
-
-        when (version) {
-            4 -> processIPv4Packet(packet, length, outputStream)
-            6 -> processIPv6Packet(packet, length, outputStream)
-            else -> AppLog.d(TAG) { "Unknown IP version: $version, skipping" }
+        return when (version) {
+            4 -> processIPv4PacketFast(packet, length, outputStream, upstreamQueue)
+            6 -> processIPv6PacketFast(packet, length, outputStream, upstreamQueue)
+            else -> {
+                AppLog.d(TAG) { "Unknown IP version: $version, skipping" }
+                true
+            }
         }
     }
 
-    private suspend fun processIPv4Packet(packet: ByteArray, length: Int, outputStream: FileOutputStream) {
-        // Get protocol (byte 9) - 17 = UDP
+    private suspend fun processIPv4PacketFast(
+        packet: ByteArray,
+        length: Int,
+        outputStream: FileOutputStream,
+        upstreamQueue: Channel<UpstreamTask>
+    ): Boolean {
         val protocol = packet[9].toInt() and 0xFF
         if (protocol != 17) {
             AppLog.d(TAG) { "Non-UDP IPv4 packet, protocol=$protocol, skipping" }
-            return
+            return true
         }
 
-        // Calculate IP header length
         val ihl = (packet[0].toInt() and 0x0F) * 4
         if (length < ihl + 8) {
             AppLog.d(TAG) { "Packet too short for UDP header" }
-            return
+            return true
         }
 
-        // Get UDP ports
         val srcPort = ((packet[ihl].toInt() and 0xFF) shl 8) or (packet[ihl + 1].toInt() and 0xFF)
         val dstPort = ((packet[ihl + 2].toInt() and 0xFF) shl 8) or (packet[ihl + 3].toInt() and 0xFF)
 
-        // Only handle DNS (port 53)
         if (dstPort != DNS_PORT) {
             AppLog.d(TAG) { "Non-DNS UDP packet, dstPort=$dstPort, skipping" }
-            return
+            return true
         }
 
-        // DNS payload starts after IP header + UDP header
         val dnsPayload = packet.copyOfRange(ihl + 8, length)
-
-        if (dnsPayload.isEmpty()) return
+        if (dnsPayload.isEmpty()) return true
 
         AppLog.d(TAG) {
             val srcIp = "${packet[12].toInt() and 0xFF}.${packet[13].toInt() and 0xFF}.${packet[14].toInt() and 0xFF}.${packet[15].toInt() and 0xFF}"
@@ -301,60 +336,91 @@ class DnsVpnService : VpnService() {
             "IPv4 DNS query from $srcIp:$srcPort to $dstIp, DNS length: ${dnsPayload.size}"
         }
 
-        // Process DNS query
-        val response = processDnsQuery(dnsPayload)
+        val question = parseDnsQuery(dnsPayload) ?: return true
 
-        if (response != null) {
-            if (ihl + 8 + response.size > packet.size) {
-                AppLog.e(TAG) { "IPv4 DNS response too large for packet buffer: ${response.size}" }
-                return
-            }
-            // 复用原始 packet 数组：把 DNS 响应写回 payload 位置，patch IP/UDP header
-            response.copyInto(packet, destinationOffset = ihl + 8)
-            patchIPv4Response(packet, ihl, srcPort, response.size)
-            val responseLength = ihl + 8 + response.size
-            synchronized(outputStream) {
-                try {
+        // 1. 检查拦截
+        val blockResult = domainFilter?.isDomainBlocked(question.domain)
+        if (blockResult?.isBlocked == true) {
+            AppLog.d(TAG) { "Domain ${question.domain} is blocked: ${blockResult.reason}" }
+            statisticsBuffer?.recordQuery(blocked = true, responseTime = 0, includeInAvg = false)
+            val response = buildBlockedDnsResponse(dnsPayload)
+            if (ihl + 8 + response.size <= packet.size) {
+                response.copyInto(packet, destinationOffset = ihl + 8)
+                patchIPv4Response(packet, ihl, srcPort, response.size)
+                val responseLength = ihl + 8 + response.size
+                synchronized(outputStream) {
                     outputStream.write(packet, 0, responseLength)
-                    AppLog.d(TAG) { "Successfully sent IPv4 DNS response to port=$srcPort, length: $responseLength" }
-                } catch (e: Exception) {
-                    AppLog.e(TAG) { "Failed to send DNS response: ${e.message}" }
                 }
             }
-        } else {
-            AppLog.w(TAG, "No DNS response generated")
+            return true
         }
+
+        // 2. 检查缓存
+        val cachedResponse = dnsQueryExecutor?.queryCache(
+            domain = question.domain,
+            qtype = question.qtype,
+            qclass = question.qclass,
+            query = dnsPayload
+        )
+        if (cachedResponse != null) {
+            AppLog.d(TAG) { "DNS cache hit: ${question.domain}" }
+            statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
+            if (ihl + 8 + cachedResponse.size <= packet.size) {
+                cachedResponse.copyInto(packet, destinationOffset = ihl + 8)
+                patchIPv4Response(packet, ihl, srcPort, cachedResponse.size)
+                val responseLength = ihl + 8 + cachedResponse.size
+                synchronized(outputStream) {
+                    outputStream.write(packet, 0, responseLength)
+                }
+            }
+            return true
+        }
+
+        // 3. 需要上游查询，发送到 slow path
+        val task = UpstreamTask(
+            packet = packet,
+            length = length,
+            dnsPayload = dnsPayload,
+            question = question,
+            srcPort = srcPort,
+            isIPv6 = false,
+            ipHeaderLength = ihl
+        )
+        val result = upstreamQueue.trySend(task)
+        if (!result.isSuccess) {
+            upstreamQueue.send(task)
+        }
+        return false
     }
 
-    private suspend fun processIPv6Packet(packet: ByteArray, length: Int, outputStream: FileOutputStream) {
-        // In IPv6, byte 6 is "Next Header" - 17 = UDP
+    private suspend fun processIPv6PacketFast(
+        packet: ByteArray,
+        length: Int,
+        outputStream: FileOutputStream,
+        upstreamQueue: Channel<UpstreamTask>
+    ): Boolean {
         val nextHeader = packet[6].toInt() and 0xFF
         if (nextHeader != 17) {
             AppLog.d(TAG) { "Non-UDP IPv6 packet, nextHeader=$nextHeader, skipping" }
-            return
+            return true
         }
 
-        // IPv6 fixed header is 40 bytes
         val ipv6HeaderLength = 40
         if (length < ipv6HeaderLength + 8) {
             AppLog.d(TAG) { "Packet too short for IPv6 UDP header" }
-            return
+            return true
         }
 
-        // Get UDP ports (after IPv6 fixed header)
         val srcPort = ((packet[ipv6HeaderLength].toInt() and 0xFF) shl 8) or (packet[ipv6HeaderLength + 1].toInt() and 0xFF)
         val dstPort = ((packet[ipv6HeaderLength + 2].toInt() and 0xFF) shl 8) or (packet[ipv6HeaderLength + 3].toInt() and 0xFF)
 
-        // Only handle DNS (port 53)
         if (dstPort != DNS_PORT) {
             AppLog.d(TAG) { "Non-DNS IPv6 UDP packet, dstPort=$dstPort, skipping" }
-            return
+            return true
         }
 
-        // DNS payload starts after IPv6 header + UDP header
         val dnsPayload = packet.copyOfRange(ipv6HeaderLength + 8, length)
-
-        if (dnsPayload.isEmpty()) return
+        if (dnsPayload.isEmpty()) return true
 
         AppLog.d(TAG) {
             val srcIp = formatIPv6(packet, 8)
@@ -362,29 +428,61 @@ class DnsVpnService : VpnService() {
             "IPv6 DNS query from $srcIp:$srcPort to $dstIp, DNS length: ${dnsPayload.size}"
         }
 
-        // Process DNS query
-        val response = processDnsQuery(dnsPayload)
+        val question = parseDnsQuery(dnsPayload) ?: return true
 
-        if (response != null) {
-            if (ipv6HeaderLength + 8 + response.size > packet.size) {
-                AppLog.e(TAG) { "IPv6 DNS response too large for packet buffer: ${response.size}" }
-                return
-            }
-            // 复用原始 packet 数组：把 DNS 响应写回 payload 位置，patch IPv6/UDP header
-            response.copyInto(packet, destinationOffset = ipv6HeaderLength + 8)
-            patchIPv6Response(packet, srcPort, response.size)
-            val responseLength = ipv6HeaderLength + 8 + response.size
-            synchronized(outputStream) {
-                try {
+        // 1. 检查拦截
+        val blockResult = domainFilter?.isDomainBlocked(question.domain)
+        if (blockResult?.isBlocked == true) {
+            AppLog.d(TAG) { "Domain ${question.domain} is blocked: ${blockResult.reason}" }
+            statisticsBuffer?.recordQuery(blocked = true, responseTime = 0, includeInAvg = false)
+            val response = buildBlockedDnsResponse(dnsPayload)
+            if (ipv6HeaderLength + 8 + response.size <= packet.size) {
+                response.copyInto(packet, destinationOffset = ipv6HeaderLength + 8)
+                patchIPv6Response(packet, srcPort, response.size)
+                val responseLength = ipv6HeaderLength + 8 + response.size
+                synchronized(outputStream) {
                     outputStream.write(packet, 0, responseLength)
-                    AppLog.d(TAG) { "Sent IPv6 DNS response to port=$srcPort, length: $responseLength" }
-                } catch (e: Exception) {
-                    AppLog.e(TAG) { "Failed to send IPv6 DNS response: ${e.message}" }
                 }
             }
-        } else {
-            AppLog.w(TAG, "No DNS response generated")
+            return true
         }
+
+        // 2. 检查缓存
+        val cachedResponse = dnsQueryExecutor?.queryCache(
+            domain = question.domain,
+            qtype = question.qtype,
+            qclass = question.qclass,
+            query = dnsPayload
+        )
+        if (cachedResponse != null) {
+            AppLog.d(TAG) { "DNS cache hit: ${question.domain}" }
+            statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
+            if (ipv6HeaderLength + 8 + cachedResponse.size <= packet.size) {
+                cachedResponse.copyInto(packet, destinationOffset = ipv6HeaderLength + 8)
+                patchIPv6Response(packet, srcPort, cachedResponse.size)
+                val responseLength = ipv6HeaderLength + 8 + cachedResponse.size
+                synchronized(outputStream) {
+                    outputStream.write(packet, 0, responseLength)
+                }
+            }
+            return true
+        }
+
+        // 3. 需要上游查询，发送到 slow path
+        val task = UpstreamTask(
+            packet = packet,
+            length = length,
+            dnsPayload = dnsPayload,
+            question = question,
+            srcPort = srcPort,
+            isIPv6 = true,
+            ipHeaderLength = ipv6HeaderLength
+        )
+        val result = upstreamQueue.trySend(task)
+        if (!result.isSuccess) {
+            upstreamQueue.send(task)
+        }
+        return false
     }
 
     private fun formatIPv6(packet: ByteArray, offset: Int): String {
@@ -397,54 +495,73 @@ class DnsVpnService : VpnService() {
         return sb.toString()
     }
 
-    private suspend fun processDnsQuery(dnsPayload: ByteArray): ByteArray? {
-        // Parse domain from DNS query
-        val question = parseDnsQuery(dnsPayload) ?: run {
-            AppLog.e(TAG, "Failed to parse DNS query")
-            return null
-        }
-
-        AppLog.d(TAG) { "Query for domain: ${question.domain}, qtype=${question.qtype}, servers=${servers.size}" }
-
-        // Check if domain is blocked
-        val blockResult = domainFilter?.isDomainBlocked(question.domain)
-        if (blockResult?.isBlocked == true) {
-            AppLog.d(TAG) { "Domain ${question.domain} is blocked: ${blockResult.reason}" }
-            
-            // Update statistics（被拦截的请求不计入平均响应时间）
-            statisticsBuffer?.recordQuery(blocked = true, responseTime = 0, includeInAvg = false)
-            
-            return buildBlockedDnsResponse(dnsPayload)
-        }
-
-        // Ensure servers are available
+    private suspend fun processUpstreamTask(
+        task: UpstreamTask,
+        outputStream: FileOutputStream
+    ) {
         if (servers.isEmpty()) {
             AppLog.e(TAG, "No DNS servers available")
-            return buildErrorDnsResponse(dnsPayload, 0x0002) // SERVFAIL
+            statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
+            writeResponseAndPatch(task, buildErrorDnsResponse(task.dnsPayload, 0x0002), outputStream)
+            return
         }
 
-        // Forward to upstream DNS
         val result = dnsQueryExecutor?.query(
-            domain = question.domain,
+            domain = task.question.domain,
             servers = servers,
-            query = dnsPayload,
-            qtype = question.qtype,
-            qclass = question.qclass
+            query = task.dnsPayload,
+            qtype = task.question.qtype,
+            qclass = task.question.qclass
         )
 
         if (result?.success == true && result.responseBytes != null) {
-            AppLog.d(TAG) { "DNS response: ${question.domain} (${result.responseTime}ms)" }
-
-            // 只有真实发送的上游请求才计入平均响应时间，缓存命中不计入
+            AppLog.d(TAG) { "DNS response: ${task.question.domain} (${result.responseTime}ms)" }
             val includeInAvg = !result.fromCache
             val recordedTime = if (result.fromCache) 0 else result.responseTime
             statisticsBuffer?.recordQuery(blocked = false, responseTime = recordedTime, includeInAvg = includeInAvg)
-
-            return result.responseBytes
+            writeResponseAndPatch(task, result.responseBytes, outputStream)
+        } else {
+            AppLog.e(TAG) { "DNS query failed: ${result?.error}" }
+            statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
+            writeResponseAndPatch(task, buildErrorDnsResponse(task.dnsPayload, 0x0002), outputStream)
         }
+    }
 
-        AppLog.e(TAG) { "DNS query failed: ${result?.error}" }
-        return buildErrorDnsResponse(dnsPayload, 0x0002) // SERVFAIL
+    private fun writeResponseAndPatch(
+        task: UpstreamTask,
+        dnsResponse: ByteArray,
+        outputStream: FileOutputStream
+    ) {
+        if (task.isIPv6) {
+            if (40 + 8 + dnsResponse.size <= task.packet.size) {
+                dnsResponse.copyInto(task.packet, destinationOffset = 40 + 8)
+                patchIPv6Response(task.packet, task.srcPort, dnsResponse.size)
+                val responseLength = 40 + 8 + dnsResponse.size
+                synchronized(outputStream) {
+                    try {
+                        outputStream.write(task.packet, 0, responseLength)
+                        AppLog.d(TAG) { "Sent IPv6 DNS response to port=${task.srcPort}, length: $responseLength" }
+                    } catch (e: Exception) {
+                        AppLog.e(TAG) { "Failed to send IPv6 DNS response: ${e.message}" }
+                    }
+                }
+            }
+        } else {
+            val ihl = task.ipHeaderLength
+            if (ihl + 8 + dnsResponse.size <= task.packet.size) {
+                dnsResponse.copyInto(task.packet, destinationOffset = ihl + 8)
+                patchIPv4Response(task.packet, ihl, task.srcPort, dnsResponse.size)
+                val responseLength = ihl + 8 + dnsResponse.size
+                synchronized(outputStream) {
+                    try {
+                        outputStream.write(task.packet, 0, responseLength)
+                        AppLog.d(TAG) { "Successfully sent IPv4 DNS response to port=${task.srcPort}, length: $responseLength" }
+                    } catch (e: Exception) {
+                        AppLog.e(TAG) { "Failed to send DNS response: ${e.message}" }
+                    }
+                }
+            }
+        }
     }
 
     private fun parseDnsQuery(data: ByteArray): DnsQuestion? {
