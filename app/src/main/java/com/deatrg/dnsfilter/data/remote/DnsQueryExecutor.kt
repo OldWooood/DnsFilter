@@ -3,6 +3,9 @@ package com.deatrg.dnsfilter.data.remote
 import com.deatrg.dnsfilter.AppLog
 import com.deatrg.dnsfilter.domain.model.DnsServer
 import com.deatrg.dnsfilter.domain.model.DnsServerType
+import com.deatrg.dnsfilter.data.remote.DnsQuestion
+import com.deatrg.dnsfilter.data.remote.readDnsName
+import com.deatrg.dnsfilter.data.remote.parseDnsQuestion
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -10,6 +13,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -35,11 +39,9 @@ class DnsQueryExecutor(
     companion object {
         private const val TAG = "DnsQueryExecutor"
         private const val DNS_CACHE_SIZE = 16384
-        private const val DNS_CACHE_TTL_MS = 10 * 60 * 1000L // 10 minutes
+        private const val DNS_CACHE_TTL_MS = 60 * 60 * 1000L // 1 hour
         private const val DEFAULT_SERVER_RTT_MS = 180L
         private const val FAILURE_PENALTY_MS = 300L
-        private const val HEDGE_MIN_DELAY_MS = 80L
-        private const val HEDGE_MAX_DELAY_MS = 220L
         private val DNS_MESSAGE_MEDIA_TYPE = "application/dns-message".toMediaType()
     }
 
@@ -57,12 +59,6 @@ class DnsQueryExecutor(
     private data class CachedDnsResponse(
         val response: ByteArray,
         val timestamp: Long
-    )
-
-    private data class DnsQuestion(
-        val domain: String,
-        val qtype: Int,
-        val qclass: Int
     )
 
     private data class ServerStats(
@@ -84,6 +80,16 @@ class DnsQueryExecutor(
     // 用 ConcurrentHashMap 替代 LinkedHashMap + synchronized，读操作完全无锁
     private val dnsCache = ConcurrentHashMap<String, CachedDnsResponse>()
 
+    init {
+        scope.launch {
+            while (true) {
+                delay(600_000L)
+                val now = System.currentTimeMillis()
+                dnsCache.entries.removeIf { now - it.value.timestamp > DNS_CACHE_TTL_MS }
+            }
+        }
+    }
+
     private fun getCacheKey(domain: String, qtype: Int, qclass: Int): String = "$domain:$qtype:$qclass"
 
     fun queryCache(
@@ -93,6 +99,20 @@ class DnsQueryExecutor(
         query: ByteArray
     ): ByteArray? {
         return getFromCache(domain, qtype, qclass, query)
+    }
+
+    fun getCachedResponseRaw(
+        domain: String,
+        qtype: Int,
+        qclass: Int
+    ): ByteArray? {
+        val key = getCacheKey(domain, qtype, qclass)
+        val cached = dnsCache[key] ?: return null
+        if (System.currentTimeMillis() - cached.timestamp < DNS_CACHE_TTL_MS) {
+            return cached.response
+        }
+        dnsCache.remove(key)
+        return null
     }
 
     private fun getFromCache(
@@ -156,13 +176,8 @@ class DnsQueryExecutor(
         }
 
         coroutineScope {
-            val rankedServers = rankServers(activeServers)
-            val hedgeDelayMs = calculateHedgeDelayMs(rankedServers.firstOrNull())
-            val deferreds = rankedServers.mapIndexed { index, server ->
+            val deferreds = activeServers.map { server ->
                 async {
-                    if (index > 0) {
-                        delay(hedgeDelayMs * index)
-                    }
                     val startTime = System.currentTimeMillis()
                     val result = queryServer(query, server, timeoutMs)
                     ServerQueryOutcome(server, result, System.currentTimeMillis() - startTime)
@@ -389,23 +404,6 @@ class DnsQueryExecutor(
         }
     }
 
-    private fun rankServers(servers: List<DnsServer>): List<DnsServer> {
-        return servers.sortedBy { server ->
-            val stats = serverStats[server.address]
-            if (stats == null) {
-                DEFAULT_SERVER_RTT_MS.toDouble()
-            } else {
-                stats.ewmaRttMs + stats.consecutiveFailures * FAILURE_PENALTY_MS
-            }
-        }
-    }
-
-    private fun calculateHedgeDelayMs(firstServer: DnsServer?): Long {
-        if (firstServer == null) return HEDGE_MIN_DELAY_MS
-        val base = serverStats[firstServer.address]?.ewmaRttMs?.toLong() ?: DEFAULT_SERVER_RTT_MS
-        return (base * 3 / 4).coerceIn(HEDGE_MIN_DELAY_MS, HEDGE_MAX_DELAY_MS)
-    }
-
     private fun recordServerResult(server: DnsServer, elapsedMs: Long, success: Boolean) {
         val stats = serverStats.getOrPut(server.address) { ServerStats() }
         synchronized(stats) {
@@ -462,62 +460,6 @@ class DnsQueryExecutor(
             patched[2] = ((patched[2].toInt() and 0xFE) or (query[2].toInt() and 0x01)).toByte()
         }
         return patched
-    }
-
-    private fun parseDnsQuestion(data: ByteArray): DnsQuestion? {
-        if (data.size < 12) return null
-
-        val questionCount = ((data[4].toInt() and 0xFF) shl 8) or (data[5].toInt() and 0xFF)
-        if (questionCount < 1) return null
-
-        val nameResult = readDnsName(data, 12, data.size) ?: return null
-        val domain = nameResult.first
-        val offset = nameResult.second
-        if (offset + 4 > data.size) return null
-
-        val qtype = ((data[offset].toInt() and 0xFF) shl 8) or (data[offset + 1].toInt() and 0xFF)
-        val qclass = ((data[offset + 2].toInt() and 0xFF) shl 8) or (data[offset + 3].toInt() and 0xFF)
-        return DnsQuestion(domain, qtype, qclass)
-    }
-
-    private fun readDnsName(data: ByteArray, offset: Int, length: Int): Pair<String, Int>? {
-        val parts = mutableListOf<String>()
-        var idx = offset
-        var jumped = false
-        var nextOffset = offset
-        var jumps = 0
-
-        while (idx < length) {
-            val len = data[idx].toInt() and 0xFF
-            if (len == 0) {
-                if (!jumped) {
-                    nextOffset = idx + 1
-                }
-                break
-            }
-            if ((len and 0xC0) == 0xC0) {
-                if (idx + 1 >= length) return null
-                val pointer = ((len and 0x3F) shl 8) or (data[idx + 1].toInt() and 0xFF)
-                if (!jumped) {
-                    nextOffset = idx + 2
-                }
-                idx = pointer
-                jumped = true
-                jumps++
-                if (jumps > 8) return null
-                continue
-            }
-            idx++
-            if (idx + len > length) return null
-            parts.add(String(data, idx, len))
-            idx += len
-            if (!jumped) {
-                nextOffset = idx
-            }
-        }
-
-        if (parts.isEmpty()) return null
-        return Pair(parts.joinToString("."), nextOffset)
     }
 
     fun shutdown() {

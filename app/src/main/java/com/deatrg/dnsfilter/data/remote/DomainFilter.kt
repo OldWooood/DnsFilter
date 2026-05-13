@@ -355,28 +355,17 @@ class DomainFilter(
 
         val result = checkBlocked(state.snapshot, normalizedDomain)
 
-        // 写缓存（ConcurrentHashMap 内部保证线程安全）
         state.cache[normalizedDomain] = result.isBlocked
 
         return result
     }
 
     private fun checkBlocked(snapshot: BlocklistSnapshot, domain: String): BlockResult {
-        // O(1) lookup in HashSet
-        if (snapshot.blockedDomains.contains(domain)) {
-            return BlockResult(true, "blocked_domain")
+        return if (snapshot.blockedDomains.contains(domain)) {
+            BlockResult(true, "blocked_domain")
+        } else {
+            BlockResult(false, null)
         }
-
-        // Check parent domains (e.g., ad.example.com -> example.com -> .com)
-        var checkDomain = domain
-        while (checkDomain.contains(".")) {
-            if (snapshot.blockedDomains.contains(checkDomain)) {
-                return BlockResult(true, "blocked_parent_domain")
-            }
-            checkDomain = checkDomain.substringAfter(".")
-        }
-
-        return BlockResult(false, null)
     }
 
     private fun publishSnapshot(snapshot: BlocklistSnapshot) {
