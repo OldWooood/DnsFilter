@@ -410,14 +410,16 @@ class DnsVpnService : VpnService() {
         }
 
         val ipv6HeaderLength = 40
-        val dnsStart = ipv6HeaderLength
-        val dnsLength = length - dnsStart
-        if (dnsLength < 8) return true
+        val udpStart = ipv6HeaderLength
+        if (length < udpStart + 8) return true
 
-        val srcPort = ((packet[dnsStart].toInt() and 0xFF) shl 8) or (packet[dnsStart + 1].toInt() and 0xFF)
-        val dstPort = ((packet[dnsStart + 2].toInt() and 0xFF) shl 8) or (packet[dnsStart + 3].toInt() and 0xFF)
+        val srcPort = ((packet[udpStart].toInt() and 0xFF) shl 8) or (packet[udpStart + 1].toInt() and 0xFF)
+        val dstPort = ((packet[udpStart + 2].toInt() and 0xFF) shl 8) or (packet[udpStart + 3].toInt() and 0xFF)
         if (dstPort != DNS_PORT) return true
 
+        val dnsStart = udpStart + 8
+        val dnsLength = length - dnsStart
+        if (dnsLength == 0) return true
         val question = parseDnsQueryFromPacket(packet, dnsStart, length) ?: return true
 
         // 1. 检查拦截
