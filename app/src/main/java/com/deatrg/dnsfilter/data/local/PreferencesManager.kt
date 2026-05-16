@@ -262,7 +262,7 @@ class PreferencesManager(private val context: Context) {
             name = "Tencent DNS 2",
             address = "119.28.28.28",
             type = DnsServerType.PLAIN,
-            isEnabled = true
+            isEnabled = false
         ),
         // AliDNS (Primary)
         DnsServer(
@@ -278,7 +278,7 @@ class PreferencesManager(private val context: Context) {
             name = "AliDNS 2",
             address = "223.6.6.6",
             type = DnsServerType.PLAIN,
-            isEnabled = true
+            isEnabled = false
         ),
         // DNSPod DoH
         DnsServer(
@@ -293,8 +293,8 @@ class PreferencesManager(private val context: Context) {
     private fun getDefaultFilterLists(): List<FilterList> = listOf(
         FilterList(
             id = "1",
-            name = "anti-ad",
-            url = "https://anti-ad.net/domains.txt",
+            name = "NeoDevHost",
+            url = "https://neodev.team/domain",
             isEnabled = true,
             isBuiltIn = true
         )
