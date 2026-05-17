@@ -39,19 +39,3 @@
 -keepclassmembernames class kotlinx.** {
     volatile <fields>;
 }
-
-# WorkManager — keep internal database and worker classes
--keep class androidx.work.impl.WorkDatabase_Impl { *; }
--keep class androidx.work.impl.model.** { *; }
--keep class * extends androidx.work.impl.Worker { *; }
--keep class * extends androidx.work.Worker {
-    public <init>(android.content.Context, androidx.work.WorkerParameters);
-}
--keep class * extends androidx.work.ListenableWorker {
-    public <init>(android.content.Context, androidx.work.WorkerParameters);
-}
--keep class androidx.work.impl.WorkerWrapper { *; }
--keep class androidx.work.impl.background.systemjob.SystemJobService { *; }
--keep class androidx.work.impl.background.systemalarm.SystemAlarmService { *; }
--dontwarn androidx.work.**
--dontwarn com.google.common.util.concurrent.ListenableFuture
