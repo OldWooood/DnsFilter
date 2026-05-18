@@ -12,6 +12,7 @@ import java.io.BufferedReader
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 class DomainFilter(
     private val context: Context,
@@ -57,6 +58,11 @@ class DomainFilter(
     // 下载进度：已下载数量 / 总数
     private val _downloadProgress = MutableStateFlow<Pair<Int, Int>?>(null)
     val downloadProgress: StateFlow<Pair<Int, Int>?> = _downloadProgress.asStateFlow()
+
+    private val _cacheVersion = MutableStateFlow(0L)
+    val cacheVersion: StateFlow<Long> = _cacheVersion.asStateFlow()
+
+    private val cacheVersionCounter = AtomicLong(0L)
 
     private var filterListsToLoad: List<FilterList> = emptyList()
 
@@ -146,6 +152,7 @@ class DomainFilter(
             
             // 保存到缓存
             cacheManager.saveBlocklist(filterList, domains)
+            notifyCacheChanged()
             
             AppLog.d(TAG, "Downloaded ${domains.size} domains for ${filterList.name}")
             domains
@@ -382,6 +389,12 @@ class DomainFilter(
         return cacheManager.getLastUpdated(filterList.url)
     }
 
+    fun hasFilterListUpdatesDue(): Boolean {
+        return filterListsToLoad.any { filterList ->
+            !cacheManager.hasCache(filterList) || cacheManager.needsUpdate(filterList)
+        }
+    }
+
     fun shutdown() {
         scope.cancel()
     }
@@ -392,6 +405,10 @@ class DomainFilter(
             cacheManager.loadBlocklist(filterList)?.let { loaded[filterList] = it }
         }
         return loaded
+    }
+
+    private fun notifyCacheChanged() {
+        _cacheVersion.value = cacheVersionCounter.incrementAndGet()
     }
 }
 

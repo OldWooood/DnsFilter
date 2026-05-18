@@ -17,6 +17,7 @@ interface FilterListRepository {
     val filterLists: Flow<List<FilterList>>
     val filterListCount: Flow<Int>
     val isLoaded: Flow<Boolean>
+    val cacheVersion: Flow<Long>
     val enabledDnsServerCount: Flow<Int>
     suspend fun saveFilterLists(lists: List<FilterList>)
     suspend fun addFilterList(list: FilterList)
@@ -24,5 +25,6 @@ interface FilterListRepository {
     suspend fun deleteFilterList(listId: String)
     suspend fun loadFilterLists()
     suspend fun refreshLists()
+    suspend fun hasUpdatesDue(): Boolean
     fun getFilterLastUpdated(filterList: FilterList): Long?
 }

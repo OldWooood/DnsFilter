@@ -27,8 +27,7 @@ class BlocklistUpdateAlarmScheduler(
         alarmManager.cancel(pendingIntent)
 
         val triggerMillis = calculateNextNoon()
-        val alarmInfo = AlarmManager.AlarmClockInfo(triggerMillis, null)
-        alarmManager.setAlarmClock(alarmInfo, pendingIntent)
+        scheduleAlarm(alarmManager, triggerMillis, pendingIntent)
 
         AppLog.d(
             TAG,
@@ -46,9 +45,7 @@ class BlocklistUpdateAlarmScheduler(
 
     fun triggerImmediateUpdate() {
         val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        val intent = Intent(ACTION_UPDATE_BLOCKLIST).apply {
-            `package` = context.packageName
-        }
+        val intent = createUpdateIntent()
         val pendingIntent = PendingIntent.getBroadcast(
             context,
             REQUEST_CODE_IMMEDIATE,
@@ -56,24 +53,37 @@ class BlocklistUpdateAlarmScheduler(
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        alarmManager.setExact(
-            AlarmManager.RTC_WAKEUP,
-            System.currentTimeMillis() + 1000,
-            pendingIntent
-        )
+        scheduleAlarm(alarmManager, System.currentTimeMillis() + 1000, pendingIntent)
         AppLog.d(TAG, "Triggered immediate blocklist update")
     }
 
     private fun createDailyPendingIntent(): PendingIntent {
-        val intent = Intent(ACTION_UPDATE_BLOCKLIST).apply {
-            `package` = context.packageName
-        }
         return PendingIntent.getBroadcast(
             context,
             REQUEST_CODE_DAILY,
-            intent,
+            createUpdateIntent(),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+    }
+
+    private fun createUpdateIntent(): Intent {
+        return Intent(context, BlocklistUpdateAlarmReceiver::class.java).apply {
+            action = ACTION_UPDATE_BLOCKLIST
+        }
+    }
+
+    private fun scheduleAlarm(
+        alarmManager: AlarmManager,
+        triggerMillis: Long,
+        pendingIntent: PendingIntent
+    ) {
+        try {
+            val alarmInfo = AlarmManager.AlarmClockInfo(triggerMillis, null)
+            alarmManager.setAlarmClock(alarmInfo, pendingIntent)
+        } catch (e: Exception) {
+            AppLog.e(TAG, "Failed to schedule alarm clock, falling back to inexact alarm", e)
+            alarmManager.set(AlarmManager.RTC_WAKEUP, triggerMillis, pendingIntent)
+        }
     }
 
     private fun calculateNextNoon(): Long {
