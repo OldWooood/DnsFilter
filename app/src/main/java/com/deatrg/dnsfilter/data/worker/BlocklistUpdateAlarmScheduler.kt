@@ -26,7 +26,7 @@ class BlocklistUpdateAlarmScheduler(
 
         alarmManager.cancel(pendingIntent)
 
-        val triggerMillis = calculateNextNoon()
+        val triggerMillis = calculateNextDailyTime()
         scheduleAlarm(alarmManager, triggerMillis, pendingIntent)
 
         AppLog.d(
@@ -86,10 +86,10 @@ class BlocklistUpdateAlarmScheduler(
         }
     }
 
-    private fun calculateNextNoon(): Long {
+    private fun calculateNextDailyTime(): Long {
         val calendar = Calendar.getInstance().apply {
-            set(Calendar.HOUR_OF_DAY, 12)
-            set(Calendar.MINUTE, 0)
+            set(Calendar.HOUR_OF_DAY, 23)
+            set(Calendar.MINUTE, 30)
             set(Calendar.SECOND, 0)
             set(Calendar.MILLISECOND, 0)
         }
