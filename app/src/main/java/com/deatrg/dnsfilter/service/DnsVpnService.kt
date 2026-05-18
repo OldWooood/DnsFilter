@@ -38,6 +38,7 @@ class DnsVpnService : VpnService() {
         const val MTU = 1500
         const val DNS_PORT = 53
         private const val PACKET_QUEUE_CAPACITY = 256
+        private const val SLOW_WORKER_COUNT = 8
         // 虚拟DNS服务器地址（应该与VPN接口地址不同）
         const val VPN_DNS_V4 = "10.10.10.10"
         const val VPN_DNS_V6 = "fd00::10"
@@ -65,7 +66,7 @@ class DnsVpnService : VpnService() {
     private val fastWorkerCount = (Runtime.getRuntime().availableProcessors() * 2).coerceIn(4, 16)
 
     // Slow path: 上游 DNS 查询 —— 主要是 IO 等待，不需要太多 Worker
-    private val slowWorkerCount = 4
+    private val slowWorkerCount = SLOW_WORKER_COUNT
 
     // 协程友好的输出锁，synchronized 会让线程 BLOCKED 而占用 dispatcher 槽位
     private val outputMutex = kotlinx.coroutines.sync.Mutex()
@@ -337,8 +338,7 @@ class DnsVpnService : VpnService() {
         if (blockResult?.isBlocked == true) {
             AppLog.d(TAG) { "Domain ${question.domain} is blocked: ${blockResult.reason}" }
             statisticsBuffer?.recordQuery(blocked = true, responseTime = 0, includeInAvg = false)
-            val queryBytes = packet.copyOfRange(dnsStart, length)
-            val response = buildBlockedDnsResponse(queryBytes)
+            val response = buildBlockedDnsResponse(packet, dnsStart, length)
             if (dnsStart + response.size <= packet.size) {
                 response.copyInto(packet, destinationOffset = dnsStart)
                 patchIPv4Response(packet, ihl, srcPort, response.size)
@@ -427,8 +427,7 @@ class DnsVpnService : VpnService() {
         if (blockResult?.isBlocked == true) {
             AppLog.d(TAG) { "Domain ${question.domain} is blocked: ${blockResult.reason}" }
             statisticsBuffer?.recordQuery(blocked = true, responseTime = 0, includeInAvg = false)
-            val queryBytes = packet.copyOfRange(dnsStart, length)
-            val response = buildBlockedDnsResponse(queryBytes)
+            val response = buildBlockedDnsResponse(packet, dnsStart, length)
             if (dnsStart + response.size <= packet.size) {
                 response.copyInto(packet, destinationOffset = dnsStart)
                 patchIPv6Response(packet, srcPort, response.size)
@@ -482,16 +481,6 @@ class DnsVpnService : VpnService() {
             upstreamQueue.send(task)
         }
         return false
-    }
-
-    private fun formatIPv6(packet: ByteArray, offset: Int): String {
-        val sb = StringBuilder()
-        for (i in 0 until 16 step 2) {
-            if (i > 0) sb.append(":")
-            val word = ((packet[offset + i].toInt() and 0xFF) shl 8) or (packet[offset + i + 1].toInt() and 0xFF)
-            sb.append(String.format("%x", word))
-        }
-        return sb.toString()
     }
 
     private suspend fun processUpstreamTask(
@@ -559,16 +548,16 @@ class DnsVpnService : VpnService() {
         }
     }
 
-    private fun buildBlockedDnsResponse(query: ByteArray): ByteArray {
+    private fun buildBlockedDnsResponse(packet: ByteArray, dnsStart: Int, packetLength: Int): ByteArray {
         // Build DNS response with NXDOMAIN for blocked domains
         val response = ByteBuffer.allocate(512)
 
         // Transaction ID (copy from query)
-        response.put(query[0])
-        response.put(query[1])
+        response.put(packet[dnsStart])
+        response.put(packet[dnsStart + 1])
 
         // Flags: Response, NXDOMAIN (rcode = 3), preserve RD
-        val rdBit = (query[2].toInt() and 0x01)
+        val rdBit = (packet[dnsStart + 2].toInt() and 0x01)
         response.put((0x80 or rdBit).toByte())
         response.put((0x80 or 0x03).toByte())
 
@@ -589,29 +578,29 @@ class DnsVpnService : VpnService() {
         response.put(0x00.toByte())
 
         // Copy question section from query
-        var offset = 12
-        while (offset < query.size) {
-            val len = query[offset].toInt() and 0xFF
-            response.put(query[offset])
+        var offset = dnsStart + 12
+        while (offset < packetLength) {
+            val len = packet[offset].toInt() and 0xFF
+            response.put(packet[offset])
             if (len == 0) {
                 offset++
                 break
             }
             if ((len and 0xC0) == 0xC0) {
-                response.put(query[offset + 1])
+                response.put(packet[offset + 1])
                 offset += 2
                 break
             }
             for (i in 0 until len) {
-                response.put(query[offset + 1 + i])
+                response.put(packet[offset + 1 + i])
             }
             offset += 1 + len
         }
 
         // Copy QTYPE and QCLASS (4 bytes)
-        if (offset + 4 <= query.size) {
+        if (offset + 4 <= packetLength) {
             for (i in 0 until 4) {
-                response.put(query[offset + i])
+                response.put(packet[offset + i])
             }
         }
 

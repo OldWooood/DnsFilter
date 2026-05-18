@@ -3,8 +3,6 @@ package com.deatrg.dnsfilter.data.remote
 import com.deatrg.dnsfilter.AppLog
 import com.deatrg.dnsfilter.domain.model.DnsServer
 import com.deatrg.dnsfilter.domain.model.DnsServerType
-import com.deatrg.dnsfilter.data.remote.DnsQuestion
-import com.deatrg.dnsfilter.data.remote.readDnsName
 import com.deatrg.dnsfilter.data.remote.parseDnsQuestion
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -40,6 +38,7 @@ class DnsQueryExecutor(
         private const val TAG = "DnsQueryExecutor"
         private const val DNS_CACHE_SIZE = 16384
         private const val DNS_CACHE_TTL_MS = 60 * 60 * 1000L // 1 hour
+        private const val DNS_RESPONSE_BUFFER_SIZE = 2048
         private const val DEFAULT_SERVER_RTT_MS = 180L
         private const val FAILURE_PENALTY_MS = 300L
         private val DNS_MESSAGE_MEDIA_TYPE = "application/dns-message".toMediaType()
@@ -50,6 +49,7 @@ class DnsQueryExecutor(
     // 每个服务器复用一个 UDP socket，减少重复创建和 VPN protect 开销
     private class ReusableUdpSocket(
         val socket: DatagramSocket,
+        val responseBuffer: ByteArray = ByteArray(DNS_RESPONSE_BUFFER_SIZE),
         val lock: Mutex = Mutex()
     ) {
         @Volatile
@@ -179,7 +179,7 @@ class DnsQueryExecutor(
             val deferreds = activeServers.map { server ->
                 async {
                     val startTime = System.currentTimeMillis()
-                    val result = queryServer(query, server, timeoutMs)
+                    val result = queryServer(query, server, timeoutMs, domain, qtype, qclass)
                     ServerQueryOutcome(server, result, System.currentTimeMillis() - startTime)
                 }
             }.toMutableList()
@@ -226,17 +226,23 @@ class DnsQueryExecutor(
     private suspend fun queryServer(
         request: ByteArray,
         server: DnsServer,
-        timeoutMs: Long
+        timeoutMs: Long,
+        expectedDomain: String,
+        expectedQtype: Int,
+        expectedQclass: Int
     ): DnsQueryResult = when (server.type) {
-        DnsServerType.PLAIN -> queryPlainDns(request, server.address, timeoutMs)
-        DnsServerType.DOH -> queryDoH(request, server.address, timeoutMs)
+        DnsServerType.PLAIN -> queryPlainDns(request, server.address, timeoutMs, expectedDomain, expectedQtype, expectedQclass)
+        DnsServerType.DOH -> queryDoH(request, server.address, timeoutMs, expectedDomain, expectedQtype, expectedQclass)
         DnsServerType.DOT -> queryDoT(server.address, timeoutMs)
     }
 
     private suspend fun queryPlainDns(
         request: ByteArray,
         serverAddress: String,
-        timeoutMs: Long
+        timeoutMs: Long,
+        expectedDomain: String,
+        expectedQtype: Int,
+        expectedQclass: Int
     ): DnsQueryResult {
         val expectedAddress = getServerAddress(serverAddress)
         val wrapper = udpSockets.getOrPut(serverAddress) {
@@ -249,7 +255,7 @@ class DnsQueryExecutor(
         return wrapper.lock.withLock {
             if (!wrapper.isValid) {
                 udpSockets.remove(serverAddress, wrapper)
-                return@withLock queryPlainDnsFresh(request, expectedAddress, timeoutMs)
+                return@withLock queryPlainDnsFresh(request, expectedAddress, timeoutMs, expectedDomain, expectedQtype, expectedQclass)
             }
 
             try {
@@ -258,8 +264,7 @@ class DnsQueryExecutor(
                 val requestPacket = DatagramPacket(request, request.size)
                 wrapper.socket.send(requestPacket)
 
-                val responseBuffer = ByteArray(2048)
-                val responsePacket = DatagramPacket(responseBuffer, responseBuffer.size)
+                val responsePacket = DatagramPacket(wrapper.responseBuffer, wrapper.responseBuffer.size)
                 wrapper.socket.receive(responsePacket)
 
                 if (!isExpectedResponseSource(responsePacket, expectedAddress)) {
@@ -273,7 +278,7 @@ class DnsQueryExecutor(
                 }
 
                 val responseBytes = responsePacket.data.copyOfRange(0, responsePacket.length)
-                if (!isValidDnsResponse(request, responseBytes)) {
+                if (!isValidDnsResponse(request, responseBytes, expectedDomain, expectedQtype, expectedQclass)) {
                     wrapper.isValid = false
                     try {
                         wrapper.socket.close()
@@ -312,7 +317,10 @@ class DnsQueryExecutor(
     private fun queryPlainDnsFresh(
         request: ByteArray,
         expectedAddress: InetAddress,
-        timeoutMs: Long
+        timeoutMs: Long,
+        expectedDomain: String,
+        expectedQtype: Int,
+        expectedQclass: Int
     ): DnsQueryResult {
         var socket: DatagramSocket? = null
         try {
@@ -333,7 +341,7 @@ class DnsQueryExecutor(
             }
 
             val responseBytes = responsePacket.data.copyOfRange(0, responsePacket.length)
-            return if (isValidDnsResponse(request, responseBytes)) {
+            return if (isValidDnsResponse(request, responseBytes, expectedDomain, expectedQtype, expectedQclass)) {
                 DnsQueryResult(true, responseBytes, 0, null)
             } else {
                 DnsQueryResult(false, null, 0, "Mismatched DNS response")
@@ -350,7 +358,10 @@ class DnsQueryExecutor(
     private suspend fun queryDoH(
         request: ByteArray,
         url: String,
-        timeoutMs: Long = 3000
+        timeoutMs: Long = 3000,
+        expectedDomain: String,
+        expectedQtype: Int,
+        expectedQclass: Int
     ): DnsQueryResult = withContext(Dispatchers.IO) {
         val httpRequest = Request.Builder()
             .url(url)
@@ -370,7 +381,7 @@ class DnsQueryExecutor(
                 val body = response.body?.bytes()
                     ?: return@withContext DnsQueryResult(false, null, 0, "Empty response")
 
-                if (!isValidDnsResponse(request, body)) {
+                if (!isValidDnsResponse(request, body, expectedDomain, expectedQtype, expectedQclass)) {
                     return@withContext DnsQueryResult(false, null, 0, "Mismatched DoH response")
                 }
 
@@ -427,7 +438,10 @@ class DnsQueryExecutor(
 
     private fun isValidDnsResponse(
         request: ByteArray,
-        response: ByteArray
+        response: ByteArray,
+        expectedDomain: String,
+        expectedQtype: Int,
+        expectedQclass: Int
     ): Boolean {
         if (request.size < 12 || response.size < 12) return false
 
@@ -439,12 +453,11 @@ class DnsQueryExecutor(
         val qrBit = (responseFlags shr 15) and 1
         if (qrBit != 1) return false
 
-        val requestQuestion = parseDnsQuestion(request) ?: return false
         val responseQuestion = parseDnsQuestion(response) ?: return false
 
-        return requestQuestion.domain.equals(responseQuestion.domain, ignoreCase = true) &&
-            requestQuestion.qtype == responseQuestion.qtype &&
-            requestQuestion.qclass == responseQuestion.qclass
+        return expectedDomain.equals(responseQuestion.domain, ignoreCase = true) &&
+            expectedQtype == responseQuestion.qtype &&
+            expectedQclass == responseQuestion.qclass
     }
 
     private fun patchResponseForClient(
