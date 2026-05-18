@@ -13,8 +13,6 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -25,7 +23,7 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.SocketTimeoutException
-import java.util.LinkedHashMap
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
@@ -39,6 +37,7 @@ class DnsQueryExecutor(
         private const val DNS_CACHE_SIZE = 16384
         private const val DNS_CACHE_TTL_MS = 60 * 60 * 1000L // 1 hour
         private const val DNS_RESPONSE_BUFFER_SIZE = 2048
+        private const val UDP_SOCKET_POOL_SIZE = 4
         private const val DEFAULT_SERVER_RTT_MS = 180L
         private const val FAILURE_PENALTY_MS = 300L
         private val DNS_MESSAGE_MEDIA_TYPE = "application/dns-message".toMediaType()
@@ -46,14 +45,17 @@ class DnsQueryExecutor(
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    // 每个服务器复用一个 UDP socket，减少重复创建和 VPN protect 开销
+    // 每个服务器复用多个 UDP socket，减少重复创建/protect 开销，同时允许冷查询并发。
     private class ReusableUdpSocket(
         val socket: DatagramSocket,
-        val responseBuffer: ByteArray = ByteArray(DNS_RESPONSE_BUFFER_SIZE),
-        val lock: Mutex = Mutex()
+        val responseBuffer: ByteArray = ByteArray(DNS_RESPONSE_BUFFER_SIZE)
     ) {
         @Volatile
         var isValid = true
+    }
+
+    private class UdpSocketPool {
+        val sockets = ArrayBlockingQueue<ReusableUdpSocket>(UDP_SOCKET_POOL_SIZE)
     }
 
     private data class CachedDnsResponse(
@@ -72,7 +74,7 @@ class DnsQueryExecutor(
         val elapsedMs: Long
     )
 
-    private val udpSockets = ConcurrentHashMap<String, ReusableUdpSocket>()
+    private val udpSocketPools = ConcurrentHashMap<String, UdpSocketPool>()
     private val serverAddressCache = ConcurrentHashMap<String, InetAddress>()
     private val serverStats = ConcurrentHashMap<String, ServerStats>()
 
@@ -98,7 +100,7 @@ class DnsQueryExecutor(
         qclass: Int,
         query: ByteArray
     ): ByteArray? {
-        return getFromCache(domain, qtype, qclass, query)
+        return getFromCache(domain, qtype, qclass, query, 0)
     }
 
     fun getCachedResponseRaw(
@@ -119,13 +121,14 @@ class DnsQueryExecutor(
         domain: String,
         qtype: Int,
         qclass: Int,
-        query: ByteArray
+        query: ByteArray,
+        queryOffset: Int
     ): ByteArray? {
         val key = getCacheKey(domain, qtype, qclass)
         val cached = dnsCache[key]
         if (cached != null) {
             if (System.currentTimeMillis() - cached.timestamp < DNS_CACHE_TTL_MS) {
-                return patchResponseForClient(cached.response, query)
+                return patchResponseForClient(cached.response, query, queryOffset)
             }
             dnsCache.remove(key)
         }
@@ -153,8 +156,30 @@ class DnsQueryExecutor(
         qtype: Int = 1,
         qclass: Int = 1,
         timeoutMs: Long = 3000
+    ): DnsQueryResult {
+        return query(
+            domain = domain,
+            servers = servers,
+            query = query,
+            queryOffset = 0,
+            queryLength = query.size,
+            qtype = qtype,
+            qclass = qclass,
+            timeoutMs = timeoutMs
+        )
+    }
+
+    suspend fun query(
+        domain: String,
+        servers: List<DnsServer>,
+        query: ByteArray,
+        queryOffset: Int,
+        queryLength: Int,
+        qtype: Int = 1,
+        qclass: Int = 1,
+        timeoutMs: Long = 3000
     ): DnsQueryResult = withContext(Dispatchers.IO) {
-        getFromCache(domain, qtype, qclass, query)?.let { cachedResponse ->
+        getFromCache(domain, qtype, qclass, query, queryOffset)?.let { cachedResponse ->
             AppLog.d(TAG) { "DNS cache hit: domain=$domain qtype=$qtype" }
             return@withContext DnsQueryResult(
                 success = true,
@@ -179,7 +204,7 @@ class DnsQueryExecutor(
             val deferreds = activeServers.map { server ->
                 async {
                     val startTime = System.currentTimeMillis()
-                    val result = queryServer(query, server, timeoutMs, domain, qtype, qclass)
+                    val result = queryServer(query, queryOffset, queryLength, server, timeoutMs, domain, qtype, qclass)
                     ServerQueryOutcome(server, result, System.currentTimeMillis() - startTime)
                 }
             }.toMutableList()
@@ -225,19 +250,23 @@ class DnsQueryExecutor(
 
     private suspend fun queryServer(
         request: ByteArray,
+        requestOffset: Int,
+        requestLength: Int,
         server: DnsServer,
         timeoutMs: Long,
         expectedDomain: String,
         expectedQtype: Int,
         expectedQclass: Int
     ): DnsQueryResult = when (server.type) {
-        DnsServerType.PLAIN -> queryPlainDns(request, server.address, timeoutMs, expectedDomain, expectedQtype, expectedQclass)
-        DnsServerType.DOH -> queryDoH(request, server.address, timeoutMs, expectedDomain, expectedQtype, expectedQclass)
+        DnsServerType.PLAIN -> queryPlainDns(request, requestOffset, requestLength, server.address, timeoutMs, expectedDomain, expectedQtype, expectedQclass)
+        DnsServerType.DOH -> queryDoH(request, requestOffset, requestLength, server.address, timeoutMs, expectedDomain, expectedQtype, expectedQclass)
         DnsServerType.DOT -> queryDoT(server.address, timeoutMs)
     }
 
     private suspend fun queryPlainDns(
         request: ByteArray,
+        requestOffset: Int,
+        requestLength: Int,
         serverAddress: String,
         timeoutMs: Long,
         expectedDomain: String,
@@ -245,118 +274,53 @@ class DnsQueryExecutor(
         expectedQclass: Int
     ): DnsQueryResult {
         val expectedAddress = getServerAddress(serverAddress)
-        val wrapper = udpSockets.getOrPut(serverAddress) {
-            val socket = DatagramSocket()
-            socketProtector?.invoke(socket)
-            socket.connect(expectedAddress, 53)
-            ReusableUdpSocket(socket)
-        }
+        val wrapper = acquireUdpSocket(serverAddress, expectedAddress)
 
-        return wrapper.lock.withLock {
-            if (!wrapper.isValid) {
-                udpSockets.remove(serverAddress, wrapper)
-                return@withLock queryPlainDnsFresh(request, expectedAddress, timeoutMs, expectedDomain, expectedQtype, expectedQclass)
-            }
+        return try {
+            wrapper.socket.soTimeout = timeoutMs.toInt()
 
-            try {
-                wrapper.socket.soTimeout = timeoutMs.toInt()
+            val requestPacket = DatagramPacket(request, requestOffset, requestLength)
+            wrapper.socket.send(requestPacket)
 
-                val requestPacket = DatagramPacket(request, request.size)
-                wrapper.socket.send(requestPacket)
-
-                val responsePacket = DatagramPacket(wrapper.responseBuffer, wrapper.responseBuffer.size)
-                wrapper.socket.receive(responsePacket)
-
-                if (!isExpectedResponseSource(responsePacket, expectedAddress)) {
-                    wrapper.isValid = false
-                    try {
-                        wrapper.socket.close()
-                    } catch (_: Exception) {
-                    }
-                    udpSockets.remove(serverAddress, wrapper)
-                    return@withLock DnsQueryResult(false, null, 0, "Unexpected DNS response source")
-                }
-
-                val responseBytes = responsePacket.data.copyOfRange(0, responsePacket.length)
-                if (!isValidDnsResponse(request, responseBytes, expectedDomain, expectedQtype, expectedQclass)) {
-                    wrapper.isValid = false
-                    try {
-                        wrapper.socket.close()
-                    } catch (_: Exception) {
-                    }
-                    udpSockets.remove(serverAddress, wrapper)
-                    return@withLock DnsQueryResult(false, null, 0, "Mismatched DNS response")
-                }
-
-                DnsQueryResult(
-                    success = true,
-                    responseBytes = responseBytes,
-                    responseTime = 0,
-                    error = null
-                )
-            } catch (e: SocketTimeoutException) {
-                wrapper.isValid = false
-                try {
-                    wrapper.socket.close()
-                } catch (_: Exception) {
-                }
-                udpSockets.remove(serverAddress, wrapper)
-                DnsQueryResult(false, null, 0, "Timeout")
-            } catch (e: Exception) {
-                wrapper.isValid = false
-                try {
-                    wrapper.socket.close()
-                } catch (_: Exception) {
-                }
-                udpSockets.remove(serverAddress, wrapper)
-                DnsQueryResult(false, null, 0, e.message)
-            }
-        }
-    }
-
-    private fun queryPlainDnsFresh(
-        request: ByteArray,
-        expectedAddress: InetAddress,
-        timeoutMs: Long,
-        expectedDomain: String,
-        expectedQtype: Int,
-        expectedQclass: Int
-    ): DnsQueryResult {
-        var socket: DatagramSocket? = null
-        try {
-            socket = DatagramSocket()
-            socketProtector?.invoke(socket)
-            socket.connect(expectedAddress, 53)
-            socket.soTimeout = timeoutMs.toInt()
-
-            val requestPacket = DatagramPacket(request, request.size)
-            socket.send(requestPacket)
-
-            val responseBuffer = ByteArray(2048)
-            val responsePacket = DatagramPacket(responseBuffer, responseBuffer.size)
-            socket.receive(responsePacket)
+            val responsePacket = DatagramPacket(wrapper.responseBuffer, wrapper.responseBuffer.size)
+            wrapper.socket.receive(responsePacket)
 
             if (!isExpectedResponseSource(responsePacket, expectedAddress)) {
+                wrapper.isValid = false
+                closeUdpSocket(wrapper)
                 return DnsQueryResult(false, null, 0, "Unexpected DNS response source")
             }
 
             val responseBytes = responsePacket.data.copyOfRange(0, responsePacket.length)
-            return if (isValidDnsResponse(request, responseBytes, expectedDomain, expectedQtype, expectedQclass)) {
-                DnsQueryResult(true, responseBytes, 0, null)
-            } else {
-                DnsQueryResult(false, null, 0, "Mismatched DNS response")
+            if (!isValidDnsResponse(request, requestOffset, responseBytes, expectedDomain, expectedQtype, expectedQclass)) {
+                wrapper.isValid = false
+                closeUdpSocket(wrapper)
+                return DnsQueryResult(false, null, 0, "Mismatched DNS response")
             }
+
+            DnsQueryResult(
+                success = true,
+                responseBytes = responseBytes,
+                responseTime = 0,
+                error = null
+            )
         } catch (e: SocketTimeoutException) {
-            return DnsQueryResult(false, null, 0, "Timeout")
+            wrapper.isValid = false
+            closeUdpSocket(wrapper)
+            DnsQueryResult(false, null, 0, "Timeout")
         } catch (e: Exception) {
-            return DnsQueryResult(false, null, 0, e.message)
+            wrapper.isValid = false
+            closeUdpSocket(wrapper)
+            DnsQueryResult(false, null, 0, e.message)
         } finally {
-            socket?.close()
+            releaseUdpSocket(serverAddress, wrapper)
         }
     }
 
     private suspend fun queryDoH(
         request: ByteArray,
+        requestOffset: Int,
+        requestLength: Int,
         url: String,
         timeoutMs: Long = 3000,
         expectedDomain: String,
@@ -367,7 +331,7 @@ class DnsQueryExecutor(
             .url(url)
             .addHeader("Accept", "application/dns-message")
             .addHeader("Content-Type", "application/dns-message")
-            .post(request.toRequestBody(DNS_MESSAGE_MEDIA_TYPE))
+            .post(request.toRequestBody(DNS_MESSAGE_MEDIA_TYPE, requestOffset, requestLength))
             .build()
 
         try {
@@ -381,7 +345,7 @@ class DnsQueryExecutor(
                 val body = response.body?.bytes()
                     ?: return@withContext DnsQueryResult(false, null, 0, "Empty response")
 
-                if (!isValidDnsResponse(request, body, expectedDomain, expectedQtype, expectedQclass)) {
+                if (!isValidDnsResponse(request, requestOffset, body, expectedDomain, expectedQtype, expectedQclass)) {
                     return@withContext DnsQueryResult(false, null, 0, "Mismatched DoH response")
                 }
 
@@ -438,14 +402,15 @@ class DnsQueryExecutor(
 
     private fun isValidDnsResponse(
         request: ByteArray,
+        requestOffset: Int,
         response: ByteArray,
         expectedDomain: String,
         expectedQtype: Int,
         expectedQclass: Int
     ): Boolean {
-        if (request.size < 12 || response.size < 12) return false
+        if (request.size - requestOffset < 12 || response.size < 12) return false
 
-        if (response[0] != request[0] || response[1] != request[1]) {
+        if (response[0] != request[requestOffset] || response[1] != request[requestOffset + 1]) {
             return false
         }
 
@@ -460,30 +425,57 @@ class DnsQueryExecutor(
             expectedQclass == responseQuestion.qclass
     }
 
+    private fun acquireUdpSocket(serverAddress: String, expectedAddress: InetAddress): ReusableUdpSocket {
+        val pool = udpSocketPools.getOrPut(serverAddress) { UdpSocketPool() }
+        return pool.sockets.poll() ?: createUdpSocket(expectedAddress)
+    }
+
+    private fun releaseUdpSocket(serverAddress: String, wrapper: ReusableUdpSocket) {
+        if (!wrapper.isValid) return
+
+        val pool = udpSocketPools.getOrPut(serverAddress) { UdpSocketPool() }
+        if (!pool.sockets.offer(wrapper)) {
+            closeUdpSocket(wrapper)
+        }
+    }
+
+    private fun createUdpSocket(expectedAddress: InetAddress): ReusableUdpSocket {
+        val socket = DatagramSocket()
+        socketProtector?.invoke(socket)
+        socket.connect(expectedAddress, 53)
+        return ReusableUdpSocket(socket)
+    }
+
+    private fun closeUdpSocket(wrapper: ReusableUdpSocket) {
+        try {
+            wrapper.socket.close()
+        } catch (_: Exception) {
+        }
+    }
+
     private fun patchResponseForClient(
         response: ByteArray,
-        query: ByteArray
+        query: ByteArray,
+        queryOffset: Int
     ): ByteArray {
         val patched = response.copyOf()
-        if (patched.size >= 2 && query.size >= 2) {
-            patched[0] = query[0]
-            patched[1] = query[1]
+        if (patched.size >= 2 && query.size - queryOffset >= 2) {
+            patched[0] = query[queryOffset]
+            patched[1] = query[queryOffset + 1]
         }
-        if (patched.size > 2 && query.size > 2) {
-            patched[2] = ((patched[2].toInt() and 0xFE) or (query[2].toInt() and 0x01)).toByte()
+        if (patched.size > 2 && query.size - queryOffset > 2) {
+            patched[2] = ((patched[2].toInt() and 0xFE) or (query[queryOffset + 2].toInt() and 0x01)).toByte()
         }
         return patched
     }
 
     fun shutdown() {
         scope.cancel()
-        udpSockets.values.forEach {
-            try {
-                it.socket.close()
-            } catch (_: Exception) {
-            }
+        udpSocketPools.values.forEach { pool ->
+            pool.sockets.forEach(::closeUdpSocket)
+            pool.sockets.clear()
         }
-        udpSockets.clear()
+        udpSocketPools.clear()
     }
 }
 

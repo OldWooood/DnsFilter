@@ -85,7 +85,8 @@ class DnsVpnService : VpnService() {
     private data class UpstreamTask(
         val packet: ByteArray,
         val length: Int,
-        val dnsPayload: ByteArray,
+        val dnsStart: Int,
+        val dnsLength: Int,
         val question: DnsQuestion,
         val srcPort: Int,
         val isIPv6: Boolean,
@@ -379,12 +380,11 @@ class DnsVpnService : VpnService() {
             return true
         }
 
-        // 3. 需要上游查询，仅在此时复制 DNS 负载
-        val dnsPayload = packet.copyOfRange(dnsStart, length)
         val task = UpstreamTask(
             packet = packet,
             length = length,
-            dnsPayload = dnsPayload,
+            dnsStart = dnsStart,
+            dnsLength = dnsLength,
             question = question,
             srcPort = srcPort,
             isIPv6 = false,
@@ -465,12 +465,11 @@ class DnsVpnService : VpnService() {
             return true
         }
 
-        // 3. 需要上游查询，仅在此时复制 DNS 负载
-        val dnsPayload = packet.copyOfRange(dnsStart, length)
         val task = UpstreamTask(
             packet = packet,
             length = length,
-            dnsPayload = dnsPayload,
+            dnsStart = dnsStart,
+            dnsLength = dnsLength,
             question = question,
             srcPort = srcPort,
             isIPv6 = true,
@@ -490,14 +489,16 @@ class DnsVpnService : VpnService() {
         if (servers.isEmpty()) {
             AppLog.e(TAG, "No DNS servers available")
             statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
-            writeResponseAndPatch(task, buildErrorDnsResponse(task.dnsPayload, 0x0002), outputStream)
+            writeResponseAndPatch(task, buildErrorDnsResponse(task.packet, task.dnsStart, task.length, 0x0002), outputStream)
             return
         }
 
         val result = dnsQueryExecutor?.query(
             domain = task.question.domain,
             servers = servers,
-            query = task.dnsPayload,
+            query = task.packet,
+            queryOffset = task.dnsStart,
+            queryLength = task.dnsLength,
             qtype = task.question.qtype,
             qclass = task.question.qclass
         )
@@ -511,7 +512,7 @@ class DnsVpnService : VpnService() {
         } else {
             AppLog.e(TAG) { "DNS query failed: ${result?.error}" }
             statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
-            writeResponseAndPatch(task, buildErrorDnsResponse(task.dnsPayload, 0x0002), outputStream)
+            writeResponseAndPatch(task, buildErrorDnsResponse(task.packet, task.dnsStart, task.length, 0x0002), outputStream)
         }
     }
 
@@ -611,15 +612,15 @@ class DnsVpnService : VpnService() {
         return result
     }
 
-    private fun buildErrorDnsResponse(query: ByteArray, errorCode: Int): ByteArray {
+    private fun buildErrorDnsResponse(packet: ByteArray, dnsStart: Int, packetLength: Int, errorCode: Int): ByteArray {
         val response = ByteBuffer.allocate(512)
 
         // Transaction ID
-        response.put(query[0])
-        response.put(query[1])
+        response.put(packet[dnsStart])
+        response.put(packet[dnsStart + 1])
 
         // Flags: Response, preserve RD, error code
-        val rdBit = (query[2].toInt() and 0x01)
+        val rdBit = (packet[dnsStart + 2].toInt() and 0x01)
         response.put((0x80 or rdBit).toByte())
         response.put((0x80 or (errorCode and 0x0F)).toByte())
 
@@ -632,29 +633,29 @@ class DnsVpnService : VpnService() {
         response.put(0x00.toByte())
 
         // Copy question section
-        var offset = 12
-        while (offset < query.size) {
-            val len = query[offset].toInt() and 0xFF
-            response.put(query[offset])
+        var offset = dnsStart + 12
+        while (offset < packetLength) {
+            val len = packet[offset].toInt() and 0xFF
+            response.put(packet[offset])
             if (len == 0) {
                 offset++
                 break
             }
             if ((len and 0xC0) == 0xC0) {
-                response.put(query[offset + 1])
+                response.put(packet[offset + 1])
                 offset += 2
                 break
             }
             for (i in 0 until len) {
-                response.put(query[offset + 1 + i])
+                response.put(packet[offset + 1 + i])
             }
             offset += 1 + len
         }
 
         // Copy QTYPE and QCLASS
-        if (offset + 4 <= query.size) {
+        if (offset + 4 <= packetLength) {
             for (i in 0 until 4) {
-                response.put(query[offset + i])
+                response.put(packet[offset + i])
             }
         }
 
