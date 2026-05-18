@@ -13,6 +13,7 @@ import com.deatrg.dnsfilter.data.local.PreferencesManager
 import com.deatrg.dnsfilter.data.local.StatisticsBuffer
 import com.deatrg.dnsfilter.data.remote.DomainFilter
 import com.deatrg.dnsfilter.data.repository.FilterListRepositoryImpl
+import com.deatrg.dnsfilter.data.worker.BlocklistUpdateService
 import com.deatrg.dnsfilter.domain.model.DnsServerType
 import com.deatrg.dnsfilter.domain.model.DnsStatistics
 import com.deatrg.dnsfilter.service.DnsVpnService
@@ -90,9 +91,12 @@ class DashboardViewModel(
         }
 
         // 初始化：从本地缓存加载 blocklist（不下载）
-        // 注意：不在这里调用 checkForUpdates()，由 AlarmManager 负责定时更新
         viewModelScope.launch {
             filterListRepository.loadFilterLists()
+            if (filterListRepository.hasUpdatesDue()) {
+                AppLog.d(TAG, "Filter lists are stale, starting background update service")
+                BlocklistUpdateService.start(getApplication())
+            }
         }
     }
 

@@ -22,8 +22,12 @@ class FilterListsViewModel(
     val filterLists: StateFlow<List<FilterList>> = repository.filterLists
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    val filterListsUi: StateFlow<List<FilterListUiModel>> = repository.filterLists
-        .map { lists -> lists.map { FilterListUiModel(it, repository.getFilterLastUpdated(it)) } }
+    val filterListsUi: StateFlow<List<FilterListUiModel>> = combine(
+        repository.filterLists,
+        repository.cacheVersion
+    ) { lists, _ ->
+        lists.map { FilterListUiModel(it, repository.getFilterLastUpdated(it)) }
+    }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val filterCount: StateFlow<Int> = repository.filterListCount
@@ -59,7 +63,7 @@ class FilterListsViewModel(
 
     fun refreshLists() {
         viewModelScope.launch {
-            repository.loadFilterLists()
+            repository.refreshLists()
         }
     }
 
