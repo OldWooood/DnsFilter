@@ -10,14 +10,12 @@ import android.content.Intent
 import android.os.IBinder
 import com.deatrg.dnsfilter.AppLog
 import com.deatrg.dnsfilter.R
-import com.deatrg.dnsfilter.ServiceLocator
 import com.deatrg.dnsfilter.ui.MainActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import java.util.concurrent.atomic.AtomicBoolean
 
 class BlocklistUpdateService : Service() {
 
@@ -26,16 +24,17 @@ class BlocklistUpdateService : Service() {
         private const val ACTION_UPDATE = "com.deatrg.dnsfilter.ACTION_UPDATE_BLOCKLIST_SERVICE"
         private const val CHANNEL_ID = "blocklist_update_channel"
         private const val NOTIFICATION_ID = 2
-        private val isUpdating = AtomicBoolean(false)
 
-        fun start(context: Context) {
+        fun start(context: Context): Boolean {
             val intent = Intent(context, BlocklistUpdateService::class.java).apply {
                 action = ACTION_UPDATE
             }
-            try {
+            return try {
                 context.startForegroundService(intent)
+                true
             } catch (e: Exception) {
                 AppLog.e(TAG, "Failed to start blocklist update service", e)
+                false
             }
         }
     }
@@ -53,25 +52,16 @@ class BlocklistUpdateService : Service() {
             return START_NOT_STICKY
         }
 
-        if (!isUpdating.compareAndSet(false, true)) {
-            AppLog.d(TAG, "Blocklist update already running")
-            stopSelf(startId)
-            return START_NOT_STICKY
-        }
-
         startForeground(NOTIFICATION_ID, createNotification())
 
         scope.launch {
             try {
                 AppLog.d(TAG, "Starting blocklist update")
-                val repository = ServiceLocator.provideFilterListRepository()
-                repository.loadFilterLists()
-                val updated = repository.checkAndUpdate()
+                val updated = BlocklistUpdateRunner.run()
                 AppLog.d(TAG, "Blocklist update completed, updated=$updated")
             } catch (e: Exception) {
                 AppLog.e(TAG, "Blocklist update failed", e)
             } finally {
-                isUpdating.set(false)
                 stopSelf(startId)
             }
         }

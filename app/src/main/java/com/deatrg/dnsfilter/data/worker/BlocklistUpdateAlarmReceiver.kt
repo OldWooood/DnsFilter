@@ -17,7 +17,10 @@ class BlocklistUpdateAlarmReceiver : BroadcastReceiver() {
                 AppLog.d(TAG, "Alarm triggered, starting update service")
                 val scheduler = BlocklistUpdateAlarmScheduler(context)
                 scheduler.scheduleDailyUpdate()
-                BlocklistUpdateService.start(context)
+                val serviceStarted = BlocklistUpdateService.start(context)
+                if (!serviceStarted) {
+                    BlocklistUpdateJobScheduler(context).scheduleImmediateUpdate()
+                }
             }
         }
     }
