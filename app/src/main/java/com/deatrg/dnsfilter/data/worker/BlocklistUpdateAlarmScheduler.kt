@@ -4,6 +4,7 @@ import android.app.AlarmManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import com.deatrg.dnsfilter.AppLog
 import java.text.SimpleDateFormat
 import java.util.Calendar
@@ -18,6 +19,8 @@ class BlocklistUpdateAlarmScheduler(
         const val REQUEST_CODE_DAILY = 1001
         const val REQUEST_CODE_IMMEDIATE = 1002
         const val ACTION_UPDATE_BLOCKLIST = "com.deatrg.dnsfilter.ACTION_UPDATE_BLOCKLIST"
+        private const val DAILY_UPDATE_HOUR = 12
+        private const val DAILY_UPDATE_MINUTE = 0
     }
 
     fun scheduleDailyUpdate() {
@@ -77,19 +80,41 @@ class BlocklistUpdateAlarmScheduler(
         triggerMillis: Long,
         pendingIntent: PendingIntent
     ) {
-        try {
-            val alarmInfo = AlarmManager.AlarmClockInfo(triggerMillis, null)
-            alarmManager.setAlarmClock(alarmInfo, pendingIntent)
-        } catch (e: Exception) {
-            AppLog.e(TAG, "Failed to schedule alarm clock, falling back to inexact alarm", e)
+        val canScheduleExact = Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+            alarmManager.canScheduleExactAlarms()
+
+        if (canScheduleExact) {
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    alarmManager.setExactAndAllowWhileIdle(
+                        AlarmManager.RTC_WAKEUP,
+                        triggerMillis,
+                        pendingIntent
+                    )
+                } else {
+                    alarmManager.setExact(AlarmManager.RTC_WAKEUP, triggerMillis, pendingIntent)
+                }
+                return
+            } catch (e: SecurityException) {
+                AppLog.e(TAG, "Exact alarm permission denied, falling back to inexact alarm", e)
+            } catch (e: Exception) {
+                AppLog.e(TAG, "Failed to schedule exact alarm, falling back to inexact alarm", e)
+            }
+        } else {
+            AppLog.w(TAG, "Exact alarm permission is not granted, scheduling inexact alarm")
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerMillis, pendingIntent)
+        } else {
             alarmManager.set(AlarmManager.RTC_WAKEUP, triggerMillis, pendingIntent)
         }
     }
 
     private fun calculateNextDailyTime(): Long {
         val calendar = Calendar.getInstance().apply {
-            set(Calendar.HOUR_OF_DAY, 23)
-            set(Calendar.MINUTE, 30)
+            set(Calendar.HOUR_OF_DAY, DAILY_UPDATE_HOUR)
+            set(Calendar.MINUTE, DAILY_UPDATE_MINUTE)
             set(Calendar.SECOND, 0)
             set(Calendar.MILLISECOND, 0)
         }
