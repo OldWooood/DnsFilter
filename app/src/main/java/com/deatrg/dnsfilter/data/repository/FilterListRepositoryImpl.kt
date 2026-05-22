@@ -82,6 +82,8 @@ class FilterListRepositoryImpl(
         if (listToRemove != null) {
             domainFilter.removeFilterList(listToRemove)
         }
+
+        domainFilter.setFilterLists(current.filter { it.isEnabled })
     }
 
     /**

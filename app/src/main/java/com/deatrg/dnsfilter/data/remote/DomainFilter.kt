@@ -279,8 +279,6 @@ class DomainFilter(
      */
     suspend fun removeFilterList(filterList: FilterList) = withContext(Dispatchers.IO) {
         cacheManager.clearCache(filterList)
-        // 重新加载所有列表
-        reloadAllFromCache()
     }
 
     /**

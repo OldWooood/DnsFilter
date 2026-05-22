@@ -13,6 +13,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -27,7 +28,9 @@ import java.util.Locale
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.coroutines.resume
 
 class DnsQueryExecutor(
     private val okHttpClient: OkHttpClient,
@@ -623,48 +626,63 @@ class DnsQueryExecutor(
         expectedDomain: String,
         expectedQtype: Int,
         expectedQclass: Int
-    ): DnsQueryResult {
+    ): DnsQueryResult = withContext(Dispatchers.IO) {
         val expectedAddress = getServerAddress(serverAddress)
         val wrapper = acquireUdpSocket(serverAddress, expectedAddress)
 
-        return try {
-            wrapper.socket.soTimeout = timeoutMs.toInt()
-
-            val requestPacket = DatagramPacket(request, requestOffset, requestLength)
-            wrapper.socket.send(requestPacket)
-
-            val responsePacket = DatagramPacket(wrapper.responseBuffer, wrapper.responseBuffer.size)
-            wrapper.socket.receive(responsePacket)
-
-            if (!isExpectedResponseSource(responsePacket, expectedAddress)) {
-                wrapper.isValid = false
-                closeUdpSocket(wrapper)
-                return DnsQueryResult(false, null, 0, "Unexpected DNS response source")
+        suspendCancellableCoroutine { continuation ->
+            val completed = AtomicBoolean(false)
+            continuation.invokeOnCancellation {
+                if (completed.compareAndSet(false, true)) {
+                    wrapper.isValid = false
+                    closeUdpSocket(wrapper)
+                }
             }
 
-            val responseBytes = responsePacket.data.copyOfRange(0, responsePacket.length)
-            if (!isValidDnsResponse(request, requestOffset, responseBytes, expectedDomain, expectedQtype, expectedQclass)) {
+            val result = try {
+                wrapper.socket.soTimeout = timeoutMs.toInt()
+
+                val requestPacket = DatagramPacket(request, requestOffset, requestLength)
+                wrapper.socket.send(requestPacket)
+
+                val responsePacket = DatagramPacket(wrapper.responseBuffer, wrapper.responseBuffer.size)
+                wrapper.socket.receive(responsePacket)
+
+                if (!isExpectedResponseSource(responsePacket, expectedAddress)) {
+                    wrapper.isValid = false
+                    closeUdpSocket(wrapper)
+                    DnsQueryResult(false, null, 0, "Unexpected DNS response source")
+                } else {
+                    val responseBytes = responsePacket.data.copyOfRange(0, responsePacket.length)
+                    if (!isValidDnsResponse(request, requestOffset, responseBytes, expectedDomain, expectedQtype, expectedQclass)) {
+                        wrapper.isValid = false
+                        closeUdpSocket(wrapper)
+                        DnsQueryResult(false, null, 0, "Mismatched DNS response")
+                    } else {
+                        DnsQueryResult(
+                            success = true,
+                            responseBytes = responseBytes,
+                            responseTime = 0,
+                            error = null
+                        )
+                    }
+                }
+            } catch (e: SocketTimeoutException) {
                 wrapper.isValid = false
                 closeUdpSocket(wrapper)
-                return DnsQueryResult(false, null, 0, "Mismatched DNS response")
+                DnsQueryResult(false, null, 0, "Timeout")
+            } catch (e: Exception) {
+                wrapper.isValid = false
+                closeUdpSocket(wrapper)
+                DnsQueryResult(false, null, 0, e.message)
             }
 
-            DnsQueryResult(
-                success = true,
-                responseBytes = responseBytes,
-                responseTime = 0,
-                error = null
-            )
-        } catch (e: SocketTimeoutException) {
-            wrapper.isValid = false
-            closeUdpSocket(wrapper)
-            DnsQueryResult(false, null, 0, "Timeout")
-        } catch (e: Exception) {
-            wrapper.isValid = false
-            closeUdpSocket(wrapper)
-            DnsQueryResult(false, null, 0, e.message)
-        } finally {
-            releaseUdpSocket(serverAddress, wrapper)
+            if (completed.compareAndSet(false, true)) {
+                releaseUdpSocket(serverAddress, wrapper)
+                if (continuation.isActive) {
+                    continuation.resume(result)
+                }
+            }
         }
     }
 
@@ -685,30 +703,46 @@ class DnsQueryExecutor(
             .post(request.toRequestBody(DNS_MESSAGE_MEDIA_TYPE, requestOffset, requestLength))
             .build()
 
-        try {
+        suspendCancellableCoroutine { continuation ->
             val call = okHttpClient.newCall(httpRequest)
-            call.timeout().timeout(timeoutMs, TimeUnit.MILLISECONDS)
-            call.execute().use { response ->
-                if (!response.isSuccessful) {
-                    return@withContext DnsQueryResult(false, null, 0, "HTTP ${response.code}")
+            val completed = AtomicBoolean(false)
+            continuation.invokeOnCancellation {
+                if (completed.compareAndSet(false, true)) {
+                    call.cancel()
                 }
-
-                val body = response.body?.bytes()
-                    ?: return@withContext DnsQueryResult(false, null, 0, "Empty response")
-
-                if (!isValidDnsResponse(request, requestOffset, body, expectedDomain, expectedQtype, expectedQclass)) {
-                    return@withContext DnsQueryResult(false, null, 0, "Mismatched DoH response")
-                }
-
-                DnsQueryResult(
-                    success = true,
-                    responseBytes = body,
-                    responseTime = 0,
-                    error = null
-                )
             }
-        } catch (e: IOException) {
-            DnsQueryResult(false, null, 0, e.message)
+
+            val result = try {
+                call.timeout().timeout(timeoutMs, TimeUnit.MILLISECONDS)
+                call.execute().use { response ->
+                    if (!response.isSuccessful) {
+                        DnsQueryResult(false, null, 0, "HTTP ${response.code}")
+                    } else {
+                        val body = response.body?.bytes()
+
+                        if (body == null) {
+                            DnsQueryResult(false, null, 0, "Empty response")
+                        } else if (!isValidDnsResponse(request, requestOffset, body, expectedDomain, expectedQtype, expectedQclass)) {
+                            DnsQueryResult(false, null, 0, "Mismatched DoH response")
+                        } else {
+                            DnsQueryResult(
+                                success = true,
+                                responseBytes = body,
+                                responseTime = 0,
+                                error = null
+                            )
+                        }
+                    }
+                }
+            } catch (e: IOException) {
+                DnsQueryResult(false, null, 0, e.message)
+            }
+
+            if (completed.compareAndSet(false, true)) {
+                if (continuation.isActive) {
+                    continuation.resume(result)
+                }
+            }
         }
     }
 
