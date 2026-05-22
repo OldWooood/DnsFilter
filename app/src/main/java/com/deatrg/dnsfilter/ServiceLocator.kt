@@ -5,7 +5,6 @@ import android.content.Context
 import com.deatrg.dnsfilter.data.local.PreferencesManager
 import com.deatrg.dnsfilter.data.local.StatisticsBuffer
 import com.deatrg.dnsfilter.data.remote.DomainFilter
-import com.deatrg.dnsfilter.data.remote.DnsQueryExecutor
 import com.deatrg.dnsfilter.data.repository.DnsServerRepositoryImpl
 import com.deatrg.dnsfilter.data.repository.FilterListRepositoryImpl
 import com.deatrg.dnsfilter.domain.repository.DnsServerRepository
@@ -32,9 +31,6 @@ object ServiceLocator {
     @SuppressLint("StaticFieldLeak")
     @Volatile
     private var domainFilter: DomainFilter? = null
-
-    @Volatile
-    private var dnsQueryExecutor: DnsQueryExecutor? = null
 
     @Volatile
     private var statisticsBuffer: StatisticsBuffer? = null
@@ -71,12 +67,6 @@ object ServiceLocator {
                 getContext(),
                 provideOkHttpClient()
             ).also { domainFilter = it }
-        }
-    }
-
-    fun provideDnsQueryExecutor(): DnsQueryExecutor {
-        return dnsQueryExecutor ?: synchronized(this) {
-            dnsQueryExecutor ?: DnsQueryExecutor(provideOkHttpClient()).also { dnsQueryExecutor = it }
         }
     }
 
