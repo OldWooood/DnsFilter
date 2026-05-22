@@ -355,7 +355,11 @@ class DnsVpnService : VpnService() {
         val rawCached = dnsQueryExecutor?.getCachedResponseRaw(
             domain = question.domain,
             qtype = question.qtype,
-            qclass = question.qclass
+            qclass = question.qclass,
+            servers = servers,
+            query = packet,
+            queryOffset = dnsStart,
+            queryLength = dnsLength
         )
         if (rawCached != null) {
             AppLog.d(TAG) { "DNS cache hit: ${question.domain}" }
@@ -443,7 +447,11 @@ class DnsVpnService : VpnService() {
         val rawCached = dnsQueryExecutor?.getCachedResponseRaw(
             domain = question.domain,
             qtype = question.qtype,
-            qclass = question.qclass
+            qclass = question.qclass,
+            servers = servers,
+            query = packet,
+            queryOffset = dnsStart,
+            queryLength = dnsLength
         )
         if (rawCached != null) {
             AppLog.d(TAG) { "DNS cache hit: ${question.domain}" }
