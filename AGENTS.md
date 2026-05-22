@@ -22,7 +22,7 @@ DnsFilter is an Android application that acts as a local DNS filtering proxy. It
 | Persistence | DataStore Preferences (settings), local file cache (blocklists) |
 | Background updates | `AlarmManager` + `BroadcastReceiver` (WorkManager is deprecated in this project) |
 
-**Important**: Although Hilt plugins and libraries are declared in `gradle/libs.versions.toml`, the project **does not use Hilt**. Dependency injection is done manually via `ServiceLocator` in `app/src/main/java/com/deatrg/dnsfilter/ServiceLocator.kt`.
+**Important**: The project **does not use Hilt**. Dependency injection is done manually via `ServiceLocator` in `app/src/main/java/com/deatrg/dnsfilter/ServiceLocator.kt`.
 
 ## Project Structure
 
@@ -44,12 +44,10 @@ app/src/main/java/com/deatrg/dnsfilter/
 │   └── worker/
 │       ├── BlocklistUpdateAlarmScheduler.kt   # AlarmManager scheduling
 │       ├── BlocklistUpdateAlarmReceiver.kt    # Handles BOOT_COMPLETED and update alarms
-│       └── BlocklistUpdateWorker.kt           # Deprecated WorkManager worker
 ├── domain/
 │   ├── model/
 │   │   ├── DnsServer.kt          # id, name, address, type (PLAIN/DOH/DOT), isEnabled
 │   │   ├── FilterList.kt         # id, name, url, isEnabled, isBuiltIn
-│   │   ├── DnsQuery.kt           # domain, timestamp, isBlocked, responseIp, etc.
 │   │   └── DnsStatistics.kt      # totalQueries, blockedQueries, allowedQueries, avgResponseTime
 │   └── repository/
 │       └── Repositories.kt       # DnsServerRepository and FilterListRepository interfaces
@@ -102,14 +100,14 @@ APKs are output to `app/build/outputs/apk/`. The build produces split APKs by AB
 
 ### Domain Filtering
 - Blocklists use the **AdAway/hosts file format**: lines like `0.0.0.0 domain.com` or `127.0.0.1 domain.com`.
-- Supports wildcard patterns (e.g., `*.tracker.com`).
-- Two-level LRU cache for lookup results: one for allowed domains, one for blocked domains.
-- Parent domain traversal: `sub.ad.example.com` is blocked if `ad.example.com` or `example.com` is in the blocklist.
-- Default built-in list: `anti-ad` (`https://anti-ad.net/domains.txt`).
+- Matching is exact after lowercase normalization and trimming a trailing dot.
+- Wildcard entries are ignored by the current in-memory matcher.
+- Subdomains are not blocked by parent-domain entries unless the exact subdomain also appears in the blocklist.
+- Default built-in list: `NeoDevHost` (`https://neodev.team/domain`).
 
 ### Blocklist Updates
 - **Daily auto-update** at local time 12:00 using `AlarmManager` + `BlocklistUpdateAlarmReceiver`.
-- `WorkManager` (`BlocklistUpdateWorker`) exists but is **deprecated** and cancelled on app startup because it is unreliable on some OEM devices.
+- WorkManager is intentionally not used because it is unreliable on some OEM devices.
 - On `BOOT_COMPLETED`, the alarm is rescheduled.
 - Blocklist cache expires after 24 hours (`UPDATE_INTERVAL_HOURS = 24`).
 
@@ -167,4 +165,4 @@ Release builds are signed using credentials from `key.properties` (not in repo).
 3. **Prefer AlarmManager over WorkManager** for new background scheduling tasks.
 4. **VPN is split-tunnel only**: The VPN routes only DNS traffic. Do not change routing to capture all traffic unless explicitly required.
 5. **Default DNS servers** are Chinese providers (Tencent DNS, AliDNS, DNSPod) and are initialized on first launch in `DnsFilterApplication`.
-6. **Blocklist parsing** only understands hosts-file format and plain domain lists. It does not support AdBlock Plus syntax or uBlock Origin filters.
+6. **Blocklist parsing** only understands hosts-file format and plain domain lists. It does not support AdBlock Plus syntax, uBlock Origin filters, wildcard matching, or parent-domain traversal.

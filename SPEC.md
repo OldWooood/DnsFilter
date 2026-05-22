@@ -22,7 +22,6 @@
 - androidx.compose.* (BOM)
 - androidx.lifecycle:lifecycle-viewmodel-compose
 - androidx.datastore:datastore-preferences
-- com.google.dagger:hilt-android
 - com.squareup.okhttp3:okhttp (DNS over HTTPS)
 - kotlinx.coroutines
 
@@ -32,7 +31,7 @@
 1. **Local DNS Proxy Server** - Runs a local DNS server that intercepts queries
 2. **Multi-DNS Support** - Configure multiple upstream DNS servers (DoH/Plain)
 3. **Concurrent DNS Requests** - Query multiple DNS servers simultaneously and use fastest response
-4. **Domain Filtering** - Filter domains against blocklists using pattern matching
+4. **Domain Filtering** - Filter exact domains against blocklists
 5. **Filter Lists Management** - Add/remove/enable/disable filter lists (AdAway format)
 6. **DNS over HTTPS (DoH)** - Support encrypted DNS via HTTPS
 8. **Logging** - Log DNS queries with blocked/allowed status
