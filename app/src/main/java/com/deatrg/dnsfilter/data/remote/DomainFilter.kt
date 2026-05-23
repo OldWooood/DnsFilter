@@ -290,13 +290,9 @@ class DomainFilter(
         }
     }
 
-    fun isDomainBlocked(domain: String): BlockResult {
+    fun isDomainBlocked(domain: String): Boolean {
         val normalizedDomain = domain.lowercase().trimEnd('.')
-        return if (blockedDomains.contains(normalizedDomain)) {
-            BlockResult(true, "blocked_domain")
-        } else {
-            BlockResult(false, null)
-        }
+        return blockedDomains.contains(normalizedDomain)
     }
 
     /**
@@ -322,8 +318,3 @@ class DomainFilter(
         _cacheVersion.value = cacheVersionCounter.incrementAndGet()
     }
 }
-
-data class BlockResult(
-    val isBlocked: Boolean,
-    val reason: String?
-)

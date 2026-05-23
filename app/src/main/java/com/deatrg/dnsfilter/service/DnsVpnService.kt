@@ -335,9 +335,8 @@ class DnsVpnService : VpnService() {
         val question = parseDnsQueryFromPacket(packet, dnsStart, length) ?: return true
 
         // 1. 检查拦截
-        val blockResult = domainFilter?.isDomainBlocked(question.domain)
-        if (blockResult?.isBlocked == true) {
-            AppLog.d(TAG) { "Domain ${question.domain} is blocked: ${blockResult.reason}" }
+        if (domainFilter?.isDomainBlocked(question.domain) == true) {
+            AppLog.d(TAG) { "Domain ${question.domain} is blocked" }
             statisticsBuffer?.recordQuery(blocked = true, responseTime = 0, includeInAvg = false)
             val response = buildBlockedDnsResponse(packet, dnsStart, length)
             if (dnsStart + response.size <= packet.size) {
@@ -427,9 +426,8 @@ class DnsVpnService : VpnService() {
         val question = parseDnsQueryFromPacket(packet, dnsStart, length) ?: return true
 
         // 1. 检查拦截
-        val blockResult = domainFilter?.isDomainBlocked(question.domain)
-        if (blockResult?.isBlocked == true) {
-            AppLog.d(TAG) { "Domain ${question.domain} is blocked: ${blockResult.reason}" }
+        if (domainFilter?.isDomainBlocked(question.domain) == true) {
+            AppLog.d(TAG) { "Domain ${question.domain} is blocked" }
             statisticsBuffer?.recordQuery(blocked = true, responseTime = 0, includeInAvg = false)
             val response = buildBlockedDnsResponse(packet, dnsStart, length)
             if (dnsStart + response.size <= packet.size) {
