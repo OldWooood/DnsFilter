@@ -36,6 +36,9 @@ class FilterListsViewModel(
     val isLoaded: StateFlow<Boolean> = repository.isLoaded
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
 
+    val isLoading: StateFlow<Boolean> = repository.isLoading
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
+
     fun addFilterList(name: String, url: String) {
         viewModelScope.launch {
             val filterList = FilterList(

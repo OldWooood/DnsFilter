@@ -17,6 +17,7 @@ class FilterListRepositoryImpl(
     override val filterLists: Flow<List<FilterList>> = preferencesManager.filterLists
     override val filterListCount: Flow<Int> = domainFilter.filterListCount
     override val isLoaded: Flow<Boolean> = domainFilter.isLoaded
+    override val isLoading: Flow<Boolean> = domainFilter.isLoading
     override val cacheVersion: Flow<Long> = domainFilter.cacheVersion
     override val enabledDnsServerCount: Flow<Int> = preferencesManager.dnsServers.map { servers ->
         servers.count { it.isEnabled && it.type != DnsServerType.DOT }
@@ -101,19 +102,6 @@ class FilterListRepositoryImpl(
         val lists = preferencesManager.filterLists.first()
         domainFilter.setFilterLists(lists.filter { it.isEnabled })
         domainFilter.loadFilterLists(forceReload = true)
-    }
-
-    /**
-     * 检查并自动更新过期的列表
-     */
-    suspend fun checkAndUpdate(): Boolean {
-        return domainFilter.checkAndUpdate()
-    }
-
-    override suspend fun hasUpdatesDue(): Boolean {
-        val lists = preferencesManager.filterLists.first()
-        domainFilter.setFilterLists(lists.filter { it.isEnabled })
-        return domainFilter.hasFilterListUpdatesDue()
     }
 
     override fun getFilterLastUpdated(filterList: FilterList): Long? {

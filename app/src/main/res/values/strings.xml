@@ -63,6 +63,7 @@
     <string name="filter_list_delete">Delete</string>
     <string name="filter_list_delete_title">Delete Filter List</string>
     <string name="filter_list_delete_message">Are you sure you want to delete "%1$s"?</string>
+    <string name="filter_list_manual_update">Update now</string>
 
     <!-- Service Notification -->
     <string name="notification_channel_name">DnsFilter Service</string>
@@ -70,11 +71,6 @@
     <string name="notification_title">DnsFilter Active</string>
     <string name="notification_text">DNS filtering is enabled</string>
     <string name="notification_action_stop">Stop</string>
-    <string name="update_notification_channel_name">Blocklist Updates</string>
-    <string name="update_notification_channel_description">Background filter list update notification</string>
-    <string name="update_notification_title">Updating blocklists</string>
-    <string name="update_notification_text">Downloading the latest filter rules</string>
-
     <plurals name="filter_lists_domains_blocked">
         <item quantity="one">%1$d domain blocked</item>
         <item quantity="other">%1$d domains blocked</item>
