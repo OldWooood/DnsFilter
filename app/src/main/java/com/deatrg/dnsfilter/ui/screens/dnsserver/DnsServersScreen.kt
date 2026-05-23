@@ -21,7 +21,6 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.deatrg.dnsfilter.R
 import com.deatrg.dnsfilter.domain.model.DnsServer
-import com.deatrg.dnsfilter.domain.model.DnsServerType
 import androidx.compose.ui.res.stringResource
 
 @Composable
@@ -90,8 +89,8 @@ fun DnsServersScreen(
     if (showAddDialog) {
         AddDnsServerDialog(
             onDismiss = { showAddDialog = false },
-            onAdd = { name, address, type ->
-                viewModel.addServer(name, address, type)
+            onAdd = { name, address ->
+                viewModel.addServer(name, address)
                 showAddDialog = false
             }
         )
@@ -195,32 +194,6 @@ private fun DnsServerCard(
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.SemiBold
                     )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    val typeColor = when (server.type) {
-                        DnsServerType.PLAIN -> MaterialTheme.colorScheme.primary
-                        DnsServerType.DOH -> MaterialTheme.colorScheme.tertiary
-                        DnsServerType.DOT -> MaterialTheme.colorScheme.secondary
-                    }
-                    val typeContainerColor = when (server.type) {
-                        DnsServerType.PLAIN -> MaterialTheme.colorScheme.primaryContainer
-                        DnsServerType.DOH -> MaterialTheme.colorScheme.tertiaryContainer
-                        DnsServerType.DOT -> MaterialTheme.colorScheme.secondaryContainer
-                    }
-                    SuggestionChip(
-                        onClick = { },
-                        label = {
-                            Text(
-                                server.type.name,
-                                style = MaterialTheme.typography.labelSmall,
-                                fontWeight = FontWeight.Medium
-                            )
-                        },
-                        colors = SuggestionChipDefaults.suggestionChipColors(
-                            containerColor = typeContainerColor,
-                            labelColor = typeColor
-                        ),
-                        border = null
-                    )
                 }
                 Spacer(modifier = Modifier.height(6.dp))
                 Text(
@@ -251,19 +224,13 @@ private fun DnsServerCard(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun AddDnsServerDialog(
     onDismiss: () -> Unit,
-    onAdd: (name: String, address: String, type: DnsServerType) -> Unit
+    onAdd: (name: String, address: String) -> Unit
 ) {
     var name by remember { mutableStateOf("") }
     var address by remember { mutableStateOf("") }
-    var selectedType by remember { mutableStateOf(DnsServerType.PLAIN) }
-    var expanded by remember { mutableStateOf(false) }
-    val selectableTypes = remember {
-        DnsServerType.entries.filter { it != DnsServerType.DOT }
-    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -293,41 +260,11 @@ private fun AddDnsServerDialog(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(16.dp)
                 )
-                ExposedDropdownMenuBox(
-                    expanded = expanded,
-                    onExpandedChange = { expanded = !expanded }
-                ) {
-                    OutlinedTextField(
-                        value = selectedType.name,
-                        onValueChange = { },
-                        readOnly = true,
-                        label = { Text(stringResource(R.string.dns_server_type)) },
-                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .menuAnchor(MenuAnchorType.PrimaryNotEditable),
-                        shape = RoundedCornerShape(16.dp)
-                    )
-                    ExposedDropdownMenu(
-                        expanded = expanded,
-                        onDismissRequest = { expanded = false }
-                    ) {
-                        selectableTypes.forEach { type ->
-                            DropdownMenuItem(
-                                text = { Text(type.name) },
-                                onClick = {
-                                    selectedType = type
-                                    expanded = false
-                                }
-                            )
-                        }
-                    }
-                }
             }
         },
         confirmButton = {
             Button(
-                onClick = { onAdd(name, address, selectedType) },
+                onClick = { onAdd(name, address) },
                 enabled = name.isNotBlank() && address.isNotBlank(),
                 shape = RoundedCornerShape(14.dp)
             ) {

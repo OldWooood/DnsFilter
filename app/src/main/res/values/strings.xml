@@ -37,7 +37,7 @@
     <string name="dns_server_add">Add DNS Server</string>
     <string name="dns_server_name">Name</string>
     <string name="dns_server_address">Address</string>
-    <string name="dns_server_address_placeholder">1.1.1.1 or https://…</string>
+    <string name="dns_server_address_placeholder">1.1.1.1</string>
     <string name="dns_server_type">Type</string>
     <string name="dns_server_enabled">Enabled</string>
     <string name="dns_server_disabled">Disabled</string>

@@ -14,14 +14,12 @@ import com.deatrg.dnsfilter.data.remote.DnsQueryExecutor
 import com.deatrg.dnsfilter.data.remote.DnsQuestion
 import com.deatrg.dnsfilter.data.remote.parseDnsQueryFromPacket
 import com.deatrg.dnsfilter.domain.model.DnsServer
-import com.deatrg.dnsfilter.domain.model.DnsServerType
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import okhttp3.OkHttpClient
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InterruptedIOException
@@ -54,7 +52,6 @@ class DnsVpnService : VpnService() {
 
     private var domainFilter: DomainFilter? = null
     private var dnsQueryExecutor: DnsQueryExecutor? = null
-    private var okHttpClient: OkHttpClient? = null
     private var statisticsBuffer: StatisticsBuffer? = null
     @Volatile
     private var servers: List<DnsServer> = emptyList()
@@ -100,12 +97,11 @@ class DnsVpnService : VpnService() {
     }
 
     private fun initializeComponents() {
-        okHttpClient = ServiceLocator.provideOkHttpClient()
         domainFilter = ServiceLocator.provideDomainFilter()
         statisticsBuffer = ServiceLocator.provideStatisticsBuffer()
 
         // Create DnsQueryExecutor with socket protection callback
-        dnsQueryExecutor = DnsQueryExecutor(okHttpClient!!) { socket ->
+        dnsQueryExecutor = DnsQueryExecutor { socket ->
             protect(socket)
         }
     }
@@ -917,6 +913,6 @@ class DnsVpnService : VpnService() {
     }
 
     private fun isSupportedDnsServer(server: DnsServer): Boolean {
-        return server.isEnabled && server.type != DnsServerType.DOT
+        return server.isEnabled
     }
 }
