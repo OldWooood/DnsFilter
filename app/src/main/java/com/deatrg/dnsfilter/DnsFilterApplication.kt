@@ -1,7 +1,6 @@
 package com.deatrg.dnsfilter
 
 import android.app.Application
-import com.deatrg.dnsfilter.data.worker.BlocklistUpdateAlarmScheduler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -20,14 +19,6 @@ class DnsFilterApplication : Application() {
             val prefs = ServiceLocator.providePreferencesManager()
             prefs.ensureDefaultServersInitialized()
             prefs.ensureDefaultFilterListsInitialized()
-        }
-
-        // 使用 AlarmManager 每天 12:00 自动更新 blocklist
-        try {
-            val scheduler = BlocklistUpdateAlarmScheduler(this)
-            scheduler.scheduleDailyUpdate()
-        } catch (e: Exception) {
-            AppLog.e("DnsFilterApplication", "Failed to schedule blocklist update", e)
         }
     }
 }

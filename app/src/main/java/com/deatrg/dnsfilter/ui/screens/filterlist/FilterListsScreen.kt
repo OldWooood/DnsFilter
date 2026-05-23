@@ -33,18 +33,42 @@ fun FilterListsScreen(
     val filterLists by viewModel.filterListsUi.collectAsStateWithLifecycle(initialValue = emptyList())
     val filterCount by viewModel.filterCount.collectAsStateWithLifecycle(initialValue = 0)
     val isLoaded by viewModel.isLoaded.collectAsStateWithLifecycle(initialValue = false)
+    val isLoading by viewModel.isLoading.collectAsStateWithLifecycle(initialValue = false)
     var showAddDialog by remember { mutableStateOf(false) }
     var filterListToDelete by remember { mutableStateOf<FilterList?>(null) }
 
     Scaffold(
         floatingActionButton = {
-            FloatingActionButton(
-                onClick = { showAddDialog = true },
-                shape = RoundedCornerShape(18.dp),
-                containerColor = MaterialTheme.colorScheme.primary,
-                contentColor = MaterialTheme.colorScheme.onPrimary
+            Column(
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+                horizontalAlignment = Alignment.End
             ) {
-                Icon(Icons.Default.Add, contentDescription = stringResource(R.string.filter_list_add))
+                FloatingActionButton(
+                    onClick = { if (!isLoading) viewModel.refreshLists() },
+                    shape = RoundedCornerShape(18.dp),
+                    containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                    contentColor = MaterialTheme.colorScheme.onSecondaryContainer
+                ) {
+                    if (isLoading) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(24.dp),
+                            strokeWidth = 2.5.dp
+                        )
+                    } else {
+                        Icon(
+                            Icons.Default.Refresh,
+                            contentDescription = stringResource(R.string.filter_list_manual_update)
+                        )
+                    }
+                }
+                FloatingActionButton(
+                    onClick = { showAddDialog = true },
+                    shape = RoundedCornerShape(18.dp),
+                    containerColor = MaterialTheme.colorScheme.primary,
+                    contentColor = MaterialTheme.colorScheme.onPrimary
+                ) {
+                    Icon(Icons.Default.Add, contentDescription = stringResource(R.string.filter_list_add))
+                }
             }
         }
     ) { padding ->

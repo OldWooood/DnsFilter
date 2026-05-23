@@ -9,8 +9,6 @@ import kotlinx.coroutines.flow.*
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.BufferedReader
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
@@ -26,25 +24,8 @@ class DomainFilter(
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val cacheManager = BlocklistCacheManager(context)
 
-    private data class BlocklistSnapshot(
-        val blockedDomains: Set<String> = emptySet()
-    ) {
-        val totalCount: Int
-            get() = blockedDomains.size
-
-        fun hasData(): Boolean = blockedDomains.isNotEmpty()
-    }
-
-    /**
-     * 打包 snapshot + caches 为一个不可变状态对象。
-     * publishSnapshot 时整体替换，保证一致性且无锁。
-     */
-    private data class FilterState(
-        val snapshot: BlocklistSnapshot = BlocklistSnapshot(),
-        val cache: ConcurrentHashMap<String, Boolean> = ConcurrentHashMap()
-    )
-
-    private val stateRef = AtomicReference(FilterState())
+    @Volatile
+    private var blockedDomains: Set<String> = emptySet()
 
     private val _isLoaded = MutableStateFlow(false)
     val isLoaded: StateFlow<Boolean> = _isLoaded.asStateFlow()
@@ -77,8 +58,8 @@ class DomainFilter(
         _isLoading.value = false
         _downloadProgress.value = null
         _filterListCount.value = 0
-        stateRef.set(FilterState())
-        
+        blockedDomains = emptySet()
+
         // 如果没有启用的过滤列表，直接标记为已加载（空 blocklist 是合法状态）
         if (filterListsToLoad.isEmpty()) {
             _filterListCount.value = 0
@@ -86,7 +67,7 @@ class DomainFilter(
             AppLog.d(TAG, "No filter lists enabled, marking as loaded with empty blocklist")
             return@withContext
         }
-        
+
         // 从本地缓存加载
         var totalLoaded = 0
         val newBlockedDomains = HashSet<String>()
@@ -100,10 +81,8 @@ class DomainFilter(
             }
         }
 
-        val snapshot = BlocklistSnapshot(
-            blockedDomains = newBlockedDomains
-        )
-        publishSnapshot(snapshot)
+        blockedDomains = newBlockedDomains
+        _filterListCount.value = newBlockedDomains.size
 
         // 只要有数据就标记为已加载（允许部分列表失败）
         if (totalLoaded > 0) {
@@ -163,40 +142,6 @@ class DomainFilter(
     }
 
     /**
-     * 检查并自动更新需要更新的列表（后台静默更新，不显示 loading）
-     */
-    suspend fun checkAndUpdate(): Boolean = withContext(Dispatchers.IO) {
-        if (_isLoading.value) return@withContext false
-
-        try {
-            val updatedLists = mutableListOf<FilterList>()
-
-            filterListsToLoad.forEach { filterList ->
-                val needsUpdate = cacheManager.needsUpdate(filterList)
-                val hasCache = cacheManager.hasCache(filterList)
-
-                if (!hasCache || needsUpdate) {
-                    // 后台更新：先下载
-                    val count = downloadFilterList(filterList)
-                    if (count != null) {
-                        updatedLists.add(filterList)
-                    }
-                }
-            }
-
-            // 只在有列表更新时才重新加载所有列表（只加载一次）
-            if (updatedLists.isNotEmpty()) {
-                reloadAllFromCache()
-            }
-
-            updatedLists.isNotEmpty()
-        } catch (e: Exception) {
-            AppLog.e(TAG, "Error checking for updates", e)
-            false
-        }
-    }
-
-    /**
      * 手动触发加载（用于首次启动时下载）
      * @param forceReload 是否强制重新下载（忽略 24 小时缓存检查）
      * 返回 true 表示可以开始拦截（有数据或空列表都视为成功）
@@ -247,17 +192,15 @@ class DomainFilter(
                 _downloadProgress.value = Pair(downloadedCount.get(), filterListsToLoad.size)
             }
 
-            val snapshot = BlocklistSnapshot(
-                blockedDomains = newBlockedDomains
-            )
-            publishSnapshot(snapshot)
+            blockedDomains = newBlockedDomains
+            _filterListCount.value = newBlockedDomains.size
 
             // 只要有至少一个列表加载成功，或所有列表都有旧缓存，就视为成功
             // 允许部分列表失败，但至少要有一个列表的缓存
-            val hasAnyData = snapshot.hasData()
+            val hasAnyData = newBlockedDomains.isNotEmpty()
             _isLoaded.value = hasAnyData
 
-            AppLog.d(TAG, "loadFilterLists completed: ${snapshot.blockedDomains.size} domains, loaded=$loadedCount/${filterListsToLoad.size}")
+            AppLog.d(TAG, "loadFilterLists completed: ${newBlockedDomains.size} domains, loaded=$loadedCount/${filterListsToLoad.size}")
             hasAnyData
         } finally {
             _isLoading.value = false
@@ -302,11 +245,9 @@ class DomainFilter(
             }
         }
 
-        publishSnapshot(
-            BlocklistSnapshot(
-                blockedDomains = newBlockedDomains
-            )
-        )
+        blockedDomains = newBlockedDomains
+        _filterListCount.value = newBlockedDomains.size
+        _isLoaded.value = newBlockedDomains.isNotEmpty()
     }
 
     private fun addDomainsToBlocklist(
@@ -351,33 +292,11 @@ class DomainFilter(
 
     fun isDomainBlocked(domain: String): BlockResult {
         val normalizedDomain = domain.lowercase().trimEnd('.')
-        val state = stateRef.get()
-
-        // 查缓存：true=blocked, false=allowed
-        state.cache[normalizedDomain]?.let { isBlocked ->
-            return BlockResult(isBlocked, if (isBlocked) "cached" else null)
-        }
-
-        val result = checkBlocked(state.snapshot, normalizedDomain)
-
-        state.cache[normalizedDomain] = result.isBlocked
-
-        return result
-    }
-
-    private fun checkBlocked(snapshot: BlocklistSnapshot, domain: String): BlockResult {
-        return if (snapshot.blockedDomains.contains(domain)) {
+        return if (blockedDomains.contains(normalizedDomain)) {
             BlockResult(true, "blocked_domain")
         } else {
             BlockResult(false, null)
         }
-    }
-
-    private fun publishSnapshot(snapshot: BlocklistSnapshot) {
-        // 整体替换：新查询立刻看到新快照 + 空缓存，旧 state 丢弃给 GC
-        stateRef.set(FilterState(snapshot = snapshot))
-        _filterListCount.value = snapshot.totalCount
-        _isLoaded.value = snapshot.hasData()
     }
 
     /**
@@ -385,12 +304,6 @@ class DomainFilter(
      */
     fun getFilterLastUpdated(filterList: FilterList): Long? {
         return cacheManager.getLastUpdated(filterList.url)
-    }
-
-    fun hasFilterListUpdatesDue(): Boolean {
-        return filterListsToLoad.any { filterList ->
-            !cacheManager.hasCache(filterList) || cacheManager.needsUpdate(filterList)
-        }
     }
 
     fun shutdown() {

@@ -64,6 +64,7 @@
     <string name="filter_list_delete">删除</string>
     <string name="filter_list_delete_title">删除过滤列表</string>
     <string name="filter_list_delete_message">确定要删除 "%1$s" 吗？</string>
+    <string name="filter_list_manual_update">立即更新</string>
 
     <!-- Service Notification -->
     <string name="notification_channel_name">DnsFilter 服务</string>
@@ -71,11 +72,6 @@
     <string name="notification_title">DnsFilter 运行中</string>
     <string name="notification_text">DNS 过滤已启用</string>
     <string name="notification_action_stop">停止</string>
-    <string name="update_notification_channel_name">拦截列表更新</string>
-    <string name="update_notification_channel_description">后台过滤列表更新通知</string>
-    <string name="update_notification_title">正在更新拦截列表</string>
-    <string name="update_notification_text">正在下载最新过滤规则</string>
-
     <plurals name="filter_lists_domains_blocked">
         <item quantity="other">已拦截 %1$d 个域名</item>
     </plurals>
