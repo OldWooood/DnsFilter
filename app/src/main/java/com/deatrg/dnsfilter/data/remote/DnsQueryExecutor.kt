@@ -2,7 +2,6 @@ package com.deatrg.dnsfilter.data.remote
 
 import com.deatrg.dnsfilter.AppLog
 import com.deatrg.dnsfilter.domain.model.DnsServer
-import com.deatrg.dnsfilter.domain.model.DnsServerType
 import com.deatrg.dnsfilter.data.remote.parseDnsQuestion
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -15,11 +14,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import java.io.IOException
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -33,7 +27,6 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.resume
 
 class DnsQueryExecutor(
-    private val okHttpClient: OkHttpClient,
     private val socketProtector: ((DatagramSocket) -> Unit)? = null
 ) {
 
@@ -51,7 +44,6 @@ class DnsQueryExecutor(
         private const val PREFETCH_COOLDOWN_MS = 30 * 1000L
         private const val DNS_RESPONSE_BUFFER_SIZE = 2048
         private const val UDP_SOCKET_POOL_SIZE = 4
-        private val DNS_MESSAGE_MEDIA_TYPE = "application/dns-message".toMediaType()
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -495,7 +487,7 @@ class DnsQueryExecutor(
         val deferreds = servers.map { server ->
             async {
                 val startTime = System.currentTimeMillis()
-                val result = queryServer(query, queryOffset, queryLength, server, timeoutMs, domain, qtype, qclass)
+                val result = queryPlainDns(query, queryOffset, queryLength, server.address, timeoutMs, domain, qtype, qclass)
                 ServerQueryOutcome(server, result, System.currentTimeMillis() - startTime)
             }
         }.toMutableList()
@@ -611,11 +603,7 @@ class DnsQueryExecutor(
         expectedDomain: String,
         expectedQtype: Int,
         expectedQclass: Int
-    ): DnsQueryResult = when (server.type) {
-        DnsServerType.PLAIN -> queryPlainDns(request, requestOffset, requestLength, server.address, timeoutMs, expectedDomain, expectedQtype, expectedQclass)
-        DnsServerType.DOH -> queryDoH(request, requestOffset, requestLength, server.address, timeoutMs, expectedDomain, expectedQtype, expectedQclass)
-        DnsServerType.DOT -> queryDoT(server.address, timeoutMs)
-    }
+    ): DnsQueryResult = queryPlainDns(request, requestOffset, requestLength, server.address, timeoutMs, expectedDomain, expectedQtype, expectedQclass)
 
     private suspend fun queryPlainDns(
         request: ByteArray,
@@ -684,78 +672,6 @@ class DnsQueryExecutor(
                 }
             }
         }
-    }
-
-    private suspend fun queryDoH(
-        request: ByteArray,
-        requestOffset: Int,
-        requestLength: Int,
-        url: String,
-        timeoutMs: Long = 3000,
-        expectedDomain: String,
-        expectedQtype: Int,
-        expectedQclass: Int
-    ): DnsQueryResult = withContext(Dispatchers.IO) {
-        val httpRequest = Request.Builder()
-            .url(url)
-            .addHeader("Accept", "application/dns-message")
-            .addHeader("Content-Type", "application/dns-message")
-            .post(request.toRequestBody(DNS_MESSAGE_MEDIA_TYPE, requestOffset, requestLength))
-            .build()
-
-        suspendCancellableCoroutine { continuation ->
-            val call = okHttpClient.newCall(httpRequest)
-            val completed = AtomicBoolean(false)
-            continuation.invokeOnCancellation {
-                if (completed.compareAndSet(false, true)) {
-                    call.cancel()
-                }
-            }
-
-            val result = try {
-                call.timeout().timeout(timeoutMs, TimeUnit.MILLISECONDS)
-                call.execute().use { response ->
-                    if (!response.isSuccessful) {
-                        DnsQueryResult(false, null, 0, "HTTP ${response.code}")
-                    } else {
-                        val body = response.body?.bytes()
-
-                        if (body == null) {
-                            DnsQueryResult(false, null, 0, "Empty response")
-                        } else if (!isValidDnsResponse(request, requestOffset, body, expectedDomain, expectedQtype, expectedQclass)) {
-                            DnsQueryResult(false, null, 0, "Mismatched DoH response")
-                        } else {
-                            DnsQueryResult(
-                                success = true,
-                                responseBytes = body,
-                                responseTime = 0,
-                                error = null
-                            )
-                        }
-                    }
-                }
-            } catch (e: IOException) {
-                DnsQueryResult(false, null, 0, e.message)
-            }
-
-            if (completed.compareAndSet(false, true)) {
-                if (continuation.isActive) {
-                    continuation.resume(result)
-                }
-            }
-        }
-    }
-
-    private suspend fun queryDoT(
-        serverAddress: String,
-        timeoutMs: Long
-    ): DnsQueryResult = withContext(Dispatchers.IO) {
-        DnsQueryResult(
-            success = false,
-            responseBytes = null,
-            responseTime = 0,
-            error = "DoT not yet implemented for $serverAddress within ${timeoutMs}ms"
-        )
     }
 
     private fun getServerAddress(serverAddress: String): InetAddress {

@@ -2,7 +2,6 @@ package com.deatrg.dnsfilter.data.repository
 
 import com.deatrg.dnsfilter.data.local.PreferencesManager
 import com.deatrg.dnsfilter.data.remote.DomainFilter
-import com.deatrg.dnsfilter.domain.model.DnsServerType
 import com.deatrg.dnsfilter.domain.model.FilterList
 import com.deatrg.dnsfilter.domain.repository.FilterListRepository
 import kotlinx.coroutines.flow.Flow
@@ -20,7 +19,7 @@ class FilterListRepositoryImpl(
     override val isLoading: Flow<Boolean> = domainFilter.isLoading
     override val cacheVersion: Flow<Long> = domainFilter.cacheVersion
     override val enabledDnsServerCount: Flow<Int> = preferencesManager.dnsServers.map { servers ->
-        servers.count { it.isEnabled && it.type != DnsServerType.DOT }
+        servers.count { it.isEnabled }
     }
 
     /**

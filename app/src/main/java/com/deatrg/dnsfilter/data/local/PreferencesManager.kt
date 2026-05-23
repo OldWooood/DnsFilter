@@ -5,7 +5,6 @@ import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.*
 import androidx.datastore.preferences.preferencesDataStore
 import com.deatrg.dnsfilter.domain.model.DnsServer
-import com.deatrg.dnsfilter.domain.model.DnsServerType
 import com.deatrg.dnsfilter.domain.model.DnsStatistics
 import com.deatrg.dnsfilter.domain.model.FilterList
 import kotlinx.coroutines.flow.first
@@ -190,7 +189,6 @@ class PreferencesManager(private val context: Context) {
                     id = obj.getString("id"),
                     name = obj.getString("name"),
                     address = obj.getString("address"),
-                    type = DnsServerType.valueOf(obj.getString("type")),
                     isEnabled = obj.getBoolean("isEnabled")
                 )
             }
@@ -224,7 +222,6 @@ class PreferencesManager(private val context: Context) {
                 put("id", server.id)
                 put("name", server.name)
                 put("address", server.address)
-                put("type", server.type.name)
                 put("isEnabled", server.isEnabled)
             }
             array.put(obj)
@@ -253,7 +250,6 @@ class PreferencesManager(private val context: Context) {
             id = "1",
             name = "Tencent DNS",
             address = "119.29.29.29",
-            type = DnsServerType.PLAIN,
             isEnabled = true
         ),
         // Tencent DNS (Secondary)
@@ -261,7 +257,6 @@ class PreferencesManager(private val context: Context) {
             id = "2",
             name = "Tencent DNS 2",
             address = "119.28.28.28",
-            type = DnsServerType.PLAIN,
             isEnabled = false
         ),
         // AliDNS (Primary)
@@ -269,7 +264,6 @@ class PreferencesManager(private val context: Context) {
             id = "3",
             name = "AliDNS",
             address = "223.5.5.5",
-            type = DnsServerType.PLAIN,
             isEnabled = true
         ),
         // AliDNS (Secondary)
@@ -277,17 +271,8 @@ class PreferencesManager(private val context: Context) {
             id = "4",
             name = "AliDNS 2",
             address = "223.6.6.6",
-            type = DnsServerType.PLAIN,
             isEnabled = false
         ),
-        // DNSPod DoH
-        DnsServer(
-            id = "5",
-            name = "DNSPod DoH",
-            address = "https://120.53.53.53/dns-query",
-            type = DnsServerType.DOH,
-            isEnabled = false
-        )
     )
 
     private fun getDefaultFilterLists(): List<FilterList> = listOf(

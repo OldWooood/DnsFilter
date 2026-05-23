@@ -13,7 +13,6 @@ import com.deatrg.dnsfilter.data.local.PreferencesManager
 import com.deatrg.dnsfilter.data.local.StatisticsBuffer
 import com.deatrg.dnsfilter.data.remote.DomainFilter
 import com.deatrg.dnsfilter.data.repository.FilterListRepositoryImpl
-import com.deatrg.dnsfilter.domain.model.DnsServerType
 import com.deatrg.dnsfilter.domain.model.DnsStatistics
 import com.deatrg.dnsfilter.service.DnsVpnService
 import kotlinx.coroutines.delay
@@ -120,7 +119,7 @@ class DashboardViewModel(
                 if (targetEnabled) {
                     // 1. 检查是否有启用的 DNS 服务器（直接从 preferences 读取当前值）
                     val enabledCount = preferencesManager.dnsServers.first().count {
-                        it.isEnabled && it.type != DnsServerType.DOT
+                        it.isEnabled
                     }
                     if (enabledCount == 0) {
                         _showNoDnsServersError.emit(Unit)
