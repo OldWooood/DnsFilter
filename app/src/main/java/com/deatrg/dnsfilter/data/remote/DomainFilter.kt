@@ -45,6 +45,12 @@ class DomainFilter(
 
     private val cacheVersionCounter = AtomicLong(0L)
 
+    // Incremented whenever blockedDomains is replaced. Observed by DnsVpnService
+    // to invalidate blocked response cache when blocklists change.
+    private val _blocklistVersion = MutableStateFlow(0L)
+    val blocklistVersion: StateFlow<Long> = _blocklistVersion.asStateFlow()
+    private val blocklistVersionCounter = AtomicLong(0L)
+
     private var filterListsToLoad: List<FilterList> = emptyList()
 
     /**
@@ -82,6 +88,7 @@ class DomainFilter(
         }
 
         blockedDomains = newBlockedDomains
+        _blocklistVersion.value = blocklistVersionCounter.incrementAndGet()
         _filterListCount.value = newBlockedDomains.size
 
         // 只要有数据就标记为已加载（允许部分列表失败）
@@ -193,6 +200,7 @@ class DomainFilter(
             }
 
             blockedDomains = newBlockedDomains
+            _blocklistVersion.value = blocklistVersionCounter.incrementAndGet()
             _filterListCount.value = newBlockedDomains.size
 
             val hasAnyData = newBlockedDomains.isNotEmpty()
@@ -235,6 +243,7 @@ class DomainFilter(
         }
 
         blockedDomains = newBlockedDomains
+        _blocklistVersion.value = blocklistVersionCounter.incrementAndGet()
         _filterListCount.value = newBlockedDomains.size
         _isLoaded.value = newBlockedDomains.isNotEmpty()
     }
@@ -280,8 +289,8 @@ class DomainFilter(
     }
 
     fun isDomainBlocked(domain: String): Boolean {
-        val normalizedDomain = domain.lowercase().trimEnd('.')
-        return blockedDomains.contains(normalizedDomain)
+        // domain is already normalized to lowercase by parseDnsQueryFromPacket
+        return blockedDomains.contains(domain)
     }
 
     /**
