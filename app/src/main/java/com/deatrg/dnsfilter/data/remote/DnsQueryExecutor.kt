@@ -44,7 +44,7 @@ class DnsQueryExecutor(
         private const val PREFETCH_REMAINING_TTL_MS = 10 * 1000L
         private const val PREFETCH_COOLDOWN_MS = 30 * 1000L
         private const val DNS_RESPONSE_BUFFER_SIZE = 2048
-        private const val UDP_SOCKET_POOL_SIZE = 4
+        private const val UDP_SOCKET_POOL_SIZE = 16
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())

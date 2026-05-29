@@ -112,7 +112,8 @@ fun parseDnsQueryFromPacket(
     if (qrBit != 0) return null
 
     val nameResult = readDnsNameFromPacket(packet, dnsStart, dnsStart + 12, packetLength) ?: return null
-    val domain = nameResult.first
+    // Normalize to lowercase once here, so callers don't need to re-lowercase
+    val domain = nameResult.first.lowercase().trimEnd('.')
     val offset = nameResult.second
     if (offset + 4 > packetLength) return null
 

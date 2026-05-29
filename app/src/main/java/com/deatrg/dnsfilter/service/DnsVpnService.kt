@@ -16,7 +16,7 @@ import com.deatrg.dnsfilter.data.remote.parseDnsQueryFromPacket
 import com.deatrg.dnsfilter.domain.model.DnsServer
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -24,6 +24,7 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InterruptedIOException
 import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ConcurrentHashMap
 
 class DnsVpnService : VpnService() {
 
@@ -68,6 +69,11 @@ class DnsVpnService : VpnService() {
 
     private fun obtainPacket(): ByteArray = packetPool.poll() ?: ByteArray(MTU)
     private fun recyclePacket(packet: ByteArray) { packetPool.offer(packet) }
+
+    // Cache blocked domain NXDOMAIN responses to avoid rebuilding for every query.
+    // Key format: "domain:qtype:qclass"
+    private val blockedResponseCache = ConcurrentHashMap<String, ByteArray>()
+    private fun blockedCacheKey(domain: String, qtype: Int, qclass: Int) = "$domain:$qtype:$qclass"
 
     private data class UpstreamTask(
         val packet: ByteArray,
@@ -146,6 +152,7 @@ class DnsVpnService : VpnService() {
             isRunning = true
             isServiceRunning = true
             startDnsServerTracking(prefsManager)
+            observeBlocklistChanges()
             startForeground(NOTIFICATION_ID, createNotification())
             scope.launch { runDnsLoop() }
             AppLog.d(TAG, "VPN established successfully")
@@ -163,6 +170,7 @@ class DnsVpnService : VpnService() {
         serversJob = null
         vpnInterface?.close()
         vpnInterface = null
+        blockedResponseCache.clear()
 
         try {
             runBlocking {
@@ -306,13 +314,27 @@ class DnsVpnService : VpnService() {
         if (dnsLength == 0) return true
         val question = parseDnsQueryFromPacket(packet, dnsStart, length) ?: return true
 
-        // 1. 检查拦截
+        // 1. 检查拦截（使用 NXDOMAIN 缓存避免重复构建）
         if (domainFilter?.isDomainBlocked(question.domain) == true) {
             AppLog.d(TAG) { "Domain ${question.domain} is blocked" }
             statisticsBuffer?.recordQuery(blocked = true, responseTime = 0, includeInAvg = false)
-            val response = buildBlockedDnsResponse(packet, dnsStart, length)
+            val cacheKey = blockedCacheKey(question.domain, question.qtype, question.qclass)
+            val cachedBlocked = blockedResponseCache[cacheKey]
+            val response = if (cachedBlocked != null) {
+                cachedBlocked
+            } else {
+                buildBlockedDnsResponse(packet, dnsStart, length).also {
+                    blockedResponseCache[cacheKey] = it
+                }
+            }
             if (dnsStart + response.size <= packet.size) {
+                val txId0 = packet[dnsStart]
+                val txId1 = packet[dnsStart + 1]
+                val rdBit = (packet[dnsStart + 2].toInt() and 0x01)
                 response.copyInto(packet, destinationOffset = dnsStart)
+                packet[dnsStart] = txId0
+                packet[dnsStart + 1] = txId1
+                packet[dnsStart + 2] = ((packet[dnsStart + 2].toInt() and 0xFE) or rdBit).toByte()
                 patchIPv4Response(packet, ihl, srcPort, response.size)
                 val responseLength = dnsStart + response.size
                 outputMutex.withLock {
@@ -397,13 +419,27 @@ class DnsVpnService : VpnService() {
         if (dnsLength == 0) return true
         val question = parseDnsQueryFromPacket(packet, dnsStart, length) ?: return true
 
-        // 1. 检查拦截
+        // 1. 检查拦截（使用 NXDOMAIN 缓存避免重复构建）
         if (domainFilter?.isDomainBlocked(question.domain) == true) {
             AppLog.d(TAG) { "Domain ${question.domain} is blocked" }
             statisticsBuffer?.recordQuery(blocked = true, responseTime = 0, includeInAvg = false)
-            val response = buildBlockedDnsResponse(packet, dnsStart, length)
+            val cacheKey = blockedCacheKey(question.domain, question.qtype, question.qclass)
+            val cachedBlocked = blockedResponseCache[cacheKey]
+            val response = if (cachedBlocked != null) {
+                cachedBlocked
+            } else {
+                buildBlockedDnsResponse(packet, dnsStart, length).also {
+                    blockedResponseCache[cacheKey] = it
+                }
+            }
             if (dnsStart + response.size <= packet.size) {
+                val txId0 = packet[dnsStart]
+                val txId1 = packet[dnsStart + 1]
+                val rdBit = (packet[dnsStart + 2].toInt() and 0x01)
                 response.copyInto(packet, destinationOffset = dnsStart)
+                packet[dnsStart] = txId0
+                packet[dnsStart + 1] = txId1
+                packet[dnsStart + 2] = ((packet[dnsStart + 2].toInt() and 0xFE) or rdBit).toByte()
                 patchIPv6Response(packet, srcPort, response.size)
                 val responseLength = dnsStart + response.size
                 outputMutex.withLock {
@@ -827,6 +863,15 @@ class DnsVpnService : VpnService() {
             preferencesManager.dnsServers.collect { updatedServers ->
                 servers = updatedServers.filter(::isSupportedDnsServer)
                 AppLog.d(TAG) { "Updated active DNS servers: ${servers.size}" }
+            }
+        }
+    }
+
+    private fun observeBlocklistChanges() {
+        scope.launch {
+            domainFilter?.blocklistVersion?.collect {
+                blockedResponseCache.clear()
+                AppLog.d(TAG) { "Blocked response cache cleared (blocklist version: $it)" }
             }
         }
     }
