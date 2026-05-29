@@ -25,6 +25,7 @@ class StatisticsBuffer(
     val statistics: StateFlow<DnsStatistics> = _statistics.asStateFlow()
 
     private var flushJob: Job? = null
+    private var uiUpdateJob: Job? = null
     private val lastUpdateTime = AtomicLong(0)
     private val isInitialized = AtomicBoolean(false)
 
@@ -66,7 +67,7 @@ class StatisticsBuffer(
             _queryCount.incrementAndGet()
         }
 
-        updateFlow()
+        ensureUiUpdateScheduled()
 
         // 启动定时 flush
         ensureFlushScheduled()
@@ -134,6 +135,15 @@ class StatisticsBuffer(
             flushJob = scope.launch {
                 delay(FLUSH_INTERVAL_MS)
                 flush()
+            }
+        }
+    }
+
+    private fun ensureUiUpdateScheduled() {
+        if (uiUpdateJob?.isActive != true) {
+            uiUpdateJob = scope.launch {
+                delay(UI_UPDATE_INTERVAL_MS)
+                updateFlow()
             }
         }
     }

@@ -28,7 +28,6 @@ class PreferencesManager(private val context: Context) {
     companion object {
         private val DNS_SERVERS = stringPreferencesKey("dns_servers")
         private val FILTER_LISTS = stringPreferencesKey("filter_lists")
-        private val FILTERING_ENABLED = booleanPreferencesKey("filtering_enabled")
         private val VPN_ENABLED = booleanPreferencesKey("vpn_enabled")
         private val STATS_TOTAL = longPreferencesKey("stats_total")
         private val STATS_BLOCKED = longPreferencesKey("stats_blocked")
@@ -70,10 +69,6 @@ class PreferencesManager(private val context: Context) {
         }
     }
 
-    val isFilteringEnabled: Flow<Boolean> = dataStore.data.map { prefs ->
-        prefs[FILTERING_ENABLED] ?: false
-    }
-
     val isVpnEnabled: Flow<Boolean> = dataStore.data.map { prefs ->
         prefs[VPN_ENABLED] ?: false
     }
@@ -100,12 +95,6 @@ class PreferencesManager(private val context: Context) {
     suspend fun saveFilterLists(lists: List<FilterList>) {
         dataStore.edit { prefs ->
             prefs[FILTER_LISTS] = filterListsToJson(lists)
-        }
-    }
-
-    suspend fun setFilteringEnabled(enabled: Boolean) {
-        dataStore.edit { prefs ->
-            prefs[FILTERING_ENABLED] = enabled
         }
     }
 
@@ -142,31 +131,6 @@ class PreferencesManager(private val context: Context) {
             totalResponseTime = prefs[STATS_RESPONSE_TOTAL] ?: 0,
             responseSampleCount = prefs[STATS_RESPONSE_SAMPLE_COUNT] ?: 0
         )
-    }
-
-    suspend fun incrementStats(blocked: Boolean, responseTime: Long) {
-        dataStore.edit { prefs ->
-            val total = (prefs[STATS_TOTAL] ?: 0) + 1
-            val blockedCount = (prefs[STATS_BLOCKED] ?: 0) + if (blocked) 1 else 0
-            val allowedCount = (prefs[STATS_ALLOWED] ?: 0) + if (!blocked) 1 else 0
-            val prevResponseTotal = prefs[STATS_RESPONSE_TOTAL] ?: 0L
-            val prevResponseSampleCount = prefs[STATS_RESPONSE_SAMPLE_COUNT] ?: 0L
-            val includeInAvg = !blocked
-            val newResponseTotal = if (includeInAvg) prevResponseTotal + responseTime else prevResponseTotal
-            val newResponseSampleCount = if (includeInAvg) prevResponseSampleCount + 1 else prevResponseSampleCount
-            val avgResponse = if (newResponseSampleCount > 0) {
-                newResponseTotal / newResponseSampleCount
-            } else {
-                0L
-            }
-
-            prefs[STATS_TOTAL] = total
-            prefs[STATS_BLOCKED] = blockedCount
-            prefs[STATS_ALLOWED] = allowedCount
-            prefs[STATS_AVG_RESPONSE] = avgResponse
-            prefs[STATS_RESPONSE_TOTAL] = newResponseTotal
-            prefs[STATS_RESPONSE_SAMPLE_COUNT] = newResponseSampleCount
-        }
     }
 
     suspend fun resetStatistics() {

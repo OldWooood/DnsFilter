@@ -3,6 +3,7 @@ package com.deatrg.dnsfilter.data.remote
 import com.deatrg.dnsfilter.AppLog
 import com.deatrg.dnsfilter.domain.model.DnsServer
 import com.deatrg.dnsfilter.data.remote.parseDnsQuestion
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -48,7 +49,7 @@ class DnsQueryExecutor(
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    // 每个服务器复用多个 UDP socket，减少重复创建/protect 开销，同时允许冷查询并发。
+    // Each server reuses a small UDP socket pool to avoid repeated create/protect cost.
     private class ReusableUdpSocket(
         val socket: DatagramSocket,
         val responseBuffer: ByteArray = ByteArray(DNS_RESPONSE_BUFFER_SIZE)
@@ -102,10 +103,10 @@ class DnsQueryExecutor(
     private val udpSocketPools = ConcurrentHashMap<String, UdpSocketPool>()
     private val serverAddressCache = ConcurrentHashMap<String, InetAddress>()
 
-    // DNS 响应缓存（最大 16384 条，TTL 10 分钟）
-    // 用 ConcurrentHashMap 替代 LinkedHashMap + synchronized，读操作完全无锁
+    // Response cache uses upstream TTLs with bounded stale fallback.
+    // ConcurrentHashMap keeps hot-path reads lock-free.
     private val dnsCache = ConcurrentHashMap<String, CachedDnsResponse>()
-    private val inFlightQueries = ConcurrentHashMap<String, kotlinx.coroutines.Deferred<DnsQueryResult>>()
+    private val inFlightQueries = ConcurrentHashMap<String, CompletableDeferred<DnsQueryResult>>()
     private val staleRefreshes = ConcurrentHashMap.newKeySet<String>()
 
     init {
@@ -373,7 +374,7 @@ class DnsQueryExecutor(
         qtype: Int = 1,
         qclass: Int = 1,
         timeoutMs: Long = 3000
-    ): DnsQueryResult = withContext(Dispatchers.IO) {
+    ): DnsQueryResult {
         val requestStart = System.currentTimeMillis()
         val cacheKey = getCacheKey(domain, qtype, qclass)
         val activeServers = servers.filter { it.isEnabled }
@@ -394,7 +395,7 @@ class DnsQueryExecutor(
                 now = System.currentTimeMillis()
             )
             AppLog.d(TAG) { "DNS cache hit: domain=$domain qtype=$qtype" }
-            return@withContext DnsQueryResult(
+            return DnsQueryResult(
                 success = true,
                 responseBytes = cacheLookup.response,
                 responseTime = 0,
@@ -418,7 +419,7 @@ class DnsQueryExecutor(
                 )
             }
             AppLog.d(TAG) { "DNS stale cache hit: domain=$domain qtype=$qtype" }
-            return@withContext DnsQueryResult(
+            return DnsQueryResult(
                 success = true,
                 responseBytes = cacheLookup.response,
                 responseTime = 0,
@@ -428,7 +429,7 @@ class DnsQueryExecutor(
         }
 
         if (activeServers.isEmpty()) {
-            return@withContext DnsQueryResult(
+            return DnsQueryResult(
                 success = false,
                 responseBytes = null,
                 responseTime = 0,
@@ -437,8 +438,20 @@ class DnsQueryExecutor(
         }
 
         val requestBytes = query.copyOfRange(queryOffset, queryOffset + queryLength)
-        val newQuery = scope.async {
-            queryUpstream(
+        val newQuery = CompletableDeferred<DnsQueryResult>()
+
+        val runningQuery = inFlightQueries.putIfAbsent(cacheKey, newQuery)
+        if (runningQuery != null) {
+            AppLog.d(TAG) { "DNS in-flight hit: domain=$domain qtype=$qtype" }
+            return runningQuery.await().forClient(
+                query = query,
+                queryOffset = queryOffset,
+                responseTime = System.currentTimeMillis() - requestStart
+            )
+        }
+
+        try {
+            val upstreamResult = queryUpstream(
                 cacheKey = cacheKey,
                 domain = domain,
                 servers = activeServers,
@@ -449,25 +462,15 @@ class DnsQueryExecutor(
                 qclass = qclass,
                 timeoutMs = timeoutMs
             )
-        }
-
-        val runningQuery = inFlightQueries.putIfAbsent(cacheKey, newQuery)
-        if (runningQuery != null) {
-            newQuery.cancel()
-            AppLog.d(TAG) { "DNS in-flight hit: domain=$domain qtype=$qtype" }
-            return@withContext runningQuery.await().forClient(
+            newQuery.complete(upstreamResult)
+            return upstreamResult.forClient(
                 query = query,
                 queryOffset = queryOffset,
                 responseTime = System.currentTimeMillis() - requestStart
             )
-        }
-
-        try {
-            return@withContext newQuery.await().forClient(
-                query = query,
-                queryOffset = queryOffset,
-                responseTime = System.currentTimeMillis() - requestStart
-            )
+        } catch (e: Throwable) {
+            newQuery.completeExceptionally(e)
+            throw e
         } finally {
             inFlightQueries.remove(cacheKey, newQuery)
         }
@@ -593,17 +596,6 @@ class DnsQueryExecutor(
             timeoutMs = timeoutMs
         )
     }
-
-    private suspend fun queryServer(
-        request: ByteArray,
-        requestOffset: Int,
-        requestLength: Int,
-        server: DnsServer,
-        timeoutMs: Long,
-        expectedDomain: String,
-        expectedQtype: Int,
-        expectedQclass: Int
-    ): DnsQueryResult = queryPlainDns(request, requestOffset, requestLength, server.address, timeoutMs, expectedDomain, expectedQtype, expectedQclass)
 
     private suspend fun queryPlainDns(
         request: ByteArray,
