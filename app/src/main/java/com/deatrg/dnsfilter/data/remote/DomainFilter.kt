@@ -142,9 +142,9 @@ class DomainFilter(
     }
 
     /**
-     * 手动触发加载（用于首次启动时下载）
-     * @param forceReload 是否强制重新下载（忽略 24 小时缓存检查）
-     * 返回 true 表示可以开始拦截（有数据或空列表都视为成功）
+     * Load enabled filter lists from cache, downloading missing or expired lists.
+     * @param forceReload Force a download and skip the 24-hour cache freshness check.
+     * @return true when usable blocklist data is available.
      */
     suspend fun loadFilterLists(forceReload: Boolean = false): Boolean = withContext(Dispatchers.IO) {
         if (_isLoading.value) return@withContext _isLoaded.value
@@ -195,8 +195,6 @@ class DomainFilter(
             blockedDomains = newBlockedDomains
             _filterListCount.value = newBlockedDomains.size
 
-            // 只要有至少一个列表加载成功，或所有列表都有旧缓存，就视为成功
-            // 允许部分列表失败，但至少要有一个列表的缓存
             val hasAnyData = newBlockedDomains.isNotEmpty()
             _isLoaded.value = hasAnyData
 
@@ -206,15 +204,6 @@ class DomainFilter(
             _isLoading.value = false
             _downloadProgress.value = null
         }
-    }
-
-    /**
-     * 重新加载单个过滤列表（用于添加新列表后）
-     */
-    suspend fun reloadFilterList(filterList: FilterList) = withContext(Dispatchers.IO) {
-        // 下载并更新
-        downloadFilterList(filterList)
-        reloadAllFromCache()
     }
 
     /**

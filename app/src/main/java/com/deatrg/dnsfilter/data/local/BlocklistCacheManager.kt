@@ -16,7 +16,7 @@ class BlocklistCacheManager(private val context: Context) {
     companion object {
         private const val CACHE_DIR = "blocklist_cache"
         private const val META_FILE = "cache_meta.json"
-        private const val UPDATE_INTERVAL_HOURS = 24L // 24小时自动更新一次
+        private const val UPDATE_INTERVAL_HOURS = 24L // Cache freshness window; manual refresh bypasses this.
         
         // 缓存元数据
         private data class CacheMeta(
@@ -123,23 +123,6 @@ class BlocklistCacheManager(private val context: Context) {
     suspend fun clearCache(filterList: FilterList) = withContext(Dispatchers.IO) {
         getCacheFile(filterList.id).delete()
         removeMeta(filterList.url)
-    }
-
-    /**
-     * 清除所有缓存
-     */
-    suspend fun clearAllCache() = withContext(Dispatchers.IO) {
-        cacheDir.listFiles()?.forEach { it.delete() }
-        synchronized(metaLock) {
-            metaCache = mutableMapOf()
-        }
-    }
-
-    /**
-     * 获取缓存大小
-     */
-    fun getCacheSize(): Long {
-        return cacheDir.listFiles()?.sumOf { it.length() } ?: 0
     }
 
     private fun updateMeta(filterList: FilterList, domainCount: Int) {

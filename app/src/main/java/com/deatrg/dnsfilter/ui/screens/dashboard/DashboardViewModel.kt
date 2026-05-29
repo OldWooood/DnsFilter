@@ -31,6 +31,7 @@ class DashboardViewModel(
         private const val TAG = "DashboardViewModel"
         private const val VPN_STATE_TIMEOUT_MS = 5000L
         private const val POLL_INTERVAL_MS = 1000L
+        private const val VPN_STATE_CHECK_INTERVAL_MS = 100L
     }
 
     // VPN实际运行状态（从Service读取）
@@ -135,7 +136,7 @@ class DashboardViewModel(
                         return@launch
                     }
 
-                    // 2. 启动 VPN
+                    // 3. 启动 VPN
                     val intent = Intent(appContext, DnsVpnService::class.java).apply {
                         action = DnsVpnService.ACTION_START
                     }
@@ -205,7 +206,7 @@ class DashboardViewModel(
                 _isVpnActuallyRunning.value = targetState
                 return true
             }
-            delay(POLL_INTERVAL_MS)
+            delay(VPN_STATE_CHECK_INTERVAL_MS)
         }
         _isVpnActuallyRunning.value = DnsVpnService.isServiceRunning
         return false
