@@ -35,7 +35,7 @@ class DnsVpnService : VpnService() {
         const val NOTIFICATION_ID = 1
         const val MTU = 1500
         const val DNS_PORT = 53
-        private const val UPSTREAM_QUEUE_CAPACITY = 256
+        private const val UPSTREAM_QUEUE_CAPACITY = 1024
         private const val SLOW_WORKER_COUNT = 8
         // 虚拟DNS服务器地址（应该与VPN接口地址不同）
         const val VPN_DNS_V4 = "10.10.10.10"
@@ -59,7 +59,7 @@ class DnsVpnService : VpnService() {
     private var serversJob: Job? = null
 
     // Upstream DNS queries mostly wait on IO, so keep this worker count modest.
-    private val slowWorkerCount = SLOW_WORKER_COUNT
+    private val slowWorkerCount: Int get() = Runtime.getRuntime().availableProcessors().coerceIn(4, 16) * 2
 
     // Serialize writes to the VPN descriptor without blocking dispatcher threads.
     private val outputMutex = Mutex()
@@ -387,9 +387,19 @@ class DnsVpnService : VpnService() {
             isIPv6 = false,
             ipHeaderLength = ihl
         )
-        val result = upstreamQueue.trySend(task)
-        if (!result.isSuccess) {
-            upstreamQueue.send(task)
+        if (!upstreamQueue.trySend(task).isSuccess) {
+            // Queue full: return SERVFAIL immediately instead of blocking the main loop
+            statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
+            val servfail = buildErrorDnsResponse(packet, dnsStart, length, 0x0002)
+            if (dnsStart + servfail.size <= packet.size) {
+                servfail.copyInto(packet, destinationOffset = dnsStart)
+                patchIPv4Response(packet, ihl, srcPort, servfail.size)
+                val responseLength = dnsStart + servfail.size
+                outputMutex.withLock {
+                    outputStream.write(packet, 0, responseLength)
+                }
+            }
+            return true
         }
         return false
     }
@@ -489,9 +499,18 @@ class DnsVpnService : VpnService() {
             isIPv6 = true,
             ipHeaderLength = ipv6HeaderLength
         )
-        val result = upstreamQueue.trySend(task)
-        if (!result.isSuccess) {
-            upstreamQueue.send(task)
+        if (!upstreamQueue.trySend(task).isSuccess) {
+            statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
+            val servfail = buildErrorDnsResponse(packet, dnsStart, length, 0x0002)
+            if (dnsStart + servfail.size <= packet.size) {
+                servfail.copyInto(packet, destinationOffset = dnsStart)
+                patchIPv6Response(packet, srcPort, servfail.size)
+                val responseLength = dnsStart + servfail.size
+                outputMutex.withLock {
+                    outputStream.write(packet, 0, responseLength)
+                }
+            }
+            return true
         }
         return false
     }
@@ -662,30 +681,9 @@ class DnsVpnService : VpnService() {
         packet[udpOff + 4] = ((udpLength shr 8) and 0xFF).toByte()
         packet[udpOff + 5] = (udpLength and 0xFF).toByte()
 
-        // Zero UDP checksum then recalculate using personalDnsfilter approach
+        // Skip UDP checksum for IPv4 (RFC 768: zero means "not computed", receiver should not verify)
         packet[udpOff + 6] = 0
         packet[udpOff + 7] = 0
-
-        // personalDnsfilter trick: temporarily modify IPv4 header bytes 8-11 to pseudo-header
-        val saved8 = packet[8]
-        val saved9 = packet[9]
-        val saved10 = packet[10]
-        val saved11 = packet[11]
-
-        packet[8] = 0      // zero field in pseudo header
-        packet[9] = 17     // protocol = UDP
-        packet[10] = ((udpLength shr 8) and 0xFF).toByte()
-        packet[11] = (udpLength and 0xFF).toByte()
-
-        val udpChecksum = computeGenericChecksum(packet, 8, totalLength - 8)
-
-        packet[8] = saved8
-        packet[9] = saved9
-        packet[10] = saved10
-        packet[11] = saved11
-
-        packet[udpOff + 6] = ((udpChecksum shr 8) and 0xFF).toByte()
-        packet[udpOff + 7] = (udpChecksum and 0xFF).toByte()
     }
 
     private fun patchIPv6Response(packet: ByteArray, srcPort: Int, dnsResponseLength: Int) {
