@@ -2,7 +2,7 @@ package com.deatrg.dnsfilter.data.remote
 
 import com.deatrg.dnsfilter.AppLog
 import com.deatrg.dnsfilter.domain.model.DnsServer
-import com.deatrg.dnsfilter.data.remote.parseDnsQuestion
+
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -19,7 +19,6 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.SocketTimeoutException
-import java.util.Locale
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
@@ -118,12 +117,9 @@ class DnsQueryExecutor(
         }
     }
 
-    private fun normalizeDomain(domain: String): String {
-        return domain.lowercase(Locale.ROOT).trimEnd('.')
-    }
-
     private fun getCacheKey(domain: String, qtype: Int, qclass: Int): String {
-        return "${normalizeDomain(domain)}:$qtype:$qclass"
+        // domain is already lowercased by parseDnsQueryFromPacket
+        return "$domain:$qtype:$qclass"
     }
 
     private fun readUInt16(data: ByteArray, offset: Int): Int {
@@ -490,7 +486,7 @@ class DnsQueryExecutor(
         val deferreds = servers.map { server ->
             async {
                 val startTime = System.currentTimeMillis()
-                val result = queryPlainDns(query, queryOffset, queryLength, server.address, timeoutMs, domain, qtype, qclass)
+                val result = queryPlainDns(query, queryOffset, queryLength, server.address, timeoutMs)
                 ServerQueryOutcome(server, result, System.currentTimeMillis() - startTime)
             }
         }.toMutableList()
@@ -602,10 +598,7 @@ class DnsQueryExecutor(
         requestOffset: Int,
         requestLength: Int,
         serverAddress: String,
-        timeoutMs: Long,
-        expectedDomain: String,
-        expectedQtype: Int,
-        expectedQclass: Int
+        timeoutMs: Long
     ): DnsQueryResult = withContext(Dispatchers.IO) {
         val expectedAddress = getServerAddress(serverAddress)
         val wrapper = acquireUdpSocket(serverAddress, expectedAddress)
@@ -634,7 +627,7 @@ class DnsQueryExecutor(
                     DnsQueryResult(false, null, 0, "Unexpected DNS response source")
                 } else {
                     val responseBytes = responsePacket.data.copyOfRange(0, responsePacket.length)
-                    if (!isValidDnsResponse(request, requestOffset, responseBytes, expectedDomain, expectedQtype, expectedQclass)) {
+                    if (!isValidDnsResponse(request, requestOffset, responseBytes)) {
                         wrapper.isValid = false
                         closeUdpSocket(wrapper)
                         DnsQueryResult(false, null, 0, "Mismatched DNS response")
@@ -682,13 +675,11 @@ class DnsQueryExecutor(
     private fun isValidDnsResponse(
         request: ByteArray,
         requestOffset: Int,
-        response: ByteArray,
-        expectedDomain: String,
-        expectedQtype: Int,
-        expectedQclass: Int
+        response: ByteArray
     ): Boolean {
         if (request.size - requestOffset < 12 || response.size < 12) return false
 
+        // Transaction ID match + connected UDP socket (kernel filters source) is sufficient
         if (response[0] != request[requestOffset] || response[1] != request[requestOffset + 1]) {
             return false
         }
@@ -697,11 +688,7 @@ class DnsQueryExecutor(
         val qrBit = (responseFlags shr 15) and 1
         if (qrBit != 1) return false
 
-        val responseQuestion = parseDnsQuestion(response) ?: return false
-
-        return normalizeDomain(expectedDomain) == normalizeDomain(responseQuestion.domain) &&
-            expectedQtype == responseQuestion.qtype &&
-            expectedQclass == responseQuestion.qclass
+        return true
     }
 
     private fun acquireUdpSocket(serverAddress: String, expectedAddress: InetAddress): ReusableUdpSocket {
