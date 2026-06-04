@@ -5,9 +5,7 @@ import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.*
 import androidx.datastore.preferences.preferencesDataStore
 import com.deatrg.dnsfilter.domain.model.DnsServer
-import com.deatrg.dnsfilter.domain.model.DnsStatistics
 import com.deatrg.dnsfilter.domain.model.FilterList
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import org.json.JSONArray
@@ -19,22 +17,10 @@ class PreferencesManager(private val context: Context) {
 
     private val dataStore = context.dataStore
 
-    data class StatisticsState(
-        val statistics: DnsStatistics,
-        val totalResponseTime: Long,
-        val responseSampleCount: Long
-    )
-
     companion object {
         private val DNS_SERVERS = stringPreferencesKey("dns_servers")
         private val FILTER_LISTS = stringPreferencesKey("filter_lists")
         private val VPN_ENABLED = booleanPreferencesKey("vpn_enabled")
-        private val STATS_TOTAL = longPreferencesKey("stats_total")
-        private val STATS_BLOCKED = longPreferencesKey("stats_blocked")
-        private val STATS_ALLOWED = longPreferencesKey("stats_allowed")
-        private val STATS_AVG_RESPONSE = longPreferencesKey("stats_avg_response")
-        private val STATS_RESPONSE_TOTAL = longPreferencesKey("stats_response_total")
-        private val STATS_RESPONSE_SAMPLE_COUNT = longPreferencesKey("stats_response_sample_count")
     }
 
     val dnsServers: Flow<List<DnsServer>> = dataStore.data.map { prefs ->
@@ -73,15 +59,6 @@ class PreferencesManager(private val context: Context) {
         prefs[VPN_ENABLED] ?: false
     }
 
-    val statistics: Flow<DnsStatistics> = dataStore.data.map { prefs ->
-        DnsStatistics(
-            totalQueries = prefs[STATS_TOTAL] ?: 0,
-            blockedQueries = prefs[STATS_BLOCKED] ?: 0,
-            allowedQueries = prefs[STATS_ALLOWED] ?: 0,
-            averageResponseTime = prefs[STATS_AVG_RESPONSE] ?: 0
-        )
-    }
-
     suspend fun saveDnsServers(servers: List<DnsServer>) {
         dataStore.edit { prefs ->
             prefs[DNS_SERVERS] = serversToJson(servers)
@@ -101,46 +78,6 @@ class PreferencesManager(private val context: Context) {
     suspend fun setVpnEnabled(enabled: Boolean) {
         dataStore.edit { prefs ->
             prefs[VPN_ENABLED] = enabled
-        }
-    }
-
-    suspend fun updateStatistics(
-        stats: DnsStatistics,
-        totalResponseTime: Long,
-        responseSampleCount: Long
-    ) {
-        dataStore.edit { prefs ->
-            prefs[STATS_TOTAL] = stats.totalQueries
-            prefs[STATS_BLOCKED] = stats.blockedQueries
-            prefs[STATS_ALLOWED] = stats.allowedQueries
-            prefs[STATS_AVG_RESPONSE] = stats.averageResponseTime
-            prefs[STATS_RESPONSE_TOTAL] = totalResponseTime
-            prefs[STATS_RESPONSE_SAMPLE_COUNT] = responseSampleCount
-        }
-    }
-
-    suspend fun getStatisticsState(): StatisticsState {
-        val prefs = dataStore.data.first()
-        return StatisticsState(
-            statistics = DnsStatistics(
-                totalQueries = prefs[STATS_TOTAL] ?: 0,
-                blockedQueries = prefs[STATS_BLOCKED] ?: 0,
-                allowedQueries = prefs[STATS_ALLOWED] ?: 0,
-                averageResponseTime = prefs[STATS_AVG_RESPONSE] ?: 0
-            ),
-            totalResponseTime = prefs[STATS_RESPONSE_TOTAL] ?: 0,
-            responseSampleCount = prefs[STATS_RESPONSE_SAMPLE_COUNT] ?: 0
-        )
-    }
-
-    suspend fun resetStatistics() {
-        dataStore.edit { prefs ->
-            prefs[STATS_TOTAL] = 0L
-            prefs[STATS_BLOCKED] = 0L
-            prefs[STATS_ALLOWED] = 0L
-            prefs[STATS_AVG_RESPONSE] = 0L
-            prefs[STATS_RESPONSE_TOTAL] = 0L
-            prefs[STATS_RESPONSE_SAMPLE_COUNT] = 0L
         }
     }
 

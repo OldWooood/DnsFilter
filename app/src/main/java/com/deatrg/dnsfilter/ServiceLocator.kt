@@ -73,7 +73,6 @@ object ServiceLocator {
     fun provideStatisticsBuffer(): StatisticsBuffer {
         return statisticsBuffer ?: synchronized(this) {
             statisticsBuffer ?: StatisticsBuffer(
-                providePreferencesManager(),
                 scope
             ).also { statisticsBuffer = it }
         }
