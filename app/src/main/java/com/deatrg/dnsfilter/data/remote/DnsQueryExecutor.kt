@@ -261,8 +261,7 @@ class DnsQueryExecutor(
     private fun skipQuestionSection(response: ByteArray, questionCount: Int): Int? {
         var offset = 12
         repeat(questionCount) {
-            val name = readDnsName(response, offset, response.size) ?: return null
-            offset = name.second + 4
+            offset = (skipDnsName(response, offset, response.size) ?: return null) + 4
             if (offset > response.size) return null
         }
         return offset
@@ -308,8 +307,7 @@ class DnsQueryExecutor(
     }
 
     private fun readDnsRecordHeader(response: ByteArray, offset: Int): DnsRecordHeader? {
-        val name = readDnsName(response, offset, response.size) ?: return null
-        val headerOffset = name.second
+        val headerOffset = skipDnsName(response, offset, response.size) ?: return null
         if (headerOffset + 10 > response.size) return null
 
         val type = readUInt16(response, headerOffset)
@@ -330,12 +328,12 @@ class DnsQueryExecutor(
 
     private fun readSoaMinimumTtl(response: ByteArray, record: DnsRecordHeader): Long? {
         val rdataEnd = record.rdataOffset + record.rdataLength
-        val mname = readDnsName(response, record.rdataOffset, response.size) ?: return null
-        if (mname.second > rdataEnd) return null
-        val rname = readDnsName(response, mname.second, response.size) ?: return null
-        if (rname.second > rdataEnd) return null
+        val mnameEnd = skipDnsName(response, record.rdataOffset, response.size) ?: return null
+        if (mnameEnd > rdataEnd) return null
+        val rnameEnd = skipDnsName(response, mnameEnd, response.size) ?: return null
+        if (rnameEnd > rdataEnd) return null
 
-        val minimumOffset = rname.second + 16
+        val minimumOffset = rnameEnd + 16
         if (minimumOffset + 4 > rdataEnd) return null
         return readUInt32(response, minimumOffset)
     }
@@ -444,7 +442,8 @@ class DnsQueryExecutor(
             return runningQuery.await().forClient(
                 query = query,
                 queryOffset = queryOffset,
-                responseTime = System.currentTimeMillis() - requestStart
+                responseTime = System.currentTimeMillis() - requestStart,
+                patchResponse = true
             )
         }
 
@@ -465,7 +464,8 @@ class DnsQueryExecutor(
             return upstreamResult.forClient(
                 query = query,
                 queryOffset = queryOffset,
-                responseTime = System.currentTimeMillis() - requestStart
+                responseTime = System.currentTimeMillis() - requestStart,
+                patchResponse = false
             )
         } catch (e: Throwable) {
             newQuery.completeExceptionally(e)
@@ -743,10 +743,14 @@ class DnsQueryExecutor(
     private fun DnsQueryResult.forClient(
         query: ByteArray,
         queryOffset: Int,
-        responseTime: Long
+        responseTime: Long,
+        patchResponse: Boolean
     ): DnsQueryResult {
         val response = responseBytes
         if (!success || response == null) {
+            return copy(responseTime = responseTime)
+        }
+        if (!patchResponse) {
             return copy(responseTime = responseTime)
         }
         return copy(
