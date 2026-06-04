@@ -9,7 +9,6 @@ import kotlinx.coroutines.flow.*
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.BufferedReader
-import java.util.BitSet
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
@@ -20,52 +19,6 @@ class DomainFilter(
 
     companion object {
         private const val TAG = "DomainFilter"
-        private const val BLOOM_FPP = 0.01
-        private const val BLOOM_MIN_SIZE = 10_000
-    }
-
-    private class BloomFilter(expectedInsertions: Int, private val falsePositiveRate: Double) {
-        private val bitSize: Int = run {
-            val ln2 = Math.log(2.0)
-            val lnP = Math.log(falsePositiveRate)
-            val raw = -expectedInsertions.toDouble() * lnP / (ln2 * ln2)
-            if (raw.isFinite().not() || raw <= 64.0) 64
-            else if (raw >= 1_000_000_000.0) 1_000_000_000
-            else raw.toInt()
-        }
-        private val numHashFunctions: Int = run {
-            val raw = Math.log(2.0) * bitSize / expectedInsertions.toDouble()
-            if (raw.isFinite().not() || raw <= 1.0) 1
-            else if (raw >= 64.0) 64
-            else raw.toInt()
-        }
-        private val bits = BitSet(bitSize)
-
-        private fun hashPair(value: String): Pair<Int, Int> {
-            val h = value.hashCode()
-            return Pair(h, h xor (h ushr 16))
-        }
-
-        fun put(value: String) {
-            val (h1, h2) = hashPair(value)
-            var h = h1.toLong() and 0xFFFFFFFFL
-            val inc = h2.toLong() and 0xFFFFFFFFL
-            for (i in 0 until numHashFunctions) {
-                bits.set((h % bitSize).toInt())
-                h = (h + inc) and 0xFFFFFFFFL
-            }
-        }
-
-        fun mightContain(value: String): Boolean {
-            val (h1, h2) = hashPair(value)
-            var h = h1.toLong() and 0xFFFFFFFFL
-            val inc = h2.toLong() and 0xFFFFFFFFL
-            for (i in 0 until numHashFunctions) {
-                if (!bits.get((h % bitSize).toInt())) return false
-                h = (h + inc) and 0xFFFFFFFFL
-            }
-            return true
-        }
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -73,9 +26,6 @@ class DomainFilter(
 
     @Volatile
     private var blockedDomains: Set<String> = emptySet()
-
-    @Volatile
-    private var bloomFilter: BloomFilter? = null
 
     private val _isLoaded = MutableStateFlow(false)
     val isLoaded: StateFlow<Boolean> = _isLoaded.asStateFlow()
@@ -115,7 +65,6 @@ class DomainFilter(
         _downloadProgress.value = null
         _filterListCount.value = 0
         blockedDomains = emptySet()
-        rebuildBloomFilter()
 
         // 如果没有启用的过滤列表，直接标记为已加载（空 blocklist 是合法状态）
         if (filterListsToLoad.isEmpty()) {
@@ -250,9 +199,8 @@ class DomainFilter(
                 _downloadProgress.value = Pair(downloadedCount.get(), filterListsToLoad.size)
             }
 
-blockedDomains = newBlockedDomains
-        rebuildBloomFilter()
-        _blocklistVersion.value = blocklistVersionCounter.incrementAndGet()
+            blockedDomains = newBlockedDomains
+            _blocklistVersion.value = blocklistVersionCounter.incrementAndGet()
             _filterListCount.value = newBlockedDomains.size
 
             val hasAnyData = newBlockedDomains.isNotEmpty()
@@ -295,7 +243,6 @@ blockedDomains = newBlockedDomains
         }
 
         blockedDomains = newBlockedDomains
-        rebuildBloomFilter()
         _blocklistVersion.value = blocklistVersionCounter.incrementAndGet()
         _filterListCount.value = newBlockedDomains.size
         _isLoaded.value = newBlockedDomains.isNotEmpty()
@@ -342,18 +289,7 @@ blockedDomains = newBlockedDomains
     }
 
     fun isDomainBlocked(domain: String): Boolean {
-        val bloom = bloomFilter
-        if (bloom != null && !bloom.mightContain(domain)) return false
         return blockedDomains.contains(domain)
-    }
-
-    private fun rebuildBloomFilter() {
-        val domains = blockedDomains
-        bloomFilter = if (domains.size >= 1000) {
-            BloomFilter(domains.size, BLOOM_FPP).also { bf ->
-                domains.forEach { bf.put(it) }
-            }
-        } else null
     }
 
     /**
