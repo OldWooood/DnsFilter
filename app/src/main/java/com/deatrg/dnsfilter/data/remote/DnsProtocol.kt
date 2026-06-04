@@ -3,7 +3,8 @@ package com.deatrg.dnsfilter.data.remote
 data class DnsQuestion(
     val domain: String,
     val qtype: Int,
-    val qclass: Int
+    val qclass: Int,
+    val questionEndOffset: Int = 0
 )
 
 private fun appendLowercaseAscii(builder: StringBuilder, data: ByteArray, offset: Int, length: Int) {
@@ -53,6 +54,27 @@ fun readDnsName(data: ByteArray, offset: Int, length: Int): Pair<String, Int>? {
 
     if (name.isEmpty()) return null
     return Pair(name.toString(), nextOffset)
+}
+
+fun skipDnsName(data: ByteArray, offset: Int, length: Int): Int? {
+    var idx = offset
+    var jumps = 0
+
+    while (idx < length) {
+        val len = data[idx].toInt() and 0xFF
+        if (len == 0) return idx + 1
+        if ((len and 0xC0) == 0xC0) {
+            if (idx + 1 >= length) return null
+            jumps++
+            if (jumps > 8) return null
+            return idx + 2
+        }
+        idx++
+        if (idx + len > length) return null
+        idx += len
+    }
+
+    return null
 }
 
 /**
@@ -131,7 +153,7 @@ fun parseDnsQueryFromPacket(
             (packet[offset + 1].toInt() and 0xFF)
     val qclass = ((packet[offset + 2].toInt() and 0xFF) shl 8) or
             (packet[offset + 3].toInt() and 0xFF)
-    return DnsQuestion(domain, qtype, qclass)
+    return DnsQuestion(domain, qtype, qclass, offset + 4)
 }
 
 fun parseDnsQuestion(data: ByteArray): DnsQuestion? {

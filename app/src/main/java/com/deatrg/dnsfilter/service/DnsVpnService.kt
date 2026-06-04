@@ -16,7 +16,7 @@ import com.deatrg.dnsfilter.data.remote.parseDnsQueryFromPacket
 import com.deatrg.dnsfilter.domain.model.DnsServer
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -24,7 +24,6 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InterruptedIOException
 import java.util.concurrent.ArrayBlockingQueue
-import java.util.concurrent.ConcurrentHashMap
 
 class DnsVpnService : VpnService() {
 
@@ -69,11 +68,6 @@ class DnsVpnService : VpnService() {
 
     private fun obtainPacket(): ByteArray = packetPool.poll() ?: ByteArray(MTU)
     private fun recyclePacket(packet: ByteArray) { packetPool.offer(packet) }
-
-    // Cache blocked domain NXDOMAIN responses to avoid rebuilding for every query.
-    // Key format: "domain:qtype:qclass"
-    private val blockedResponseCache = ConcurrentHashMap<String, ByteArray>()
-    private fun blockedCacheKey(domain: String, qtype: Int, qclass: Int) = "$domain:$qtype:$qclass"
 
     private data class UpstreamTask(
         val packet: ByteArray,
@@ -152,7 +146,6 @@ class DnsVpnService : VpnService() {
             isRunning = true
             isServiceRunning = true
             startDnsServerTracking(prefsManager)
-            observeBlocklistChanges()
             startForeground(NOTIFICATION_ID, createNotification())
             scope.launch { runDnsLoop() }
             AppLog.d(TAG, "VPN established successfully")
@@ -170,7 +163,6 @@ class DnsVpnService : VpnService() {
         serversJob = null
         vpnInterface?.close()
         vpnInterface = null
-        blockedResponseCache.clear()
 
         try {
             runBlocking {
@@ -318,28 +310,11 @@ class DnsVpnService : VpnService() {
         if (domainFilter?.isDomainBlocked(question.domain) == true) {
             AppLog.d(TAG) { "Domain ${question.domain} is blocked" }
             statisticsBuffer?.recordQuery(blocked = true, responseTime = 0, includeInAvg = false)
-            val cacheKey = blockedCacheKey(question.domain, question.qtype, question.qclass)
-            val cachedBlocked = blockedResponseCache[cacheKey]
-            val response = if (cachedBlocked != null) {
-                cachedBlocked
-            } else {
-                buildBlockedDnsResponse(packet, dnsStart, length).also {
-                    blockedResponseCache[cacheKey] = it
-                }
-            }
-            if (dnsStart + response.size <= packet.size) {
-                val txId0 = packet[dnsStart]
-                val txId1 = packet[dnsStart + 1]
-                val rdBit = (packet[dnsStart + 2].toInt() and 0x01)
-                response.copyInto(packet, destinationOffset = dnsStart)
-                packet[dnsStart] = txId0
-                packet[dnsStart + 1] = txId1
-                packet[dnsStart + 2] = ((packet[dnsStart + 2].toInt() and 0xFE) or rdBit).toByte()
-                patchIPv4Response(packet, ihl, srcPort, response.size)
-                val responseLength = dnsStart + response.size
-                outputMutex.withLock {
-                    outputStream.write(packet, 0, responseLength)
-                }
+            val dnsResponseLength = patchDnsErrorResponse(packet, dnsStart, question.questionEndOffset, 0x0003)
+            patchIPv4Response(packet, ihl, srcPort, dnsResponseLength)
+            val responseLength = dnsStart + dnsResponseLength
+            outputMutex.withLock {
+                outputStream.write(packet, 0, responseLength)
             }
             return true
         }
@@ -390,14 +365,11 @@ class DnsVpnService : VpnService() {
         if (!upstreamQueue.trySend(task).isSuccess) {
             // Queue full: return SERVFAIL immediately instead of blocking the main loop
             statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
-            val servfail = buildErrorDnsResponse(packet, dnsStart, length, 0x0002)
-            if (dnsStart + servfail.size <= packet.size) {
-                servfail.copyInto(packet, destinationOffset = dnsStart)
-                patchIPv4Response(packet, ihl, srcPort, servfail.size)
-                val responseLength = dnsStart + servfail.size
-                outputMutex.withLock {
-                    outputStream.write(packet, 0, responseLength)
-                }
+            val dnsResponseLength = patchDnsErrorResponse(packet, dnsStart, question.questionEndOffset, 0x0002)
+            patchIPv4Response(packet, ihl, srcPort, dnsResponseLength)
+            val responseLength = dnsStart + dnsResponseLength
+            outputMutex.withLock {
+                outputStream.write(packet, 0, responseLength)
             }
             return true
         }
@@ -433,28 +405,11 @@ class DnsVpnService : VpnService() {
         if (domainFilter?.isDomainBlocked(question.domain) == true) {
             AppLog.d(TAG) { "Domain ${question.domain} is blocked" }
             statisticsBuffer?.recordQuery(blocked = true, responseTime = 0, includeInAvg = false)
-            val cacheKey = blockedCacheKey(question.domain, question.qtype, question.qclass)
-            val cachedBlocked = blockedResponseCache[cacheKey]
-            val response = if (cachedBlocked != null) {
-                cachedBlocked
-            } else {
-                buildBlockedDnsResponse(packet, dnsStart, length).also {
-                    blockedResponseCache[cacheKey] = it
-                }
-            }
-            if (dnsStart + response.size <= packet.size) {
-                val txId0 = packet[dnsStart]
-                val txId1 = packet[dnsStart + 1]
-                val rdBit = (packet[dnsStart + 2].toInt() and 0x01)
-                response.copyInto(packet, destinationOffset = dnsStart)
-                packet[dnsStart] = txId0
-                packet[dnsStart + 1] = txId1
-                packet[dnsStart + 2] = ((packet[dnsStart + 2].toInt() and 0xFE) or rdBit).toByte()
-                patchIPv6Response(packet, srcPort, response.size)
-                val responseLength = dnsStart + response.size
-                outputMutex.withLock {
-                    outputStream.write(packet, 0, responseLength)
-                }
+            val dnsResponseLength = patchDnsErrorResponse(packet, dnsStart, question.questionEndOffset, 0x0003)
+            patchIPv6Response(packet, srcPort, dnsResponseLength)
+            val responseLength = dnsStart + dnsResponseLength
+            outputMutex.withLock {
+                outputStream.write(packet, 0, responseLength)
             }
             return true
         }
@@ -501,14 +456,11 @@ class DnsVpnService : VpnService() {
         )
         if (!upstreamQueue.trySend(task).isSuccess) {
             statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
-            val servfail = buildErrorDnsResponse(packet, dnsStart, length, 0x0002)
-            if (dnsStart + servfail.size <= packet.size) {
-                servfail.copyInto(packet, destinationOffset = dnsStart)
-                patchIPv6Response(packet, srcPort, servfail.size)
-                val responseLength = dnsStart + servfail.size
-                outputMutex.withLock {
-                    outputStream.write(packet, 0, responseLength)
-                }
+            val dnsResponseLength = patchDnsErrorResponse(packet, dnsStart, question.questionEndOffset, 0x0002)
+            patchIPv6Response(packet, srcPort, dnsResponseLength)
+            val responseLength = dnsStart + dnsResponseLength
+            outputMutex.withLock {
+                outputStream.write(packet, 0, responseLength)
             }
             return true
         }
@@ -522,7 +474,7 @@ class DnsVpnService : VpnService() {
         if (servers.isEmpty()) {
             AppLog.e(TAG, "No DNS servers available")
             statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
-            writeResponseAndPatch(task, buildErrorDnsResponse(task.packet, task.dnsStart, task.length, 0x0002), outputStream)
+            writeErrorResponse(task, outputStream, 0x0002)
             return
         }
 
@@ -545,7 +497,28 @@ class DnsVpnService : VpnService() {
         } else {
             AppLog.e(TAG) { "DNS query failed: ${result?.error}" }
             statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
-            writeResponseAndPatch(task, buildErrorDnsResponse(task.packet, task.dnsStart, task.length, 0x0002), outputStream)
+            writeErrorResponse(task, outputStream, 0x0002)
+        }
+    }
+
+    private suspend fun writeErrorResponse(
+        task: UpstreamTask,
+        outputStream: FileOutputStream,
+        errorCode: Int
+    ) {
+        val dnsResponseLength = patchDnsErrorResponse(task.packet, task.dnsStart, task.question.questionEndOffset, errorCode)
+        if (task.isIPv6) {
+            patchIPv6Response(task.packet, task.srcPort, dnsResponseLength)
+        } else {
+            patchIPv4Response(task.packet, task.ipHeaderLength, task.srcPort, dnsResponseLength)
+        }
+        val responseLength = if (task.isIPv6) {
+            40 + 8 + dnsResponseLength
+        } else {
+            task.ipHeaderLength + 8 + dnsResponseLength
+        }
+        outputMutex.withLock {
+            outputStream.write(task.packet, 0, responseLength)
         }
     }
 
@@ -581,65 +554,27 @@ class DnsVpnService : VpnService() {
         }
     }
 
-    private fun buildBlockedDnsResponse(packet: ByteArray, dnsStart: Int, packetLength: Int): ByteArray {
-        return buildErrorDnsResponse(packet, dnsStart, packetLength, 0x0003)
-    }
-
-    private fun buildErrorDnsResponse(packet: ByteArray, dnsStart: Int, packetLength: Int, errorCode: Int): ByteArray {
-        val response = ByteArray(512)
-        var pos = 0
-
-        // Transaction ID
-        response[pos++] = packet[dnsStart]
-        response[pos++] = packet[dnsStart + 1]
-
-        // Flags: Response, preserve RD, error code
-        val rdBit = (packet[dnsStart + 2].toInt() and 0x01)
-        response[pos++] = (0x80 or rdBit).toByte()
-        response[pos++] = (0x80 or (errorCode and 0x0F)).toByte()
+    private fun patchDnsErrorResponse(
+        packet: ByteArray,
+        dnsStart: Int,
+        questionEndOffset: Int,
+        errorCode: Int
+    ): Int {
+        val rdBit = packet[dnsStart + 2].toInt() and 0x01
+        packet[dnsStart + 2] = (0x80 or rdBit).toByte()
+        packet[dnsStart + 3] = (0x80 or (errorCode and 0x0F)).toByte()
 
         // QDCOUNT = 1; ANCOUNT, NSCOUNT and ARCOUNT = 0.
-        response[pos++] = 0x00
-        response[pos++] = 0x01
-        response[pos++] = 0x00
-        response[pos++] = 0x00
-        response[pos++] = 0x00
-        response[pos++] = 0x00
-        response[pos++] = 0x00
-        response[pos++] = 0x00
+        packet[dnsStart + 4] = 0
+        packet[dnsStart + 5] = 1
+        packet[dnsStart + 6] = 0
+        packet[dnsStart + 7] = 0
+        packet[dnsStart + 8] = 0
+        packet[dnsStart + 9] = 0
+        packet[dnsStart + 10] = 0
+        packet[dnsStart + 11] = 0
 
-        // Copy question section
-        var offset = dnsStart + 12
-        while (offset < packetLength) {
-            val len = packet[offset].toInt() and 0xFF
-            if (pos >= response.size) return response.copyOf(pos)
-            response[pos++] = packet[offset]
-            if (len == 0) {
-                offset++
-                break
-            }
-            if ((len and 0xC0) == 0xC0) {
-                if (offset + 1 >= packetLength || pos >= response.size) return response.copyOf(pos)
-                response[pos++] = packet[offset + 1]
-                offset += 2
-                break
-            }
-            for (i in 0 until len) {
-                if (offset + 1 + i >= packetLength || pos >= response.size) return response.copyOf(pos)
-                response[pos++] = packet[offset + 1 + i]
-            }
-            offset += 1 + len
-        }
-
-        // Copy QTYPE and QCLASS
-        if (offset + 4 <= packetLength) {
-            for (i in 0 until 4) {
-                if (pos >= response.size) return response.copyOf(pos)
-                response[pos++] = packet[offset + i]
-            }
-        }
-
-        return response.copyOf(pos)
+        return questionEndOffset - dnsStart
     }
 
     private fun patchIPv4Response(packet: ByteArray, ipHeaderLength: Int, srcPort: Int, dnsResponseLength: Int) {
@@ -861,15 +796,6 @@ class DnsVpnService : VpnService() {
             preferencesManager.dnsServers.collect { updatedServers ->
                 servers = updatedServers.filter(::isSupportedDnsServer)
                 AppLog.d(TAG) { "Updated active DNS servers: ${servers.size}" }
-            }
-        }
-    }
-
-    private fun observeBlocklistChanges() {
-        scope.launch {
-            domainFilter?.blocklistVersion?.collect {
-                blockedResponseCache.clear()
-                AppLog.d(TAG) { "Blocked response cache cleared (blocklist version: $it)" }
             }
         }
     }
