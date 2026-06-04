@@ -85,9 +85,6 @@ class DashboardViewModel(
         }
 
         // 加载统计信息初始值
-        viewModelScope.launch {
-            statisticsBuffer.loadInitialValues()
-        }
 
         // 初始化：从本地缓存加载 blocklist（不下载）
         viewModelScope.launch {
@@ -164,7 +161,6 @@ class DashboardViewModel(
                     if (success) {
                         preferencesManager.setVpnEnabled(false)
                         // 刷新统计信息到磁盘
-                        statisticsBuffer.flush()
                         AppLog.d(TAG, "VPN stopped successfully")
                     } else {
                         AppLog.e(TAG, "VPN stop timeout")
@@ -233,9 +229,6 @@ class DashboardViewModel(
     override fun onCleared() {
         super.onCleared()
         // ViewModel 销毁时刷新统计信息
-        viewModelScope.launch {
-            statisticsBuffer.flush()
-        }
     }
 
     class Factory(private val application: Application) : ViewModelProvider.Factory {

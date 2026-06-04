@@ -164,16 +164,6 @@ class DnsVpnService : VpnService() {
         vpnInterface?.close()
         vpnInterface = null
 
-        try {
-            runBlocking {
-                withContext(NonCancellable + Dispatchers.IO) {
-                    statisticsBuffer?.flush()
-                }
-            }
-        } catch (e: Exception) {
-            AppLog.e(TAG, "Failed to flush statistics", e)
-        }
-
         scope.cancel()
         dnsQueryExecutor?.shutdown()
         stopForeground(STOP_FOREGROUND_REMOVE)
