@@ -657,8 +657,14 @@ class DnsVpnService : VpnService() {
      */
     private fun computeIpv6UdpChecksum(packet: ByteArray, totalLength: Int): Int {
         // 保存 IPv6 header 前 8 bytes
-        val saved = ByteArray(8)
-        for (i in 0 until 8) saved[i] = packet[i]
+        val saved0 = packet[0]
+        val saved1 = packet[1]
+        val saved2 = packet[2]
+        val saved3 = packet[3]
+        val saved4 = packet[4]
+        val saved5 = packet[5]
+        val saved6 = packet[6]
+        val saved7 = packet[7]
 
         val udpLength = totalLength - 40
 
@@ -677,7 +683,14 @@ class DnsVpnService : VpnService() {
         val checksum = computeGenericChecksum(packet, 0, totalLength)
 
         // 恢复原 header
-        for (i in 0 until 8) packet[i] = saved[i]
+        packet[0] = saved0
+        packet[1] = saved1
+        packet[2] = saved2
+        packet[3] = saved3
+        packet[4] = saved4
+        packet[5] = saved5
+        packet[6] = saved6
+        packet[7] = saved7
 
         return if (checksum == 0) 0xFFFF else checksum
     }

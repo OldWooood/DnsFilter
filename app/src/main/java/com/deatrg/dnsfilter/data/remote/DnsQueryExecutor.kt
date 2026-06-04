@@ -205,7 +205,7 @@ class DnsQueryExecutor(
         val policy = getCachePolicy(response) ?: return
         val now = System.currentTimeMillis()
         dnsCache[cacheKey] = CachedDnsResponse(
-            response = response.copyOf(),
+            response = response,
             expiresAtMs = now + policy.ttlMs,
             staleUntilMs = now + policy.ttlMs + policy.staleMs,
             isNegative = policy.isNegative
@@ -374,7 +374,7 @@ class DnsQueryExecutor(
     ): DnsQueryResult {
         val requestStart = System.currentTimeMillis()
         val cacheKey = getCacheKey(domain, qtype, qclass)
-        val activeServers = servers.filter { it.isEnabled }
+        val activeServers = servers
 
         val cacheLookup = getCacheLookup(domain, qtype, qclass, query, queryOffset)
         if (cacheLookup?.isStale == false) {
@@ -448,14 +448,13 @@ class DnsQueryExecutor(
         }
 
         try {
-            val requestBytes = query.copyOfRange(queryOffset, queryOffset + queryLength)
             val upstreamResult = queryUpstream(
                 cacheKey = cacheKey,
                 domain = domain,
                 servers = activeServers,
-                query = requestBytes,
-                queryOffset = 0,
-                queryLength = requestBytes.size,
+                query = query,
+                queryOffset = queryOffset,
+                queryLength = queryLength,
                 qtype = qtype,
                 qclass = qclass,
                 timeoutMs = timeoutMs
