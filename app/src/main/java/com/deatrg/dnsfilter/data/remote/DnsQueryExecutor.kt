@@ -53,6 +53,9 @@ class DnsQueryExecutor(
         val socket: DatagramSocket,
         val responseBuffer: ByteArray = ByteArray(DNS_RESPONSE_BUFFER_SIZE)
     ) {
+        val requestPacket: DatagramPacket = DatagramPacket(ByteArray(0), 0)
+        val responsePacket: DatagramPacket = DatagramPacket(responseBuffer, responseBuffer.size)
+
         @Volatile
         var isValid = true
     }
@@ -153,7 +156,7 @@ class DnsQueryExecutor(
                     cacheKey = key,
                     domain = domain,
                     cached = cached,
-                    servers = servers.filter { it.isEnabled },
+                    servers = servers,
                     query = query,
                     queryOffset = queryOffset,
                     queryLength = queryLength,
@@ -433,7 +436,6 @@ class DnsQueryExecutor(
             )
         }
 
-        val requestBytes = query.copyOfRange(queryOffset, queryOffset + queryLength)
         val newQuery = CompletableDeferred<DnsQueryResult>()
 
         val runningQuery = inFlightQueries.putIfAbsent(cacheKey, newQuery)
@@ -447,6 +449,7 @@ class DnsQueryExecutor(
         }
 
         try {
+            val requestBytes = query.copyOfRange(queryOffset, queryOffset + queryLength)
             val upstreamResult = queryUpstream(
                 cacheKey = cacheKey,
                 domain = domain,
@@ -615,10 +618,12 @@ class DnsQueryExecutor(
             val result = try {
                 wrapper.socket.soTimeout = timeoutMs.toInt()
 
-                val requestPacket = DatagramPacket(request, requestOffset, requestLength)
-                wrapper.socket.send(requestPacket)
+                wrapper.requestPacket.setData(request, requestOffset, requestLength)
+                wrapper.socket.send(wrapper.requestPacket)
 
-                val responsePacket = DatagramPacket(wrapper.responseBuffer, wrapper.responseBuffer.size)
+                wrapper.responsePacket.setData(wrapper.responseBuffer, 0, wrapper.responseBuffer.size)
+                wrapper.responsePacket.length = wrapper.responseBuffer.size
+                val responsePacket = wrapper.responsePacket
                 wrapper.socket.receive(responsePacket)
 
                 if (!isExpectedResponseSource(responsePacket, expectedAddress)) {
