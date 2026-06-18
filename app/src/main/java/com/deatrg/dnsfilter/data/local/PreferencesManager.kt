@@ -179,8 +179,8 @@ class PreferencesManager(private val context: Context) {
     private fun getDefaultFilterLists(): List<FilterList> = listOf(
         FilterList(
             id = "1",
-            name = "NeoDevHost",
-            url = "https://neodev.team/domain",
+            name = "Anti-Ad",
+            url = "https://anti-ad.net/domains.txt",
             isEnabled = true,
             isBuiltIn = true
         )
