@@ -6,7 +6,6 @@ import kotlinx.coroutines.flow.Flow
 
 interface DnsServerRepository {
     val dnsServers: Flow<List<DnsServer>>
-    suspend fun saveDnsServers(servers: List<DnsServer>)
     suspend fun addDnsServer(server: DnsServer)
     suspend fun updateDnsServer(server: DnsServer)
     suspend fun deleteDnsServer(serverId: String)
@@ -20,7 +19,6 @@ interface FilterListRepository {
     val isLoading: Flow<Boolean>
     val cacheVersion: Flow<Long>
     val enabledDnsServerCount: Flow<Int>
-    suspend fun saveFilterLists(lists: List<FilterList>)
     suspend fun addFilterList(list: FilterList)
     suspend fun updateFilterList(list: FilterList)
     suspend fun deleteFilterList(listId: String)

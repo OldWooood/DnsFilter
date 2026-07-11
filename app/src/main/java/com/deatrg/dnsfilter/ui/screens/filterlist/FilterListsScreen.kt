@@ -1,30 +1,66 @@
 package com.deatrg.dnsfilter.ui.screens.filterlist
 
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material.icons.outlined.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.FilterAlt
+import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.FilledTonalIconButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.deatrg.dnsfilter.R
 import com.deatrg.dnsfilter.domain.model.FilterList
-import androidx.compose.ui.res.pluralStringResource
-import androidx.compose.ui.res.stringResource
+import com.deatrg.dnsfilter.ui.components.AppPanel
+import com.deatrg.dnsfilter.ui.components.EmptyState
+import com.deatrg.dnsfilter.ui.components.PageHeader
+import com.deatrg.dnsfilter.ui.components.StatusDot
 import java.text.SimpleDateFormat
-import java.util.*
+import java.util.Date
+import java.util.Locale
 
 @Composable
 fun FilterListsScreen(
@@ -38,74 +74,89 @@ fun FilterListsScreen(
     var filterListToDelete by remember { mutableStateOf<FilterList?>(null) }
 
     Scaffold(
-        floatingActionButton = {
-            Column(
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-                horizontalAlignment = Alignment.End
-            ) {
-                FloatingActionButton(
-                    onClick = { if (!isLoading) viewModel.refreshLists() },
-                    shape = RoundedCornerShape(18.dp),
-                    containerColor = MaterialTheme.colorScheme.secondaryContainer,
-                    contentColor = MaterialTheme.colorScheme.onSecondaryContainer
-                ) {
-                    if (isLoading) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(24.dp),
-                            strokeWidth = 2.5.dp
-                        )
-                    } else {
-                        Icon(
-                            Icons.Default.Refresh,
-                            contentDescription = stringResource(R.string.filter_list_manual_update)
-                        )
-                    }
-                }
-                FloatingActionButton(
-                    onClick = { showAddDialog = true },
-                    shape = RoundedCornerShape(18.dp),
-                    containerColor = MaterialTheme.colorScheme.primary,
-                    contentColor = MaterialTheme.colorScheme.onPrimary
-                ) {
-                    Icon(Icons.Default.Add, contentDescription = stringResource(R.string.filter_list_add))
-                }
-            }
-        }
+        containerColor = MaterialTheme.colorScheme.background,
+        contentWindowInsets = WindowInsets(0, 0, 0, 0)
     ) { padding ->
-        Column(
+        LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(padding)
-                .padding(horizontal = 20.dp)
+                .padding(padding),
+            contentPadding = PaddingValues(start = 20.dp, top = 24.dp, end = 20.dp, bottom = 28.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            // Header - fixed
-            HeaderSection(
-                filterCount = filterCount,
-                isLoaded = isLoaded
-            )
+            item {
+                PageHeader(
+                    eyebrow = stringResource(R.string.filter_lists_eyebrow),
+                    title = stringResource(R.string.filter_lists_title),
+                    actions = {
+                        FilledTonalIconButton(
+                            onClick = { if (!isLoading) viewModel.refreshLists() },
+                            enabled = !isLoading
+                        ) {
+                            Icon(Icons.Outlined.Refresh, contentDescription = stringResource(R.string.filter_list_manual_update))
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        FilledIconButton(onClick = { showAddDialog = true }) {
+                            Icon(Icons.Outlined.Add, contentDescription = stringResource(R.string.filter_list_add))
+                        }
+                    }
+                )
+            }
 
-            // Filter list - scrollable
-            LazyColumn(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
+            item {
+                AppPanel {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            StatusDot(isLoaded)
+                            Spacer(Modifier.width(10.dp))
+                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Text(
+                                    if (isLoaded) {
+                                        pluralStringResource(R.plurals.filter_lists_domains_blocked, filterCount, filterCount)
+                                    } else {
+                                        stringResource(R.string.filter_lists_loading)
+                                    },
+                                    style = MaterialTheme.typography.titleMedium
+                                )
+                                Text(
+                                    pluralStringResource(
+                                        R.plurals.filter_lists_source_summary,
+                                        filterLists.size,
+                                        filterLists.size
+                                    ),
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                        AnimatedVisibility(isLoading) {
+                            CircularProgressIndicator(modifier = Modifier.size(22.dp), strokeWidth = 2.dp)
+                        }
+                    }
+                }
+            }
+
+            if (filterLists.isEmpty()) {
+                item {
+                    EmptyState(
+                        icon = Icons.Outlined.FilterAlt,
+                        title = stringResource(R.string.filter_lists_empty_title),
+                        supportingText = stringResource(R.string.filter_lists_empty_hint)
+                    )
+                }
+            } else {
                 items(filterLists, key = { it.filterList.id }) { item ->
-                    FilterListCard(
+                    FilterListRow(
                         item = item,
                         onToggle = { viewModel.toggleFilterList(item.filterList) },
                         onDelete = { filterListToDelete = item.filterList }
                     )
                 }
-
-                if (filterLists.isEmpty()) {
-                    item {
-                        EmptyStateCard()
-                    }
-                }
             }
-
-            // Bottom spacing for FAB
-            Spacer(modifier = Modifier.height(16.dp))
         }
     }
 
@@ -113,7 +164,7 @@ fun FilterListsScreen(
         AddFilterListDialog(
             onDismiss = { showAddDialog = false },
             onAdd = { name, url ->
-                viewModel.addFilterList(name, url)
+                viewModel.addFilterList(name.trim(), url.trim())
                 showAddDialog = false
             }
         )
@@ -122,13 +173,8 @@ fun FilterListsScreen(
     filterListToDelete?.let { filterList ->
         AlertDialog(
             onDismissRequest = { filterListToDelete = null },
-            shape = RoundedCornerShape(28.dp),
-            title = {
-                Text(
-                    stringResource(R.string.filter_list_delete_title),
-                    fontWeight = FontWeight.Bold
-                )
-            },
+            shape = RoundedCornerShape(24.dp),
+            title = { Text(stringResource(R.string.filter_list_delete_title), style = MaterialTheme.typography.headlineMedium) },
             text = { Text(stringResource(R.string.filter_list_delete_message, filterList.name)) },
             confirmButton = {
                 TextButton(
@@ -150,181 +196,86 @@ fun FilterListsScreen(
 }
 
 @Composable
-private fun HeaderSection(
-    filterCount: Int,
-    isLoaded: Boolean
-) {
-    Text(
-        text = stringResource(R.string.filter_lists_title),
-        style = MaterialTheme.typography.headlineLarge,
-        fontWeight = FontWeight.ExtraBold,
-        modifier = Modifier.padding(top = 20.dp, bottom = 4.dp),
-        color = MaterialTheme.colorScheme.onBackground
-    )
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(bottom = 16.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Text(
-            text = if (isLoaded) {
-                pluralStringResource(R.plurals.filter_lists_domains_blocked, filterCount, filterCount)
-            } else {
-                stringResource(R.string.filter_lists_loading)
-            },
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-        if (!isLoaded) {
-            CircularProgressIndicator(
-                modifier = Modifier.size(18.dp),
-                strokeWidth = 2.dp
-            )
-        }
-    }
-}
-
-@Composable
-private fun EmptyStateCard() {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(24.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceContainer
-        ),
-        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(32.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(64.dp)
-                    .clip(RoundedCornerShape(20.dp))
-                    .background(
-                        Brush.linearGradient(
-                            colors = listOf(
-                                MaterialTheme.colorScheme.error.copy(alpha = 0.15f),
-                                MaterialTheme.colorScheme.error.copy(alpha = 0.08f)
-                            )
-                        )
-                    ),
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(
-                    Icons.Default.Block,
-                    contentDescription = null,
-                    modifier = Modifier.size(32.dp),
-                    tint = MaterialTheme.colorScheme.error
-                )
-            }
-            Spacer(modifier = Modifier.height(16.dp))
-            Text(
-                stringResource(R.string.filter_lists_empty_title),
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-            Text(
-                text = stringResource(R.string.filter_lists_empty_hint),
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
-    }
-}
-
-@Composable
-private fun FilterListCard(
+private fun FilterListRow(
     item: FilterListUiModel,
     onToggle: () -> Unit,
     onDelete: () -> Unit
 ) {
-    val dateFormat = remember { SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.getDefault()) }
     val filterList = item.filterList
+    val dateFormat = remember { SimpleDateFormat("yyyy/MM/dd · HH:mm", Locale.getDefault()) }
 
-    Card(
+    Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceContainer
-        ),
-        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+        color = MaterialTheme.colorScheme.surface,
+        tonalElevation = 1.dp
     ) {
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
+            modifier = Modifier.padding(start = 16.dp, top = 15.dp, end = 10.dp, bottom = 15.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Column(modifier = Modifier.weight(1f)) {
+            Box(
+                modifier = Modifier
+                    .size(44.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(
+                        if (filterList.isEnabled) MaterialTheme.colorScheme.primaryContainer
+                        else MaterialTheme.colorScheme.surfaceVariant
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    Icons.Outlined.FilterAlt,
+                    contentDescription = null,
+                    tint = if (filterList.isEnabled) MaterialTheme.colorScheme.onPrimaryContainer
+                    else MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Spacer(Modifier.width(14.dp))
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        text = filterList.name,
+                        filterList.name,
                         style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
                     )
                     if (filterList.isBuiltIn) {
-                        Spacer(modifier = Modifier.width(8.dp))
-                        SuggestionChip(
-                            onClick = { },
-                            label = {
-                                Text(
-                                    stringResource(R.string.filter_list_built_in),
-                                    style = MaterialTheme.typography.labelSmall,
-                                    fontWeight = FontWeight.Medium
-                                )
-                            },
-                            colors = SuggestionChipDefaults.suggestionChipColors(
-                                containerColor = MaterialTheme.colorScheme.secondaryContainer,
-                                labelColor = MaterialTheme.colorScheme.onSecondaryContainer
-                            ),
-                            border = null
+                        Spacer(Modifier.width(7.dp))
+                        Text(
+                            stringResource(R.string.filter_list_built_in).uppercase(),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary
                         )
                     }
                 }
-                Spacer(modifier = Modifier.height(6.dp))
                 Text(
-                    text = filterList.url,
+                    filterList.url,
                     style = MaterialTheme.typography.bodyMedium,
+                    fontFamily = FontFamily.Monospace,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
-                if (item.lastUpdated != null) {
-                    Spacer(modifier = Modifier.height(4.dp))
+                item.lastUpdated?.let {
                     Text(
-                        text = stringResource(R.string.filter_list_updated, dateFormat.format(Date(item.lastUpdated))),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                        stringResource(R.string.filter_list_updated, dateFormat.format(Date(it))),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-            }
-            IconButton(onClick = onToggle) {
-                Icon(
-                    imageVector = if (filterList.isEnabled) Icons.Filled.Shield else Icons.Outlined.Shield,
-                    contentDescription = if (filterList.isEnabled) stringResource(R.string.filter_list_enabled) else stringResource(R.string.filter_list_disabled),
-                    tint = if (filterList.isEnabled)
-                        MaterialTheme.colorScheme.primary
-                    else
-                        MaterialTheme.colorScheme.error.copy(alpha = 0.7f),
-                    modifier = Modifier.size(28.dp)
-                )
             }
             if (!filterList.isBuiltIn) {
                 IconButton(onClick = onDelete) {
                     Icon(
                         Icons.Outlined.Delete,
                         contentDescription = stringResource(R.string.filter_list_delete),
-                        tint = MaterialTheme.colorScheme.error.copy(alpha = 0.7f)
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }
+            Switch(checked = filterList.isEnabled, onCheckedChange = { onToggle() })
         }
     }
 }
@@ -336,25 +287,21 @@ private fun AddFilterListDialog(
 ) {
     var name by remember { mutableStateOf("") }
     var url by remember { mutableStateOf("") }
+    val focusManager = LocalFocusManager.current
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        shape = RoundedCornerShape(28.dp),
-        title = {
-            Text(
-                stringResource(R.string.filter_list_add),
-                fontWeight = FontWeight.Bold
-            )
-        },
+        shape = RoundedCornerShape(24.dp),
+        title = { Text(stringResource(R.string.filter_list_add), style = MaterialTheme.typography.headlineMedium) },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
                 OutlinedTextField(
                     value = name,
                     onValueChange = { name = it },
                     label = { Text(stringResource(R.string.filter_list_name)) },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(16.dp)
+                    shape = RoundedCornerShape(14.dp)
                 )
                 OutlinedTextField(
                     value = url,
@@ -363,28 +310,28 @@ private fun AddFilterListDialog(
                     placeholder = { Text(stringResource(R.string.filter_list_url_placeholder)) },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(16.dp)
+                    shape = RoundedCornerShape(14.dp)
                 )
                 Text(
-                    text = stringResource(R.string.filter_list_format_hint),
-                    style = MaterialTheme.typography.bodySmall,
+                    stringResource(R.string.filter_list_format_hint),
+                    style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
         },
         confirmButton = {
             Button(
-                onClick = { onAdd(name, url) },
-                enabled = name.isNotBlank() && url.isNotBlank(),
-                shape = RoundedCornerShape(14.dp)
+                onClick = {
+                    focusManager.clearFocus()
+                    onAdd(name, url)
+                },
+                enabled = name.isNotBlank() && url.isNotBlank()
             ) {
                 Text(stringResource(R.string.action_add))
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text(stringResource(R.string.action_cancel))
-            }
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.action_cancel)) }
         }
     )
 }

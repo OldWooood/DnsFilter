@@ -15,47 +15,6 @@ private fun appendLowercaseAscii(builder: StringBuilder, data: ByteArray, offset
     }
 }
 
-fun readDnsName(data: ByteArray, offset: Int, length: Int): Pair<String, Int>? {
-    val name = StringBuilder(64)
-    var idx = offset
-    var jumped = false
-    var nextOffset = offset
-    var jumps = 0
-
-    while (idx < length) {
-        val len = data[idx].toInt() and 0xFF
-        if (len == 0) {
-            if (!jumped) {
-                nextOffset = idx + 1
-            }
-            break
-        }
-        if ((len and 0xC0) == 0xC0) {
-            if (idx + 1 >= length) return null
-            val pointer = ((len and 0x3F) shl 8) or (data[idx + 1].toInt() and 0xFF)
-            if (!jumped) {
-                nextOffset = idx + 2
-            }
-            idx = pointer
-            jumped = true
-            jumps++
-            if (jumps > 8) return null
-            continue
-        }
-        idx++
-        if (idx + len > length) return null
-        if (name.isNotEmpty()) name.append('.')
-        appendLowercaseAscii(name, data, idx, len)
-        idx += len
-        if (!jumped) {
-            nextOffset = idx
-        }
-    }
-
-    if (name.isEmpty()) return null
-    return Pair(name.toString(), nextOffset)
-}
-
 fun skipDnsName(data: ByteArray, offset: Int, length: Int): Int? {
     var idx = offset
     var jumps = 0
@@ -154,20 +113,4 @@ fun parseDnsQueryFromPacket(
     val qclass = ((packet[offset + 2].toInt() and 0xFF) shl 8) or
             (packet[offset + 3].toInt() and 0xFF)
     return DnsQuestion(domain, qtype, qclass, offset + 4)
-}
-
-fun parseDnsQuestion(data: ByteArray): DnsQuestion? {
-    if (data.size < 12) return null
-
-    val questionCount = ((data[4].toInt() and 0xFF) shl 8) or (data[5].toInt() and 0xFF)
-    if (questionCount < 1) return null
-
-    val nameResult = readDnsName(data, 12, data.size) ?: return null
-    val domain = nameResult.first
-    val offset = nameResult.second
-    if (offset + 4 > data.size) return null
-
-    val qtype = ((data[offset].toInt() and 0xFF) shl 8) or (data[offset + 1].toInt() and 0xFF)
-    val qclass = ((data[offset + 2].toInt() and 0xFF) shl 8) or (data[offset + 3].toInt() and 0xFF)
-    return DnsQuestion(domain, qtype, qclass)
 }

@@ -22,13 +22,6 @@ object AppLog {
     }
 
     @JvmStatic
-    fun d(tag: String, msg: String, tr: Throwable) {
-        if (BuildConfig.DEBUG) {
-            Log.d(tag, msg, tr)
-        }
-    }
-
-    @JvmStatic
     fun e(tag: String, msg: String) {
         if (BuildConfig.DEBUG) {
             Log.e(tag, msg)
@@ -61,10 +54,4 @@ object AppLog {
         }
     }
 
-    @JvmStatic
-    fun i(tag: String, msg: String) {
-        if (BuildConfig.DEBUG) {
-            Log.i(tag, msg)
-        }
-    }
 }

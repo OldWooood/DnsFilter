@@ -1,27 +1,59 @@
 package com.deatrg.dnsfilter.ui.screens.dnsserver
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material.icons.outlined.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.Dns
+import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.deatrg.dnsfilter.R
 import com.deatrg.dnsfilter.domain.model.DnsServer
-import androidx.compose.ui.res.stringResource
+import com.deatrg.dnsfilter.ui.components.AppPanel
+import com.deatrg.dnsfilter.ui.components.EmptyState
+import com.deatrg.dnsfilter.ui.components.PageHeader
+import com.deatrg.dnsfilter.ui.components.StatusDot
 
 @Composable
 fun DnsServersScreen(
@@ -29,60 +61,78 @@ fun DnsServersScreen(
 ) {
     val servers by viewModel.dnsServers.collectAsStateWithLifecycle(initialValue = emptyList())
     var showAddDialog by remember { mutableStateOf(false) }
+    val enabledCount = servers.count { it.isEnabled }
 
     Scaffold(
-        floatingActionButton = {
-            FloatingActionButton(
-                onClick = { showAddDialog = true },
-                shape = RoundedCornerShape(18.dp),
-                containerColor = MaterialTheme.colorScheme.primary,
-                contentColor = MaterialTheme.colorScheme.onPrimary
-            ) {
-                Icon(Icons.Default.Add, contentDescription = stringResource(R.string.dns_server_add))
-            }
-        }
+        containerColor = MaterialTheme.colorScheme.background,
+        contentWindowInsets = WindowInsets(0, 0, 0, 0)
     ) { padding ->
-        Column(
+        LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(padding)
-                .padding(horizontal = 20.dp)
+                .padding(padding),
+            contentPadding = PaddingValues(start = 20.dp, top = 24.dp, end = 20.dp, bottom = 28.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            // Header - fixed
-            HeaderSection()
+            item {
+                PageHeader(
+                    eyebrow = stringResource(R.string.dns_servers_eyebrow),
+                    title = stringResource(R.string.dns_servers_title),
+                    supportingText = stringResource(R.string.dns_servers_subtitle),
+                    actions = {
+                        FilledIconButton(onClick = { showAddDialog = true }) {
+                            Icon(Icons.Outlined.Add, contentDescription = stringResource(R.string.dns_server_add))
+                        }
+                    }
+                )
+            }
 
-            // Server list - scrollable
-            LazyColumn(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
+            item {
+                AppPanel {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            StatusDot(enabledCount > 0)
+                            Spacer(Modifier.width(10.dp))
+                            Text(
+                                pluralStringResource(
+                                    R.plurals.dns_servers_enabled_summary,
+                                    enabledCount,
+                                    enabledCount,
+                                    servers.size
+                                ),
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                        }
+                        TextButton(onClick = { viewModel.resetToDefaults() }) {
+                            Icon(Icons.Outlined.Refresh, contentDescription = null, modifier = Modifier.size(17.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text(stringResource(R.string.dns_servers_reset_defaults))
+                        }
+                    }
+                }
+            }
+
+            if (servers.isEmpty()) {
+                item {
+                    EmptyState(
+                        icon = Icons.Outlined.Dns,
+                        title = stringResource(R.string.dns_servers_empty_title),
+                        supportingText = stringResource(R.string.dns_servers_empty_hint)
+                    )
+                }
+            } else {
                 items(servers, key = { it.id }) { server ->
-                    DnsServerCard(
+                    DnsServerRow(
                         server = server,
                         onToggle = { viewModel.toggleServer(server) },
                         onDelete = { viewModel.deleteServer(server.id) }
                     )
                 }
-
-                if (servers.isEmpty()) {
-                    item {
-                        EmptyStateCard()
-                    }
-                }
             }
-
-            // Reset button - fixed at bottom
-            Spacer(modifier = Modifier.height(8.dp))
-            OutlinedButton(
-                onClick = { viewModel.resetToDefaults() },
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp)
-            ) {
-                Icon(Icons.Default.Refresh, contentDescription = null)
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(stringResource(R.string.dns_servers_reset_defaults))
-            }
-            Spacer(modifier = Modifier.height(8.dp))
         }
     }
 
@@ -90,7 +140,7 @@ fun DnsServersScreen(
         AddDnsServerDialog(
             onDismiss = { showAddDialog = false },
             onAdd = { name, address ->
-                viewModel.addServer(name, address)
+                viewModel.addServer(name.trim(), address.trim())
                 showAddDialog = false
             }
         )
@@ -98,128 +148,59 @@ fun DnsServersScreen(
 }
 
 @Composable
-private fun HeaderSection() {
-    Text(
-        text = stringResource(R.string.dns_servers_title),
-        style = MaterialTheme.typography.headlineLarge,
-        fontWeight = FontWeight.ExtraBold,
-        modifier = Modifier.padding(top = 20.dp, bottom = 4.dp),
-        color = MaterialTheme.colorScheme.onBackground
-    )
-    Text(
-        text = stringResource(R.string.dns_servers_subtitle),
-        style = MaterialTheme.typography.bodyMedium,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-        modifier = Modifier.padding(bottom = 16.dp)
-    )
-}
-
-@Composable
-private fun EmptyStateCard() {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(24.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceContainer
-        ),
-        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(32.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(64.dp)
-                    .clip(RoundedCornerShape(20.dp))
-                    .background(
-                        Brush.linearGradient(
-                            colors = listOf(
-                                MaterialTheme.colorScheme.primary.copy(alpha = 0.2f),
-                                MaterialTheme.colorScheme.primary.copy(alpha = 0.1f)
-                            )
-                        )
-                    ),
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(
-                    Icons.Default.Dns,
-                    contentDescription = null,
-                    modifier = Modifier.size(32.dp),
-                    tint = MaterialTheme.colorScheme.primary
-                )
-            }
-            Spacer(modifier = Modifier.height(16.dp))
-            Text(
-                stringResource(R.string.dns_servers_empty_title),
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-            Text(
-                text = stringResource(R.string.dns_servers_empty_hint),
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
-    }
-}
-
-@Composable
-private fun DnsServerCard(
+private fun DnsServerRow(
     server: DnsServer,
     onToggle: () -> Unit,
     onDelete: () -> Unit
 ) {
-    Card(
+    Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceContainer
-        ),
-        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+        color = MaterialTheme.colorScheme.surface,
+        tonalElevation = 1.dp
     ) {
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
+            modifier = Modifier.padding(start = 16.dp, top = 15.dp, end = 10.dp, bottom = 15.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = server.name,
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                }
-                Spacer(modifier = Modifier.height(6.dp))
-                Text(
-                    text = server.address,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+            Box(
+                modifier = Modifier
+                    .size(44.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(
+                        if (server.isEnabled) MaterialTheme.colorScheme.primaryContainer
+                        else MaterialTheme.colorScheme.surfaceVariant
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    Icons.Outlined.Dns,
+                    contentDescription = null,
+                    tint = if (server.isEnabled) MaterialTheme.colorScheme.onPrimaryContainer
+                    else MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
-            IconButton(onClick = onToggle) {
-                Icon(
-                    imageVector = if (server.isEnabled) Icons.Filled.CheckCircle else Icons.Outlined.Cancel,
-                    contentDescription = if (server.isEnabled) stringResource(R.string.dns_server_enabled) else stringResource(R.string.dns_server_disabled),
-                    tint = if (server.isEnabled)
-                        MaterialTheme.colorScheme.primary
-                    else
-                        MaterialTheme.colorScheme.error.copy(alpha = 0.7f),
-                    modifier = Modifier.size(28.dp)
+            Spacer(Modifier.width(14.dp))
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text(server.name, style = MaterialTheme.typography.titleMedium)
+                Text(
+                    server.address,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
             IconButton(onClick = onDelete) {
                 Icon(
                     Icons.Outlined.Delete,
                     contentDescription = stringResource(R.string.dns_server_delete),
-                    tint = MaterialTheme.colorScheme.error.copy(alpha = 0.7f)
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
+            Switch(
+                checked = server.isEnabled,
+                onCheckedChange = { onToggle() }
+            )
         }
     }
 }
@@ -231,25 +212,21 @@ private fun AddDnsServerDialog(
 ) {
     var name by remember { mutableStateOf("") }
     var address by remember { mutableStateOf("") }
+    val focusManager = LocalFocusManager.current
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        shape = RoundedCornerShape(28.dp),
-        title = {
-            Text(
-                stringResource(R.string.dns_server_add),
-                fontWeight = FontWeight.Bold
-            )
-        },
+        shape = RoundedCornerShape(24.dp),
+        title = { Text(stringResource(R.string.dns_server_add), style = MaterialTheme.typography.headlineMedium) },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
                 OutlinedTextField(
                     value = name,
                     onValueChange = { name = it },
                     label = { Text(stringResource(R.string.dns_server_name)) },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(16.dp)
+                    shape = RoundedCornerShape(14.dp)
                 )
                 OutlinedTextField(
                     value = address,
@@ -258,23 +235,23 @@ private fun AddDnsServerDialog(
                     placeholder = { Text(stringResource(R.string.dns_server_address_placeholder)) },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(16.dp)
+                    shape = RoundedCornerShape(14.dp)
                 )
             }
         },
         confirmButton = {
             Button(
-                onClick = { onAdd(name, address) },
-                enabled = name.isNotBlank() && address.isNotBlank(),
-                shape = RoundedCornerShape(14.dp)
+                onClick = {
+                    focusManager.clearFocus()
+                    onAdd(name, address)
+                },
+                enabled = name.isNotBlank() && address.isNotBlank()
             ) {
                 Text(stringResource(R.string.action_add))
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text(stringResource(R.string.action_cancel))
-            }
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.action_cancel)) }
         }
     )
 }

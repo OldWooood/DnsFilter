@@ -1,81 +1,126 @@
 package com.deatrg.dnsfilter.ui.theme
 
-import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
-import androidx.compose.material3.*
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Typography
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.sp
 
 private val DarkColorScheme = darkColorScheme(
-    primary = Indigo80,
-    onPrimary = Indigo20,
-    primaryContainer = Indigo20,
-    onPrimaryContainer = Indigo90,
-    secondary = Slate80,
-    onSecondary = SurfaceDark,
-    secondaryContainer = Slate40,
-    onSecondaryContainer = Slate90,
-    tertiary = Violet80,
-    onTertiary = Violet20,
-    tertiaryContainer = Violet20,
-    onTertiaryContainer = Violet90,
-    error = Rose80,
-    onError = Color(0xFF4C0519),
-    errorContainer = Color(0xFF881337),
-    onErrorContainer = Rose80,
-    background = SurfaceDark,
-    onBackground = Color(0xFFE2E8F0),
-    surface = Color(0xFF1E293B),
-    onSurface = Color(0xFFE2E8F0),
-    surfaceVariant = Color(0xFF334155),
-    onSurfaceVariant = Slate80,
-    outline = Slate40
+    primary = SignalGreenLight,
+    onPrimary = Color(0xFF003829),
+    primaryContainer = SignalGreenContainerDark,
+    onPrimaryContainer = Color(0xFFB5F1D8),
+    secondary = Color(0xFFB7C9C0),
+    onSecondary = Color(0xFF24352E),
+    secondaryContainer = Color(0xFF30453B),
+    onSecondaryContainer = Color(0xFFD3E8DD),
+    tertiary = SignalGreenLight,
+    onTertiary = Color(0xFF003829),
+    tertiaryContainer = SignalGreenContainerDark,
+    onTertiaryContainer = Color(0xFFB5F1D8),
+    error = Color(0xFFFFB4AF),
+    onError = Color(0xFF690005),
+    errorContainer = Color(0xFF8E1718),
+    onErrorContainer = Color(0xFFFFDAD7),
+    background = Night,
+    onBackground = NightText,
+    surface = NightSurface,
+    onSurface = NightText,
+    surfaceVariant = NightRaised,
+    onSurfaceVariant = Color(0xFFBFC9C2),
+    outline = Color(0xFF89938D),
+    outlineVariant = Color(0xFF3F4943),
+    inverseSurface = Color(0xFFE1E7E2),
+    inverseOnSurface = Color(0xFF2D322E),
+    inversePrimary = SignalGreen
 )
 
 private val LightColorScheme = lightColorScheme(
-    primary = Indigo40,
+    primary = SignalGreen,
     onPrimary = Color.White,
-    primaryContainer = Indigo90,
-    onPrimaryContainer = Indigo20,
-    secondary = Slate40,
+    primaryContainer = SignalGreenContainer,
+    onPrimaryContainer = Color(0xFF0E3A2E),
+    secondary = Color(0xFF4E6359),
     onSecondary = Color.White,
-    secondaryContainer = Slate90,
-    onSecondaryContainer = Slate40,
-    tertiary = Violet40,
+    secondaryContainer = Color(0xFFD1E8DC),
+    onSecondaryContainer = Color(0xFF0C1F17),
+    tertiary = SignalGreen,
     onTertiary = Color.White,
-    tertiaryContainer = Violet90,
-    onTertiaryContainer = Violet20,
-    error = Rose40,
+    tertiaryContainer = SignalGreenContainer,
+    onTertiaryContainer = Color(0xFF0E3A2E),
+    error = Brick,
     onError = Color.White,
-    errorContainer = Color(0xFFFFE4E6),
-    onErrorContainer = Color(0xFF881337),
-    background = SurfaceLight,
-    onBackground = Color(0xFF1E293B),
-    surface = Color.White,
-    onSurface = Color(0xFF1E293B),
-    surfaceVariant = Color(0xFFF1F5F9),
-    onSurfaceVariant = Slate40,
-    outline = Color(0xFFCBD5E1)
+    errorContainer = BrickLight,
+    onErrorContainer = Color(0xFF410002),
+    background = Paper,
+    onBackground = Ink,
+    surface = PaperSurface,
+    onSurface = Ink,
+    surfaceVariant = PaperRaised,
+    onSurfaceVariant = InkMuted,
+    outline = Color(0xFF737D77),
+    outlineVariant = Color(0xFFD5DBD6),
+    inverseSurface = Color(0xFF2D322E),
+    inverseOnSurface = Color(0xFFF0F2EE),
+    inversePrimary = SignalGreenLight
+)
+
+private val AppTypography = Typography(
+    displaySmall = TextStyle(
+        fontFamily = FontFamily.SansSerif,
+        fontWeight = FontWeight.Bold,
+        fontSize = 40.sp,
+        lineHeight = 44.sp,
+        letterSpacing = (-1.2).sp
+    ),
+    headlineLarge = TextStyle(
+        fontFamily = FontFamily.SansSerif,
+        fontWeight = FontWeight.Bold,
+        fontSize = 32.sp,
+        lineHeight = 36.sp,
+        letterSpacing = (-0.8).sp
+    ),
+    headlineMedium = TextStyle(
+        fontFamily = FontFamily.SansSerif,
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 26.sp,
+        lineHeight = 31.sp,
+        letterSpacing = (-0.4).sp
+    ),
+    titleLarge = TextStyle(
+        fontFamily = FontFamily.SansSerif,
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 20.sp,
+        lineHeight = 26.sp
+    ),
+    titleMedium = TextStyle(
+        fontFamily = FontFamily.SansSerif,
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 16.sp,
+        lineHeight = 22.sp
+    ),
+    bodyLarge = TextStyle(fontSize = 16.sp, lineHeight = 24.sp),
+    bodyMedium = TextStyle(fontSize = 14.sp, lineHeight = 21.sp),
+    labelLarge = TextStyle(fontWeight = FontWeight.SemiBold, fontSize = 14.sp, letterSpacing = 0.1.sp),
+    labelMedium = TextStyle(fontWeight = FontWeight.Medium, fontSize = 12.sp, letterSpacing = 0.4.sp),
+    labelSmall = TextStyle(fontWeight = FontWeight.SemiBold, fontSize = 11.sp, letterSpacing = 0.7.sp)
 )
 
 @Composable
 fun DnsFilterTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
-    dynamicColor: Boolean = true,
     content: @Composable () -> Unit
 ) {
-    val colorScheme = when {
-        dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
-            val context = LocalContext.current
-            if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
-        }
-        darkTheme -> DarkColorScheme
-        else -> LightColorScheme
-    }
-
     MaterialTheme(
-        colorScheme = colorScheme,
+        colorScheme = if (darkTheme) DarkColorScheme else LightColorScheme,
+        typography = AppTypography,
         content = content
     )
 }

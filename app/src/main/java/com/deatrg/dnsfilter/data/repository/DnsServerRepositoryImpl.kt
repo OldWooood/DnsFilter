@@ -12,10 +12,6 @@ class DnsServerRepositoryImpl(
 
     override val dnsServers: Flow<List<DnsServer>> = preferencesManager.dnsServers
 
-    override suspend fun saveDnsServers(servers: List<DnsServer>) {
-        preferencesManager.saveDnsServers(servers)
-    }
-
     override suspend fun addDnsServer(server: DnsServer) {
         val current = preferencesManager.dnsServers.first().toMutableList()
         current.add(server)

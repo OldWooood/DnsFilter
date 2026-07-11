@@ -23,14 +23,6 @@ class FilterListRepositoryImpl(
     }
 
     /**
-     * 保存过滤列表配置（不立即下载，只在设置时同步到 DomainFilter）
-     */
-    override suspend fun saveFilterLists(lists: List<FilterList>) {
-        preferencesManager.saveFilterLists(lists)
-        domainFilter.setFilterLists(lists.filter { it.isEnabled })
-    }
-
-    /**
      * 添加过滤列表 - 立即下载并加载到内存
      */
     override suspend fun addFilterList(list: FilterList) {

@@ -47,8 +47,7 @@ class DashboardViewModel(
     val showNoDnsServersError: SharedFlow<Unit> = _showNoDnsServersError.asSharedFlow()
 
     // 是否暂停轮询（应用在后台时暂停，省电）
-    private val _isPaused = MutableStateFlow(false)
-    val isPaused: StateFlow<Boolean> = _isPaused.asStateFlow()
+    private val isPaused = MutableStateFlow(false)
 
     // Blocklist 状态
     val isFilterLoaded = domainFilter.isLoaded
@@ -65,7 +64,7 @@ class DashboardViewModel(
     init {
         // 定期检查VPN实际运行状态并同步到UI（使用 Flow 实现真正暂停，彻底消除后台高频唤醒）
         viewModelScope.launch {
-            _isPaused
+            isPaused
                 .flatMapLatest { paused ->
                     if (paused) {
                         // 完全停止发射，协程无限挂起，不消耗 CPU
@@ -144,7 +143,6 @@ class DashboardViewModel(
                     val success = waitForVpnState(true)
                     
                     if (success) {
-                        preferencesManager.setVpnEnabled(true)
                         AppLog.d(TAG, "VPN started successfully")
                     } else {
                         AppLog.e(TAG, "VPN start timeout")
@@ -159,8 +157,6 @@ class DashboardViewModel(
                     val success = waitForVpnState(false)
                     
                     if (success) {
-                        preferencesManager.setVpnEnabled(false)
-                        // 刷新统计信息到磁盘
                         AppLog.d(TAG, "VPN stopped successfully")
                     } else {
                         AppLog.e(TAG, "VPN stop timeout")
@@ -216,19 +212,14 @@ class DashboardViewModel(
      * 暂停轮询（应用进入后台时调用）
      */
     fun pause() {
-        _isPaused.value = true
+        isPaused.value = true
     }
 
     /**
      * 恢复轮询（应用回到前台时调用）
      */
     fun resume() {
-        _isPaused.value = false
-    }
-
-    override fun onCleared() {
-        super.onCleared()
-        // ViewModel 销毁时刷新统计信息
+        isPaused.value = false
     }
 
     class Factory(private val application: Application) : ViewModelProvider.Factory {

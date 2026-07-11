@@ -33,6 +33,7 @@ class DnsQueryExecutor(
     companion object {
         private const val TAG = "DnsQueryExecutor"
         private const val DNS_CACHE_SIZE = 16384
+        private const val DNS_CACHE_TRIM_SIZE = DNS_CACHE_SIZE / 10
         private const val DNS_CACHE_MIN_TTL_MS = 30 * 1000L
         private const val DNS_CACHE_MAX_TTL_MS = 60 * 60 * 1000L
         private const val DNS_CACHE_STALE_MS = 5 * 60 * 1000L
@@ -108,6 +109,11 @@ class DnsQueryExecutor(
     // Response cache uses upstream TTLs with bounded stale fallback.
     // ConcurrentHashMap keeps hot-path reads lock-free.
     private val dnsCache = ConcurrentHashMap<String, CachedDnsResponse>()
+    // Writes and eviction use a small synchronized insertion-order index; hot cache reads
+    // remain lock-free in dnsCache.
+    private val cacheEvictionLock = Any()
+    private val cacheInsertionOrder = LinkedHashMap<String, CachedDnsResponse>()
+    private val cachePruneInProgress = AtomicBoolean(false)
     private val inFlightQueries = ConcurrentHashMap<String, CompletableDeferred<DnsQueryResult>>()
     private val staleRefreshes = ConcurrentHashMap.newKeySet<String>()
 
@@ -168,6 +174,23 @@ class DnsQueryExecutor(
             }
             return cached.response
         }
+        if (now <= cached.staleUntilMs) {
+            cached.hitCount.incrementAndGet()
+            if (query != null && queryLength > 0 && servers.isNotEmpty()) {
+                startStaleRefresh(
+                    cacheKey = key,
+                    domain = domain,
+                    servers = servers,
+                    query = query,
+                    queryOffset = queryOffset,
+                    queryLength = queryLength,
+                    qtype = qtype,
+                    qclass = qclass,
+                    timeoutMs = timeoutMs
+                )
+            }
+            return cached.response
+        }
         if (now > cached.staleUntilMs && dnsCache.remove(key, cached)) {
             staleRefreshes.remove(key)
         }
@@ -204,12 +227,18 @@ class DnsQueryExecutor(
     ) {
         val policy = getCachePolicy(response) ?: return
         val now = System.currentTimeMillis()
-        dnsCache[cacheKey] = CachedDnsResponse(
+        val cached = CachedDnsResponse(
             response = response,
             expiresAtMs = now + policy.ttlMs,
             staleUntilMs = now + policy.ttlMs + policy.staleMs,
             isNegative = policy.isNegative
         )
+        dnsCache[cacheKey] = cached
+        synchronized(cacheEvictionLock) {
+            // Reinsert so refreshes move to the back of the FIFO eviction order.
+            cacheInsertionOrder.remove(cacheKey)
+            cacheInsertionOrder[cacheKey] = cached
+        }
         staleRefreshes.remove(cacheKey)
         if (dnsCache.size > DNS_CACHE_SIZE) {
             pruneCache(now)
@@ -217,19 +246,32 @@ class DnsQueryExecutor(
     }
 
     private fun pruneCache(now: Long) {
-        dnsCache.entries.removeIf { now > it.value.staleUntilMs }
+        if (!cachePruneInProgress.compareAndSet(false, true)) return
+        try {
+            dnsCache.entries.removeIf { now > it.value.staleUntilMs }
 
-        val overflow = dnsCache.size - DNS_CACHE_SIZE
-        if (overflow <= 0) return
-
-        dnsCache.entries
-            .sortedBy { it.value.expiresAtMs }
-            .take(overflow)
-            .forEach { entry ->
-                if (dnsCache.remove(entry.key, entry.value)) {
-                    staleRefreshes.remove(entry.key)
+            // Trim a batch instead of sorting the entire cache for every insertion after it
+            // reaches capacity.
+            val shouldTrim = dnsCache.size > DNS_CACHE_SIZE
+            val targetSize = DNS_CACHE_SIZE - DNS_CACHE_TRIM_SIZE
+            synchronized(cacheEvictionLock) {
+                val iterator = cacheInsertionOrder.entries.iterator()
+                while (iterator.hasNext()) {
+                    val entry = iterator.next()
+                    val current = dnsCache[entry.key]
+                    if (current !== entry.value) {
+                        iterator.remove()
+                        continue
+                    }
+                    if (shouldTrim && dnsCache.size > targetSize && dnsCache.remove(entry.key, entry.value)) {
+                        staleRefreshes.remove(entry.key)
+                        iterator.remove()
+                    }
                 }
             }
+        } finally {
+            cachePruneInProgress.set(false)
+        }
     }
 
     private fun getCachePolicy(response: ByteArray): CachePolicy? {
@@ -340,26 +382,6 @@ class DnsQueryExecutor(
 
     private fun minOfNullable(current: Long?, candidate: Long): Long {
         return current?.let { minOf(it, candidate) } ?: candidate
-    }
-
-    suspend fun query(
-        domain: String,
-        servers: List<DnsServer>,
-        query: ByteArray,
-        qtype: Int = 1,
-        qclass: Int = 1,
-        timeoutMs: Long = 3000
-    ): DnsQueryResult {
-        return query(
-            domain = domain,
-            servers = servers,
-            query = query,
-            queryOffset = 0,
-            queryLength = query.size,
-            qtype = qtype,
-            qclass = qclass,
-            timeoutMs = timeoutMs
-        )
     }
 
     suspend fun query(
@@ -763,6 +785,9 @@ class DnsQueryExecutor(
         inFlightQueries.values.forEach { it.cancel() }
         inFlightQueries.clear()
         staleRefreshes.clear()
+        synchronized(cacheEvictionLock) {
+            cacheInsertionOrder.clear()
+        }
         udpSocketPools.values.forEach { pool ->
             pool.sockets.forEach(::closeUdpSocket)
             pool.sockets.clear()

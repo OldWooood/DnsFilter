@@ -2,17 +2,17 @@
 
 A fast local DNS filtering proxy for Android. Intercepts DNS queries via Android's `VpnService`, blocks ads and tracking domains using customizable blocklists, and forwards to multiple upstream servers concurrently for the fastest response.
 
-**Version:** 1.8.0 | **Package:** `com.deatrg.dnsfilter` | **minSdk:** 29 (Android 10+)
+**Version:** 2.0.0 | **Package:** `com.deatrg.dnsfilter` | **minSdk:** 29 (Android 10+)
 
 ## Features
 
 - **Local VPN-based DNS Proxy** — Routes only DNS traffic into the app via split-tunnel VPN, all other traffic goes through normally
 - **Domain Blocking** — Filters against AdAway-format blocklists. Supports multiple lists, add/remove/toggle, and manual refresh
 - **Concurrent Multi-Server Queries** — Sends DNS queries to all enabled upstream servers simultaneously, uses the fastest successful response
-- **DNS Response Caching** — 16,384-entry LRU cache with bounded TTL (30s–60min), stale-while-revalidate, and popular-domain prefetch
-- **In-flight Query Deduplication** — Concurrent requests for the same domain share a single upstream query
-- **UDP Socket Pooling** — Reusable socket pool per upstream server (4 per server) reduces connection overhead
-- **Statistics** — In-memory query counter with batched persistence (every 5s), live display (total, blocked, block rate, avg response time)
+- **DNS Response Caching** — Bounded 16,384-entry cache with upstream-derived TTL, stale-while-revalidate, and popular-domain prefetch
+- **Pre-queue Query Deduplication** — Concurrent requests for the same domain/type occupy one worker and share one upstream query
+- **UDP Socket Pooling** — Up to 16 idle reusable sockets per upstream server reduce socket setup overhead
+- **Statistics** — In-memory live counters for total, blocked, block rate, and average upstream response time
 - **Dashboard** — Protection status, start/stop toggle, statistics grid
 - **DNS Server Management** — Configure multiple upstream servers with enable/disable toggle
 - **Foreground Service** — Runs as a foreground service with notification and stop action
@@ -47,9 +47,9 @@ APKs are output to `app/build/outputs/apk/release/`. The build generates split A
 | Architecture | MVVM with manual DI (ServiceLocator) |
 | Async | Kotlin Coroutines + Flow |
 | Networking | OkHttp (blocklist downloads), `DatagramSocket` (DNS queries) |
-| Persistence | DataStore Preferences (settings, statistics), file cache (blocklists, 24h expiry) |
-| Background | Foreground Service + AlarmManager (blocklist updates) |
-| Build | Gradle 9.3 + AGP 9.2 + Kotlin DSL |
+| Persistence | DataStore Preferences (server/filter settings), file cache (blocklists, 24h freshness window) |
+| Background | Foreground `VpnService` |
+| Build | Gradle 9.4.1 + AGP 9.2 + Kotlin DSL |
 
 ## Architecture
 
@@ -60,8 +60,8 @@ VPN Interface (split-tunnel, DNS only)
 DnsVpnService — reads IP packets, parses IPv4/IPv6/UDP/DNS
        │
        ├─── DomainFilter — O(1) HashSet blocklist lookup
-       ├─── DnsQueryExecutor — LRU cache → concurrent upstream queries
-       └─── StatisticsBuffer — in-memory counter, batched DataStore writes
+       ├─── DnsQueryExecutor — bounded TTL cache → concurrent upstream queries
+       └─── StatisticsBuffer — in-memory live counters
 ```
 
 ## How It Works
@@ -70,9 +70,18 @@ DnsVpnService — reads IP packets, parses IPv4/IPv6/UDP/DNS
 2. Reads raw IP/UDP packets from the VPN interface
 3. Parses the DNS question from each packet
 4. Checks against loaded blocklists — blocked domains get an immediate NXDOMAIN response
-5. Checks the local LRU cache — fresh entries skip the upstream query entirely
-6. Forwards to all enabled upstream DNS servers concurrently via plain UDP
-7. Returns the fastest successful response, caches it, patches back into the original packet
+5. Checks the local cache — fresh and bounded-stale entries can respond immediately
+6. Coalesces matching cache misses before the upstream worker queue
+7. Forwards each unique miss to all enabled upstream DNS servers concurrently via plain UDP
+8. Returns the fastest successful response, caches it, and fans it out to waiting clients
+
+## Protocol Support and Limits
+
+- Upstream DNS currently uses plain UDP on port 53. DoH and DoT are not implemented.
+- IPv4 and IPv6 DNS packets are supported; IPv6 extension headers are not currently parsed.
+- Oversized UDP responses are returned with the DNS `TC` flag instead of being silently dropped. A TCP DNS proxy/fallback is not implemented yet.
+- Cache keys currently use normalized domain, query type, and query class.
+- Blocklists support hosts-file entries and plain domains. AdBlock Plus/uBlock syntax and wildcard matching are not supported.
 
 ## License
 

@@ -29,12 +29,6 @@ class DnsServersViewModel(
         }
     }
 
-    fun updateServer(server: DnsServer) {
-        viewModelScope.launch {
-            repository.updateDnsServer(server)
-        }
-    }
-
     fun toggleServer(server: DnsServer) {
         viewModelScope.launch {
             repository.updateDnsServer(server.copy(isEnabled = !server.isEnabled))

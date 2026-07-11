@@ -20,7 +20,6 @@ class PreferencesManager(private val context: Context) {
     companion object {
         private val DNS_SERVERS = stringPreferencesKey("dns_servers")
         private val FILTER_LISTS = stringPreferencesKey("filter_lists")
-        private val VPN_ENABLED = booleanPreferencesKey("vpn_enabled")
     }
 
     val dnsServers: Flow<List<DnsServer>> = dataStore.data.map { prefs ->
@@ -55,10 +54,6 @@ class PreferencesManager(private val context: Context) {
         }
     }
 
-    val isVpnEnabled: Flow<Boolean> = dataStore.data.map { prefs ->
-        prefs[VPN_ENABLED] ?: false
-    }
-
     suspend fun saveDnsServers(servers: List<DnsServer>) {
         dataStore.edit { prefs ->
             prefs[DNS_SERVERS] = serversToJson(servers)
@@ -72,12 +67,6 @@ class PreferencesManager(private val context: Context) {
     suspend fun saveFilterLists(lists: List<FilterList>) {
         dataStore.edit { prefs ->
             prefs[FILTER_LISTS] = filterListsToJson(lists)
-        }
-    }
-
-    suspend fun setVpnEnabled(enabled: Boolean) {
-        dataStore.edit { prefs ->
-            prefs[VPN_ENABLED] = enabled
         }
     }
 

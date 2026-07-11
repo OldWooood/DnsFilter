@@ -11,6 +11,7 @@ import com.deatrg.dnsfilter.ServiceLocator
 import com.deatrg.dnsfilter.data.local.StatisticsBuffer
 import com.deatrg.dnsfilter.data.remote.DomainFilter
 import com.deatrg.dnsfilter.data.remote.DnsQueryExecutor
+import com.deatrg.dnsfilter.data.remote.DnsQueryResult
 import com.deatrg.dnsfilter.data.remote.DnsQuestion
 import com.deatrg.dnsfilter.data.remote.parseDnsQueryFromPacket
 import com.deatrg.dnsfilter.domain.model.DnsServer
@@ -24,6 +25,7 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InterruptedIOException
 import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ConcurrentHashMap
 
 class DnsVpnService : VpnService() {
 
@@ -35,7 +37,6 @@ class DnsVpnService : VpnService() {
         const val MTU = 1500
         const val DNS_PORT = 53
         private const val UPSTREAM_QUEUE_CAPACITY = 1024
-        private const val SLOW_WORKER_COUNT = 8
         // 虚拟DNS服务器地址（应该与VPN接口地址不同）
         const val VPN_DNS_V4 = "10.10.10.10"
         const val VPN_DNS_V6 = "fd00::10"
@@ -71,7 +72,6 @@ class DnsVpnService : VpnService() {
 
     private data class UpstreamTask(
         val packet: ByteArray,
-        val length: Int,
         val dnsStart: Int,
         val dnsLength: Int,
         val question: DnsQuestion,
@@ -79,6 +79,33 @@ class DnsVpnService : VpnService() {
         val isIPv6: Boolean,
         val ipHeaderLength: Int
     )
+
+    private data class QueryKey(
+        val domain: String,
+        val qtype: Int,
+        val qclass: Int
+    )
+
+    private class PendingUpstreamGroup(
+        val key: QueryKey,
+        val leader: UpstreamTask
+    ) {
+        private val tasks = ArrayList<UpstreamTask>().apply { add(leader) }
+        private var accepting = true
+
+        fun tryAdd(task: UpstreamTask): Boolean = synchronized(this) {
+            if (!accepting) return@synchronized false
+            tasks.add(task)
+            true
+        }
+
+        fun closeAndDrain(): List<UpstreamTask> = synchronized(this) {
+            accepting = false
+            tasks.toList().also { tasks.clear() }
+        }
+    }
+
+    private val pendingUpstreamGroups = ConcurrentHashMap<QueryKey, PendingUpstreamGroup>()
 
     override fun onCreate() {
         super.onCreate()
@@ -175,17 +202,30 @@ class DnsVpnService : VpnService() {
         val vpnInterface = this.vpnInterface ?: return
         val inputStream = FileInputStream(vpnInterface.fileDescriptor)
         val outputStream = FileOutputStream(vpnInterface.fileDescriptor)
-        val upstreamQueue = Channel<UpstreamTask>(capacity = UPSTREAM_QUEUE_CAPACITY)
+        val upstreamQueue = Channel<PendingUpstreamGroup>(capacity = UPSTREAM_QUEUE_CAPACITY)
 
         val slowWorkers = List(slowWorkerCount) {
             scope.launch(Dispatchers.IO) {
-                for (task in upstreamQueue) {
+                for (group in upstreamQueue) {
+                    var tasks: List<UpstreamTask> = emptyList()
+                    var result: DnsQueryResult? = null
                     try {
-                        processUpstreamTask(task, outputStream)
+                        result = queryUpstream(group.leader)
                     } catch (e: Exception) {
                         AppLog.e(TAG) { "Error in upstream worker: ${e.message}" }
                     } finally {
-                        recyclePacket(task.packet)
+                        tasks = group.closeAndDrain()
+                        pendingUpstreamGroups.remove(group.key, group)
+                    }
+
+                    tasks.forEach { task ->
+                        try {
+                            writeUpstreamResult(task, result, outputStream)
+                        } catch (e: Exception) {
+                            AppLog.e(TAG) { "Failed to complete upstream task: ${e.message}" }
+                        } finally {
+                            recyclePacket(task.packet)
+                        }
                     }
                 }
             }
@@ -247,7 +287,7 @@ class DnsVpnService : VpnService() {
         packet: ByteArray,
         length: Int,
         outputStream: FileOutputStream,
-        upstreamQueue: Channel<UpstreamTask>
+        upstreamQueue: Channel<PendingUpstreamGroup>
     ): Boolean {
         if (length < 40) {
             AppLog.d(TAG) { "Packet too short: $length bytes" }
@@ -269,7 +309,7 @@ class DnsVpnService : VpnService() {
         packet: ByteArray,
         length: Int,
         outputStream: FileOutputStream,
-        upstreamQueue: Channel<UpstreamTask>
+        upstreamQueue: Channel<PendingUpstreamGroup>
     ): Boolean {
         val protocol = packet[9].toInt() and 0xFF
         if (protocol != 17) {
@@ -338,13 +378,19 @@ class DnsVpnService : VpnService() {
                 outputMutex.withLock {
                     outputStream.write(packet, 0, responseLength)
                 }
+            } else {
+                val dnsResponseLength = patchDnsTruncatedResponse(packet, dnsStart, question.questionEndOffset)
+                patchIPv4Response(packet, ihl, srcPort, dnsResponseLength)
+                val responseLength = dnsStart + dnsResponseLength
+                outputMutex.withLock {
+                    outputStream.write(packet, 0, responseLength)
+                }
             }
             return true
         }
 
         val task = UpstreamTask(
             packet = packet,
-            length = length,
             dnsStart = dnsStart,
             dnsLength = dnsLength,
             question = question,
@@ -352,7 +398,7 @@ class DnsVpnService : VpnService() {
             isIPv6 = false,
             ipHeaderLength = ihl
         )
-        if (!upstreamQueue.trySend(task).isSuccess) {
+        if (!enqueueUpstreamTask(task, upstreamQueue)) {
             // Queue full: return SERVFAIL immediately instead of blocking the main loop
             statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
             val dnsResponseLength = patchDnsErrorResponse(packet, dnsStart, question.questionEndOffset, 0x0002)
@@ -370,7 +416,7 @@ class DnsVpnService : VpnService() {
         packet: ByteArray,
         length: Int,
         outputStream: FileOutputStream,
-        upstreamQueue: Channel<UpstreamTask>
+        upstreamQueue: Channel<PendingUpstreamGroup>
     ): Boolean {
         val nextHeader = packet[6].toInt() and 0xFF
         if (nextHeader != 17) {
@@ -430,13 +476,19 @@ class DnsVpnService : VpnService() {
                 outputMutex.withLock {
                     outputStream.write(packet, 0, responseLength)
                 }
+            } else {
+                val dnsResponseLength = patchDnsTruncatedResponse(packet, dnsStart, question.questionEndOffset)
+                patchIPv6Response(packet, srcPort, dnsResponseLength)
+                val responseLength = dnsStart + dnsResponseLength
+                outputMutex.withLock {
+                    outputStream.write(packet, 0, responseLength)
+                }
             }
             return true
         }
 
         val task = UpstreamTask(
             packet = packet,
-            length = length,
             dnsStart = dnsStart,
             dnsLength = dnsLength,
             question = question,
@@ -444,7 +496,7 @@ class DnsVpnService : VpnService() {
             isIPv6 = true,
             ipHeaderLength = ipv6HeaderLength
         )
-        if (!upstreamQueue.trySend(task).isSuccess) {
+        if (!enqueueUpstreamTask(task, upstreamQueue)) {
             statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
             val dnsResponseLength = patchDnsErrorResponse(packet, dnsStart, question.questionEndOffset, 0x0002)
             patchIPv6Response(packet, srcPort, dnsResponseLength)
@@ -457,18 +509,36 @@ class DnsVpnService : VpnService() {
         return false
     }
 
-    private suspend fun processUpstreamTask(
+    private fun enqueueUpstreamTask(
         task: UpstreamTask,
-        outputStream: FileOutputStream
-    ) {
+        upstreamQueue: Channel<PendingUpstreamGroup>
+    ): Boolean {
+        val key = QueryKey(task.question.domain, task.question.qtype, task.question.qclass)
+        while (true) {
+            val existing = pendingUpstreamGroups[key]
+            if (existing != null) {
+                if (existing.tryAdd(task)) return true
+                pendingUpstreamGroups.remove(key, existing)
+                continue
+            }
+
+            val group = PendingUpstreamGroup(key, task)
+            if (pendingUpstreamGroups.putIfAbsent(key, group) != null) continue
+            if (upstreamQueue.trySend(group).isSuccess) return true
+
+            pendingUpstreamGroups.remove(key, group)
+            group.closeAndDrain()
+            return false
+        }
+    }
+
+    private suspend fun queryUpstream(task: UpstreamTask): DnsQueryResult? {
         if (servers.isEmpty()) {
             AppLog.e(TAG, "No DNS servers available")
-            statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
-            writeErrorResponse(task, outputStream, 0x0002)
-            return
+            return null
         }
 
-        val result = dnsQueryExecutor?.query(
+        return dnsQueryExecutor?.query(
             domain = task.question.domain,
             servers = servers,
             query = task.packet,
@@ -477,7 +547,13 @@ class DnsVpnService : VpnService() {
             qtype = task.question.qtype,
             qclass = task.question.qclass
         )
+    }
 
+    private suspend fun writeUpstreamResult(
+        task: UpstreamTask,
+        result: DnsQueryResult?,
+        outputStream: FileOutputStream
+    ) {
         if (result?.success == true && result.responseBytes != null) {
             AppLog.d(TAG) { "DNS response: ${task.question.domain} (${result.responseTime}ms)" }
             val includeInAvg = !result.fromCache
@@ -517,18 +593,40 @@ class DnsVpnService : VpnService() {
         dnsResponse: ByteArray,
         outputStream: FileOutputStream
     ) {
+        val maxDnsResponseLength = task.packet.size - task.dnsStart
+        if (dnsResponse.size > maxDnsResponseLength) {
+            val truncatedLength = patchDnsTruncatedResponse(
+                task.packet,
+                task.dnsStart,
+                task.question.questionEndOffset
+            )
+            if (task.isIPv6) {
+                patchIPv6Response(task.packet, task.srcPort, truncatedLength)
+            } else {
+                patchIPv4Response(task.packet, task.ipHeaderLength, task.srcPort, truncatedLength)
+            }
+            val responseLength = task.dnsStart + truncatedLength
+            outputMutex.withLock {
+                outputStream.write(task.packet, 0, responseLength)
+            }
+            return
+        }
+
+        val transactionId0 = task.packet[task.dnsStart]
+        val transactionId1 = task.packet[task.dnsStart + 1]
+        val recursionDesired = task.packet[task.dnsStart + 2].toInt() and 0x01
         val responseLength: Int
         val responseType: String
         if (task.isIPv6) {
-            if (40 + 8 + dnsResponse.size > task.packet.size) return
             dnsResponse.copyInto(task.packet, destinationOffset = 40 + 8)
+            patchDnsResponseForClient(task.packet, task.dnsStart, transactionId0, transactionId1, recursionDesired)
             patchIPv6Response(task.packet, task.srcPort, dnsResponse.size)
             responseLength = 40 + 8 + dnsResponse.size
             responseType = "IPv6"
         } else {
             val ihl = task.ipHeaderLength
-            if (ihl + 8 + dnsResponse.size > task.packet.size) return
             dnsResponse.copyInto(task.packet, destinationOffset = ihl + 8)
+            patchDnsResponseForClient(task.packet, task.dnsStart, transactionId0, transactionId1, recursionDesired)
             patchIPv4Response(task.packet, ihl, task.srcPort, dnsResponse.size)
             responseLength = ihl + 8 + dnsResponse.size
             responseType = "IPv4"
@@ -542,6 +640,30 @@ class DnsVpnService : VpnService() {
                 AppLog.e(TAG) { "Failed to send $responseType DNS response: ${e.message}" }
             }
         }
+    }
+
+    private fun patchDnsResponseForClient(
+        packet: ByteArray,
+        dnsStart: Int,
+        transactionId0: Byte,
+        transactionId1: Byte,
+        recursionDesired: Int
+    ) {
+        packet[dnsStart] = transactionId0
+        packet[dnsStart + 1] = transactionId1
+        packet[dnsStart + 2] = (
+            (packet[dnsStart + 2].toInt() and 0xFE) or recursionDesired
+        ).toByte()
+    }
+
+    private fun patchDnsTruncatedResponse(
+        packet: ByteArray,
+        dnsStart: Int,
+        questionEndOffset: Int
+    ): Int {
+        val responseLength = patchDnsErrorResponse(packet, dnsStart, questionEndOffset, 0)
+        packet[dnsStart + 2] = (packet[dnsStart + 2].toInt() or 0x02).toByte()
+        return responseLength
     }
 
     private fun patchDnsErrorResponse(
@@ -787,10 +909,6 @@ class DnsVpnService : VpnService() {
         isServiceRunning = false
         stopVpn()
         super.onDestroy()
-    }
-
-    override fun onBind(intent: Intent?): android.os.IBinder? {
-        return super.onBind(intent)
     }
 
     private fun startDnsServerTracking(preferencesManager: com.deatrg.dnsfilter.data.local.PreferencesManager) {
