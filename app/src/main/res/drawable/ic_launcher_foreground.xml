@@ -4,7 +4,27 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
+
+    <!-- A quiet inner field gives the adaptive icon depth without using a gradient. -->
+    <path
+        android:fillAlpha="0.48"
+        android:fillColor="#0D5945"
+        android:pathData="M54,23A31,31 0,1 1,54,85A31,31 0,1 1,54,23" />
+
+    <!-- Three DNS request paths converge through one filtering node. -->
+    <path
+        android:fillColor="@android:color/transparent"
+        android:pathData="M40,40H49L63,54M40,54H67M40,68H49L63,54"
+        android:strokeColor="#E5F4ED"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:strokeWidth="5" />
+
+    <path
+        android:fillColor="#E5F4ED"
+        android:pathData="M35,35a5,5 0,1 1,0 10a5,5 0,1 1,0 -10M35,49a5,5 0,1 1,0 10a5,5 0,1 1,0 -10M35,63a5,5 0,1 1,0 10a5,5 0,1 1,0 -10" />
+
     <path
         android:fillColor="#FFFFFF"
-        android:pathData="M54,30 L72,38 L72,56 C72,66 54,76 54,76 C54,76 36,66 36,56 L36,38 Z" />
+        android:pathData="M73,48a6,6 0,1 1,0 12a6,6 0,1 1,0 -12" />
 </vector>

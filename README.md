@@ -2,7 +2,7 @@
 
 A fast local DNS filtering proxy for Android. Intercepts DNS queries via Android's `VpnService`, blocks ads and tracking domains using customizable blocklists, and forwards to multiple upstream servers concurrently for the fastest response.
 
-**Version:** 2.0.0 | **Package:** `com.deatrg.dnsfilter` | **minSdk:** 29 (Android 10+)
+**Version:** 2.0.1 | **Package:** `com.deatrg.dnsfilter` | **minSdk:** 29 (Android 10+)
 
 ## Features
 
@@ -16,6 +16,7 @@ A fast local DNS filtering proxy for Android. Intercepts DNS queries via Android
 - **Dashboard** — Protection status, start/stop toggle, statistics grid
 - **DNS Server Management** — Configure multiple upstream servers with enable/disable toggle
 - **Foreground Service** — Runs as a foreground service with notification and stop action
+- **Automatic Blocklist Updates** — Refreshes enabled lists daily around local noon and reschedules after reboot or time-zone changes
 - **Low Overhead** — Packet buffer recycling, lock-free cache, minimal allocations in hot path
 
 ## Screens
@@ -48,7 +49,7 @@ APKs are output to `app/build/outputs/apk/release/`. The build generates split A
 | Async | Kotlin Coroutines + Flow |
 | Networking | OkHttp (blocklist downloads), `DatagramSocket` (DNS queries) |
 | Persistence | DataStore Preferences (server/filter settings), file cache (blocklists, 24h freshness window) |
-| Background | Foreground `VpnService` |
+| Background | Foreground `VpnService` + `AlarmManager` blocklist refresh |
 | Build | Gradle 9.4.1 + AGP 9.2 + Kotlin DSL |
 
 ## Architecture

@@ -1,6 +1,7 @@
 package com.deatrg.dnsfilter
 
 import android.app.Application
+import com.deatrg.dnsfilter.data.worker.BlocklistUpdateAlarmScheduler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -13,6 +14,7 @@ class DnsFilterApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         ServiceLocator.init(this)
+        BlocklistUpdateAlarmScheduler(this).scheduleNext()
 
         // 初始化默认 DNS 服务器和过滤列表（首次安装时）
         applicationScope.launch {

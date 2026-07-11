@@ -145,7 +145,7 @@ class PreferencesManager(private val context: Context) {
         // Tencent DNS (Secondary)
         DnsServer(
             id = "2",
-            name = "Tencent DNS 2",
+            name = "Tencent DNS Backup",
             address = "119.28.28.28",
             isEnabled = false
         ),
@@ -159,7 +159,7 @@ class PreferencesManager(private val context: Context) {
         // AliDNS (Secondary)
         DnsServer(
             id = "4",
-            name = "AliDNS 2",
+            name = "AliDNS Backup",
             address = "223.6.6.6",
             isEnabled = false
         ),
