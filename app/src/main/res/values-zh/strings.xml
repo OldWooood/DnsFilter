@@ -45,6 +45,10 @@
     <string name="dns_server_disabled">已禁用</string>
     <string name="dns_server_delete">删除</string>
     <string name="dns_servers_reset_defaults">恢复默认</string>
+    <string name="default_dns_tencent">腾讯公共 DNS</string>
+    <string name="default_dns_tencent_backup">腾讯公共 DNS（备用）</string>
+    <string name="default_dns_alibaba">阿里公共 DNS</string>
+    <string name="default_dns_alibaba_backup">阿里公共 DNS（备用）</string>
     <string name="action_add">添加</string>
     <string name="action_cancel">取消</string>
 

@@ -44,6 +44,10 @@
     <string name="dns_server_disabled">Disabled</string>
     <string name="dns_server_delete">Delete</string>
     <string name="dns_servers_reset_defaults">Reset to Defaults</string>
+    <string name="default_dns_tencent">Tencent Public DNS</string>
+    <string name="default_dns_tencent_backup">Tencent Public DNS (Backup)</string>
+    <string name="default_dns_alibaba">Alibaba Public DNS</string>
+    <string name="default_dns_alibaba_backup">Alibaba Public DNS (Backup)</string>
     <string name="action_add">Add</string>
     <string name="action_cancel">Cancel</string>
 

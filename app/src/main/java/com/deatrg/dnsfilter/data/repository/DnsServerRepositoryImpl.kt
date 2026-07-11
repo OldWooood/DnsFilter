@@ -22,15 +22,17 @@ class DnsServerRepositoryImpl(
         val current = preferencesManager.dnsServers.first().toMutableList()
         val index = current.indexOfFirst { it.id == server.id }
         if (index != -1) {
-            current[index] = server
+            current[index] = server.copy(isBuiltIn = current[index].isBuiltIn)
             preferencesManager.saveDnsServers(current)
         }
     }
 
     override suspend fun deleteDnsServer(serverId: String) {
         val current = preferencesManager.dnsServers.first().toMutableList()
-        current.removeAll { it.id == serverId }
-        preferencesManager.saveDnsServers(current)
+        val removed = current.removeAll { it.id == serverId && !it.isBuiltIn }
+        if (removed) {
+            preferencesManager.saveDnsServers(current)
+        }
     }
 
     override suspend fun resetToDefaults() {

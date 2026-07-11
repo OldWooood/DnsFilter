@@ -190,12 +190,14 @@ private fun DnsServerRow(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
-            IconButton(onClick = onDelete) {
-                Icon(
-                    Icons.Outlined.Delete,
-                    contentDescription = stringResource(R.string.dns_server_delete),
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant
-                )
+            if (!server.isBuiltIn) {
+                IconButton(onClick = onDelete) {
+                    Icon(
+                        Icons.Outlined.Delete,
+                        contentDescription = stringResource(R.string.dns_server_delete),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
             Switch(
                 checked = server.isEnabled,

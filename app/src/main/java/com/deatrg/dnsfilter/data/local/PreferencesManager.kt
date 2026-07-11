@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.*
 import androidx.datastore.preferences.preferencesDataStore
+import com.deatrg.dnsfilter.R
 import com.deatrg.dnsfilter.domain.model.DnsServer
 import com.deatrg.dnsfilter.domain.model.FilterList
 import kotlinx.coroutines.flow.Flow
@@ -79,7 +80,8 @@ class PreferencesManager(private val context: Context) {
                     id = obj.getString("id"),
                     name = obj.getString("name"),
                     address = obj.getString("address"),
-                    isEnabled = obj.getBoolean("isEnabled")
+                    isEnabled = obj.getBoolean("isEnabled"),
+                    isBuiltIn = obj.getBoolean("isBuiltIn")
                 )
             }
         } catch (e: Exception) {
@@ -113,6 +115,7 @@ class PreferencesManager(private val context: Context) {
                 put("name", server.name)
                 put("address", server.address)
                 put("isEnabled", server.isEnabled)
+                put("isBuiltIn", server.isBuiltIn)
             }
             array.put(obj)
         }
@@ -138,30 +141,34 @@ class PreferencesManager(private val context: Context) {
         // Tencent DNS (Primary)
         DnsServer(
             id = "1",
-            name = "Tencent DNS",
+            name = context.getString(R.string.default_dns_tencent),
             address = "119.29.29.29",
-            isEnabled = true
+            isEnabled = true,
+            isBuiltIn = true
         ),
         // Tencent DNS (Secondary)
         DnsServer(
             id = "2",
-            name = "Tencent DNS Backup",
+            name = context.getString(R.string.default_dns_tencent_backup),
             address = "119.28.28.28",
-            isEnabled = false
+            isEnabled = false,
+            isBuiltIn = true
         ),
         // AliDNS (Primary)
         DnsServer(
             id = "3",
-            name = "AliDNS",
+            name = context.getString(R.string.default_dns_alibaba),
             address = "223.5.5.5",
-            isEnabled = true
+            isEnabled = true,
+            isBuiltIn = true
         ),
         // AliDNS (Secondary)
         DnsServer(
             id = "4",
-            name = "AliDNS Backup",
+            name = context.getString(R.string.default_dns_alibaba_backup),
             address = "223.6.6.6",
-            isEnabled = false
+            isEnabled = false,
+            isBuiltIn = true
         ),
     )
 
