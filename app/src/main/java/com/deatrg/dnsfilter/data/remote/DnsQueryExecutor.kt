@@ -1,17 +1,13 @@
 package com.deatrg.dnsfilter.data.remote
 
+import android.os.SystemClock
 import com.deatrg.dnsfilter.AppLog
 import com.deatrg.dnsfilter.domain.model.DnsServer
 
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -21,9 +17,7 @@ import java.net.InetAddress
 import java.net.SocketTimeoutException
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.resume
 
 class DnsQueryExecutor(
@@ -32,22 +26,9 @@ class DnsQueryExecutor(
 
     companion object {
         private const val TAG = "DnsQueryExecutor"
-        private const val DNS_CACHE_SIZE = 16384
-        private const val DNS_CACHE_TRIM_SIZE = DNS_CACHE_SIZE / 10
-        private const val DNS_CACHE_MIN_TTL_MS = 30 * 1000L
-        private const val DNS_CACHE_MAX_TTL_MS = 60 * 60 * 1000L
-        private const val DNS_CACHE_STALE_MS = 5 * 60 * 1000L
-        private const val DNS_NEGATIVE_CACHE_MIN_TTL_MS = 30 * 1000L
-        private const val DNS_NEGATIVE_CACHE_MAX_TTL_MS = 2 * 60 * 1000L
-        private const val DNS_NEGATIVE_CACHE_STALE_MS = 30 * 1000L
-        private const val PREFETCH_MIN_HITS = 3
-        private const val PREFETCH_REMAINING_TTL_MS = 10 * 1000L
-        private const val PREFETCH_COOLDOWN_MS = 30 * 1000L
         private const val DNS_RESPONSE_BUFFER_SIZE = 2048
         private const val UDP_SOCKET_POOL_SIZE = 16
     }
-
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     // Each server reuses a small UDP socket pool to avoid repeated create/protect cost.
     private class ReusableUdpSocket(
@@ -65,38 +46,6 @@ class DnsQueryExecutor(
         val sockets = ArrayBlockingQueue<ReusableUdpSocket>(UDP_SOCKET_POOL_SIZE)
     }
 
-    private class CachedDnsResponse(
-        val response: ByteArray,
-        val expiresAtMs: Long,
-        val staleUntilMs: Long,
-        val isNegative: Boolean
-    ) {
-        val hitCount = AtomicInteger(0)
-
-        @Volatile
-        var lastRefreshStartedAtMs: Long = 0
-    }
-
-    private data class CacheLookup(
-        val response: ByteArray,
-        val isStale: Boolean,
-        val cached: CachedDnsResponse
-    )
-
-    private data class CachePolicy(
-        val ttlMs: Long,
-        val staleMs: Long,
-        val isNegative: Boolean
-    )
-
-    private data class DnsRecordHeader(
-        val type: Int,
-        val ttlSeconds: Long,
-        val rdataOffset: Int,
-        val rdataLength: Int,
-        val nextOffset: Int
-    )
-
     private data class ServerQueryOutcome(
         val server: DnsServer,
         val result: DnsQueryResult,
@@ -105,283 +54,13 @@ class DnsQueryExecutor(
 
     private val udpSocketPools = ConcurrentHashMap<String, UdpSocketPool>()
     private val serverAddressCache = ConcurrentHashMap<String, InetAddress>()
-
-    // Response cache uses upstream TTLs with bounded stale fallback.
-    // ConcurrentHashMap keeps hot-path reads lock-free.
-    private val dnsCache = ConcurrentHashMap<String, CachedDnsResponse>()
-    // Writes and eviction use a small synchronized insertion-order index; hot cache reads
-    // remain lock-free in dnsCache.
-    private val cacheEvictionLock = Any()
-    private val cacheInsertionOrder = LinkedHashMap<String, CachedDnsResponse>()
-    private val cachePruneInProgress = AtomicBoolean(false)
     private val inFlightQueries = ConcurrentHashMap<String, CompletableDeferred<DnsQueryResult>>()
-    private val staleRefreshes = ConcurrentHashMap.newKeySet<String>()
 
-    init {
-        scope.launch {
-            while (true) {
-                delay(600_000L)
-                pruneCache(System.currentTimeMillis())
-            }
-        }
-    }
+    private fun monotonicNowMs(): Long = SystemClock.elapsedRealtime()
 
-    private fun getCacheKey(domain: String, qtype: Int, qclass: Int): String {
+    private fun getQueryKey(domain: String, qtype: Int, qclass: Int): String {
         // domain is already lowercased by parseDnsQueryFromPacket
         return "$domain:$qtype:$qclass"
-    }
-
-    private fun readUInt16(data: ByteArray, offset: Int): Int {
-        return ((data[offset].toInt() and 0xFF) shl 8) or (data[offset + 1].toInt() and 0xFF)
-    }
-
-    private fun readUInt32(data: ByteArray, offset: Int): Long {
-        return ((data[offset].toLong() and 0xFF) shl 24) or
-            ((data[offset + 1].toLong() and 0xFF) shl 16) or
-            ((data[offset + 2].toLong() and 0xFF) shl 8) or
-            (data[offset + 3].toLong() and 0xFF)
-    }
-
-    fun getCachedResponseRaw(
-        domain: String,
-        qtype: Int,
-        qclass: Int,
-        servers: List<DnsServer> = emptyList(),
-        query: ByteArray? = null,
-        queryOffset: Int = 0,
-        queryLength: Int = 0,
-        timeoutMs: Long = 3000
-    ): ByteArray? {
-        val key = getCacheKey(domain, qtype, qclass)
-        val cached = dnsCache[key] ?: return null
-        val now = System.currentTimeMillis()
-        if (now < cached.expiresAtMs) {
-            cached.hitCount.incrementAndGet()
-            if (query != null && queryLength > 0) {
-                maybeStartPrefetch(
-                    cacheKey = key,
-                    domain = domain,
-                    cached = cached,
-                    servers = servers,
-                    query = query,
-                    queryOffset = queryOffset,
-                    queryLength = queryLength,
-                    qtype = qtype,
-                    qclass = qclass,
-                    timeoutMs = timeoutMs,
-                    now = now
-                )
-            }
-            return cached.response
-        }
-        if (now <= cached.staleUntilMs) {
-            cached.hitCount.incrementAndGet()
-            if (query != null && queryLength > 0 && servers.isNotEmpty()) {
-                startStaleRefresh(
-                    cacheKey = key,
-                    domain = domain,
-                    servers = servers,
-                    query = query,
-                    queryOffset = queryOffset,
-                    queryLength = queryLength,
-                    qtype = qtype,
-                    qclass = qclass,
-                    timeoutMs = timeoutMs
-                )
-            }
-            return cached.response
-        }
-        if (now > cached.staleUntilMs && dnsCache.remove(key, cached)) {
-            staleRefreshes.remove(key)
-        }
-        return null
-    }
-
-    private fun getCacheLookup(
-        domain: String,
-        qtype: Int,
-        qclass: Int,
-        query: ByteArray,
-        queryOffset: Int
-    ): CacheLookup? {
-        val key = getCacheKey(domain, qtype, qclass)
-        val cached = dnsCache[key] ?: return null
-        val now = System.currentTimeMillis()
-        if (now < cached.expiresAtMs) {
-            cached.hitCount.incrementAndGet()
-            return CacheLookup(patchResponseForClient(cached.response, query, queryOffset), isStale = false, cached)
-        }
-        if (now <= cached.staleUntilMs) {
-            cached.hitCount.incrementAndGet()
-            return CacheLookup(patchResponseForClient(cached.response, query, queryOffset), isStale = true, cached)
-        }
-        if (dnsCache.remove(key, cached)) {
-            staleRefreshes.remove(key)
-        }
-        return null
-    }
-
-    private fun putToCache(
-        cacheKey: String,
-        response: ByteArray
-    ) {
-        val policy = getCachePolicy(response) ?: return
-        val now = System.currentTimeMillis()
-        val cached = CachedDnsResponse(
-            response = response,
-            expiresAtMs = now + policy.ttlMs,
-            staleUntilMs = now + policy.ttlMs + policy.staleMs,
-            isNegative = policy.isNegative
-        )
-        dnsCache[cacheKey] = cached
-        synchronized(cacheEvictionLock) {
-            // Reinsert so refreshes move to the back of the FIFO eviction order.
-            cacheInsertionOrder.remove(cacheKey)
-            cacheInsertionOrder[cacheKey] = cached
-        }
-        staleRefreshes.remove(cacheKey)
-        if (dnsCache.size > DNS_CACHE_SIZE) {
-            pruneCache(now)
-        }
-    }
-
-    private fun pruneCache(now: Long) {
-        if (!cachePruneInProgress.compareAndSet(false, true)) return
-        try {
-            dnsCache.entries.removeIf { now > it.value.staleUntilMs }
-
-            // Trim a batch instead of sorting the entire cache for every insertion after it
-            // reaches capacity.
-            val shouldTrim = dnsCache.size > DNS_CACHE_SIZE
-            val targetSize = DNS_CACHE_SIZE - DNS_CACHE_TRIM_SIZE
-            synchronized(cacheEvictionLock) {
-                val iterator = cacheInsertionOrder.entries.iterator()
-                while (iterator.hasNext()) {
-                    val entry = iterator.next()
-                    val current = dnsCache[entry.key]
-                    if (current !== entry.value) {
-                        iterator.remove()
-                        continue
-                    }
-                    if (shouldTrim && dnsCache.size > targetSize && dnsCache.remove(entry.key, entry.value)) {
-                        staleRefreshes.remove(entry.key)
-                        iterator.remove()
-                    }
-                }
-            }
-        } finally {
-            cachePruneInProgress.set(false)
-        }
-    }
-
-    private fun getCachePolicy(response: ByteArray): CachePolicy? {
-        if (response.size < 12) return null
-
-        val flags = readUInt16(response, 2)
-        val rcode = flags and 0x0F
-        if (rcode != 0 && rcode != 3) return null
-
-        val questionCount = readUInt16(response, 4)
-        val answerCount = readUInt16(response, 6)
-        val authorityCount = readUInt16(response, 8)
-        val recordsOffset = skipQuestionSection(response, questionCount) ?: return null
-
-        if (rcode == 3 || answerCount == 0) {
-            val ttlSeconds = findNegativeTtlSeconds(response, recordsOffset, answerCount, authorityCount)
-                ?: TimeUnit.MILLISECONDS.toSeconds(DNS_NEGATIVE_CACHE_MIN_TTL_MS)
-            val ttlMs = TimeUnit.SECONDS.toMillis(ttlSeconds)
-                .coerceIn(DNS_NEGATIVE_CACHE_MIN_TTL_MS, DNS_NEGATIVE_CACHE_MAX_TTL_MS)
-            return CachePolicy(ttlMs, DNS_NEGATIVE_CACHE_STALE_MS, isNegative = true)
-        }
-
-        val ttlSeconds = findMinAnswerTtlSeconds(response, recordsOffset, answerCount) ?: return null
-        val ttlMs = TimeUnit.SECONDS.toMillis(ttlSeconds)
-            .coerceIn(DNS_CACHE_MIN_TTL_MS, DNS_CACHE_MAX_TTL_MS)
-        return CachePolicy(ttlMs, DNS_CACHE_STALE_MS, isNegative = false)
-    }
-
-    private fun skipQuestionSection(response: ByteArray, questionCount: Int): Int? {
-        var offset = 12
-        repeat(questionCount) {
-            offset = (skipDnsName(response, offset, response.size) ?: return null) + 4
-            if (offset > response.size) return null
-        }
-        return offset
-    }
-
-    private fun findMinAnswerTtlSeconds(
-        response: ByteArray,
-        recordsOffset: Int,
-        answerCount: Int
-    ): Long? {
-        var offset = recordsOffset
-        var minTtl: Long? = null
-        repeat(answerCount) {
-            val record = readDnsRecordHeader(response, offset) ?: return null
-            minTtl = minOfNullable(minTtl, record.ttlSeconds)
-            offset = record.nextOffset
-        }
-        return minTtl
-    }
-
-    private fun findNegativeTtlSeconds(
-        response: ByteArray,
-        recordsOffset: Int,
-        answerCount: Int,
-        authorityCount: Int
-    ): Long? {
-        var offset = recordsOffset
-        repeat(answerCount) {
-            val record = readDnsRecordHeader(response, offset) ?: return null
-            offset = record.nextOffset
-        }
-
-        var minTtl: Long? = null
-        repeat(authorityCount) {
-            val record = readDnsRecordHeader(response, offset) ?: return null
-            if (record.type == 6) {
-                val soaMinimum = readSoaMinimumTtl(response, record)
-                minTtl = minOfNullable(minTtl, minOf(record.ttlSeconds, soaMinimum ?: record.ttlSeconds))
-            }
-            offset = record.nextOffset
-        }
-        return minTtl
-    }
-
-    private fun readDnsRecordHeader(response: ByteArray, offset: Int): DnsRecordHeader? {
-        val headerOffset = skipDnsName(response, offset, response.size) ?: return null
-        if (headerOffset + 10 > response.size) return null
-
-        val type = readUInt16(response, headerOffset)
-        val ttlSeconds = readUInt32(response, headerOffset + 4)
-        val rdataLength = readUInt16(response, headerOffset + 8)
-        val rdataOffset = headerOffset + 10
-        val nextOffset = rdataOffset + rdataLength
-        if (nextOffset > response.size) return null
-
-        return DnsRecordHeader(
-            type = type,
-            ttlSeconds = ttlSeconds,
-            rdataOffset = rdataOffset,
-            rdataLength = rdataLength,
-            nextOffset = nextOffset
-        )
-    }
-
-    private fun readSoaMinimumTtl(response: ByteArray, record: DnsRecordHeader): Long? {
-        val rdataEnd = record.rdataOffset + record.rdataLength
-        val mnameEnd = skipDnsName(response, record.rdataOffset, response.size) ?: return null
-        if (mnameEnd > rdataEnd) return null
-        val rnameEnd = skipDnsName(response, mnameEnd, response.size) ?: return null
-        if (rnameEnd > rdataEnd) return null
-
-        val minimumOffset = rnameEnd + 16
-        if (minimumOffset + 4 > rdataEnd) return null
-        return readUInt32(response, minimumOffset)
-    }
-
-    private fun minOfNullable(current: Long?, candidate: Long): Long {
-        return current?.let { minOf(it, candidate) } ?: candidate
     }
 
     suspend fun query(
@@ -394,58 +73,9 @@ class DnsQueryExecutor(
         qclass: Int = 1,
         timeoutMs: Long = 3000
     ): DnsQueryResult {
-        val requestStart = System.currentTimeMillis()
-        val cacheKey = getCacheKey(domain, qtype, qclass)
+        val requestStart = monotonicNowMs()
+        val queryKey = getQueryKey(domain, qtype, qclass)
         val activeServers = servers
-
-        val cacheLookup = getCacheLookup(domain, qtype, qclass, query, queryOffset)
-        if (cacheLookup?.isStale == false) {
-            maybeStartPrefetch(
-                cacheKey = cacheKey,
-                domain = domain,
-                cached = cacheLookup.cached,
-                servers = activeServers,
-                query = query,
-                queryOffset = queryOffset,
-                queryLength = queryLength,
-                qtype = qtype,
-                qclass = qclass,
-                timeoutMs = timeoutMs,
-                now = System.currentTimeMillis()
-            )
-            AppLog.d(TAG) { "DNS cache hit: domain=$domain qtype=$qtype" }
-            return DnsQueryResult(
-                success = true,
-                responseBytes = cacheLookup.response,
-                responseTime = 0,
-                error = null,
-                fromCache = true
-            )
-        }
-
-        if (cacheLookup?.isStale == true) {
-            if (activeServers.isNotEmpty()) {
-                startStaleRefresh(
-                    cacheKey = cacheKey,
-                    domain = domain,
-                    servers = activeServers,
-                    query = query,
-                    queryOffset = queryOffset,
-                    queryLength = queryLength,
-                    qtype = qtype,
-                    qclass = qclass,
-                    timeoutMs = timeoutMs
-                )
-            }
-            AppLog.d(TAG) { "DNS stale cache hit: domain=$domain qtype=$qtype" }
-            return DnsQueryResult(
-                success = true,
-                responseBytes = cacheLookup.response,
-                responseTime = 0,
-                error = null,
-                fromCache = true
-            )
-        }
 
         if (activeServers.isEmpty()) {
             return DnsQueryResult(
@@ -458,60 +88,56 @@ class DnsQueryExecutor(
 
         val newQuery = CompletableDeferred<DnsQueryResult>()
 
-        val runningQuery = inFlightQueries.putIfAbsent(cacheKey, newQuery)
+        val runningQuery = inFlightQueries.putIfAbsent(queryKey, newQuery)
         if (runningQuery != null) {
             AppLog.d(TAG) { "DNS in-flight hit: domain=$domain qtype=$qtype" }
             return runningQuery.await().forClient(
                 query = query,
                 queryOffset = queryOffset,
-                responseTime = System.currentTimeMillis() - requestStart,
+                responseTime = monotonicNowMs() - requestStart,
                 patchResponse = true
             )
         }
 
         try {
             val upstreamResult = queryUpstream(
-                cacheKey = cacheKey,
                 domain = domain,
                 servers = activeServers,
                 query = query,
                 queryOffset = queryOffset,
                 queryLength = queryLength,
                 qtype = qtype,
-                qclass = qclass,
                 timeoutMs = timeoutMs
             )
             newQuery.complete(upstreamResult)
             return upstreamResult.forClient(
                 query = query,
                 queryOffset = queryOffset,
-                responseTime = System.currentTimeMillis() - requestStart,
+                responseTime = monotonicNowMs() - requestStart,
                 patchResponse = false
             )
         } catch (e: Throwable) {
             newQuery.completeExceptionally(e)
             throw e
         } finally {
-            inFlightQueries.remove(cacheKey, newQuery)
+            inFlightQueries.remove(queryKey, newQuery)
         }
     }
 
     private suspend fun queryUpstream(
-        cacheKey: String,
         domain: String,
         servers: List<DnsServer>,
         query: ByteArray,
         queryOffset: Int,
         queryLength: Int,
         qtype: Int,
-        qclass: Int,
         timeoutMs: Long
     ): DnsQueryResult = coroutineScope {
         val deferreds = servers.map { server ->
             async {
-                val startTime = System.currentTimeMillis()
+                val startTime = monotonicNowMs()
                 val result = queryPlainDns(query, queryOffset, queryLength, server.address, timeoutMs)
-                ServerQueryOutcome(server, result, System.currentTimeMillis() - startTime)
+                ServerQueryOutcome(server, result, monotonicNowMs() - startTime)
             }
         }.toMutableList()
 
@@ -526,7 +152,7 @@ class DnsQueryExecutor(
 
             if (result.result.success) {
                 deferreds.forEach { it.cancel() }
-                result.result.responseBytes?.let { putToCache(cacheKey, it) }
+                result.result.responseBytes?.let(::clampPositiveDnsTtlsInPlace)
                 AppLog.d(TAG) {
                     "DNS success: domain=$domain qtype=$qtype server=${result.server.name} time=${result.elapsedMs}ms"
                 }
@@ -534,8 +160,7 @@ class DnsQueryExecutor(
                     success = true,
                     responseBytes = result.result.responseBytes,
                     responseTime = result.elapsedMs,
-                    error = null,
-                    fromCache = false
+                    error = null
                 )
             } else if (firstError == null) {
                 firstError = result.result.error
@@ -549,71 +174,6 @@ class DnsQueryExecutor(
             responseBytes = null,
             responseTime = 0,
             error = firstError ?: "All DNS queries failed"
-        )
-    }
-
-    private fun startStaleRefresh(
-        cacheKey: String,
-        domain: String,
-        servers: List<DnsServer>,
-        query: ByteArray,
-        queryOffset: Int,
-        queryLength: Int,
-        qtype: Int,
-        qclass: Int,
-        timeoutMs: Long
-    ) {
-        if (!staleRefreshes.add(cacheKey)) return
-
-        val requestBytes = query.copyOfRange(queryOffset, queryOffset + queryLength)
-        scope.launch {
-            try {
-                queryUpstream(
-                    cacheKey = cacheKey,
-                    domain = domain,
-                    servers = servers,
-                    query = requestBytes,
-                    queryOffset = 0,
-                    queryLength = requestBytes.size,
-                    qtype = qtype,
-                    qclass = qclass,
-                    timeoutMs = timeoutMs
-                )
-            } finally {
-                staleRefreshes.remove(cacheKey)
-            }
-        }
-    }
-
-    private fun maybeStartPrefetch(
-        cacheKey: String,
-        domain: String,
-        cached: CachedDnsResponse,
-        servers: List<DnsServer>,
-        query: ByteArray,
-        queryOffset: Int,
-        queryLength: Int,
-        qtype: Int,
-        qclass: Int,
-        timeoutMs: Long,
-        now: Long
-    ) {
-        if (cached.isNegative || servers.isEmpty()) return
-        if (cached.hitCount.get() < PREFETCH_MIN_HITS) return
-        if (cached.expiresAtMs - now > PREFETCH_REMAINING_TTL_MS) return
-        if (now - cached.lastRefreshStartedAtMs < PREFETCH_COOLDOWN_MS) return
-
-        cached.lastRefreshStartedAtMs = now
-        startStaleRefresh(
-            cacheKey = cacheKey,
-            domain = domain,
-            servers = servers,
-            query = query,
-            queryOffset = queryOffset,
-            queryLength = queryLength,
-            qtype = qtype,
-            qclass = qclass,
-            timeoutMs = timeoutMs
         )
     }
 
@@ -781,13 +341,8 @@ class DnsQueryExecutor(
     }
 
     fun shutdown() {
-        scope.cancel()
         inFlightQueries.values.forEach { it.cancel() }
         inFlightQueries.clear()
-        staleRefreshes.clear()
-        synchronized(cacheEvictionLock) {
-            cacheInsertionOrder.clear()
-        }
         udpSocketPools.values.forEach { pool ->
             pool.sockets.forEach(::closeUdpSocket)
             pool.sockets.clear()
@@ -800,6 +355,5 @@ data class DnsQueryResult(
     val success: Boolean,
     val responseBytes: ByteArray?,
     val responseTime: Long,
-    val error: String?,
-    val fromCache: Boolean = false
+    val error: String?
 )

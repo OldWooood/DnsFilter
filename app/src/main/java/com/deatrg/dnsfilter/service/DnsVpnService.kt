@@ -14,6 +14,7 @@ import com.deatrg.dnsfilter.data.remote.DnsQueryExecutor
 import com.deatrg.dnsfilter.data.remote.DnsQueryResult
 import com.deatrg.dnsfilter.data.remote.DnsQuestion
 import com.deatrg.dnsfilter.data.remote.parseDnsQueryFromPacket
+import com.deatrg.dnsfilter.data.remote.patchBlockedNxDomainResponse
 import com.deatrg.dnsfilter.domain.model.DnsServer
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
@@ -336,55 +337,15 @@ class DnsVpnService : VpnService() {
         if (dnsLength == 0) return true
         val question = parseDnsQueryFromPacket(packet, dnsStart, length) ?: return true
 
-        // 1. 检查拦截（使用 NXDOMAIN 缓存避免重复构建）
+        // 检查拦截；24 小时 SOA TTL 交由 Android Resolver 负缓存。
         if (domainFilter?.isDomainBlocked(question.domain) == true) {
             AppLog.d(TAG) { "Domain ${question.domain} is blocked" }
             statisticsBuffer?.recordQuery(blocked = true, responseTime = 0, includeInAvg = false)
-            val dnsResponseLength = patchDnsErrorResponse(packet, dnsStart, question.questionEndOffset, 0x0003)
+            val dnsResponseLength = patchBlockedNxDomainResponse(packet, dnsStart, question.questionEndOffset)
             patchIPv4Response(packet, ihl, srcPort, dnsResponseLength)
             val responseLength = dnsStart + dnsResponseLength
             outputMutex.withLock {
                 outputStream.write(packet, 0, responseLength)
-            }
-            return true
-        }
-
-        // 2. 检查缓存（直接从 packet 读取，无 copyOfRange）
-        val rawCached = dnsQueryExecutor?.getCachedResponseRaw(
-            domain = question.domain,
-            qtype = question.qtype,
-            qclass = question.qclass,
-            servers = servers,
-            query = packet,
-            queryOffset = dnsStart,
-            queryLength = dnsLength
-        )
-        if (rawCached != null) {
-            AppLog.d(TAG) { "DNS cache hit: ${question.domain}" }
-            statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
-            if (dnsStart + rawCached.size <= packet.size) {
-                // 保存原始查询的 transaction ID 和 RD bit
-                val txId0 = packet[dnsStart]
-                val txId1 = packet[dnsStart + 1]
-                val rdBit = (packet[dnsStart + 2].toInt() and 0x01)
-                // 写入缓存响应
-                rawCached.copyInto(packet, destinationOffset = dnsStart)
-                // 原地 patch transaction ID
-                packet[dnsStart] = txId0
-                packet[dnsStart + 1] = txId1
-                packet[dnsStart + 2] = ((packet[dnsStart + 2].toInt() and 0xFE) or rdBit).toByte()
-                patchIPv4Response(packet, ihl, srcPort, rawCached.size)
-                val responseLength = dnsStart + rawCached.size
-                outputMutex.withLock {
-                    outputStream.write(packet, 0, responseLength)
-                }
-            } else {
-                val dnsResponseLength = patchDnsTruncatedResponse(packet, dnsStart, question.questionEndOffset)
-                patchIPv4Response(packet, ihl, srcPort, dnsResponseLength)
-                val responseLength = dnsStart + dnsResponseLength
-                outputMutex.withLock {
-                    outputStream.write(packet, 0, responseLength)
-                }
             }
             return true
         }
@@ -437,52 +398,15 @@ class DnsVpnService : VpnService() {
         if (dnsLength == 0) return true
         val question = parseDnsQueryFromPacket(packet, dnsStart, length) ?: return true
 
-        // 1. 检查拦截（使用 NXDOMAIN 缓存避免重复构建）
+        // 检查拦截；24 小时 SOA TTL 交由 Android Resolver 负缓存。
         if (domainFilter?.isDomainBlocked(question.domain) == true) {
             AppLog.d(TAG) { "Domain ${question.domain} is blocked" }
             statisticsBuffer?.recordQuery(blocked = true, responseTime = 0, includeInAvg = false)
-            val dnsResponseLength = patchDnsErrorResponse(packet, dnsStart, question.questionEndOffset, 0x0003)
+            val dnsResponseLength = patchBlockedNxDomainResponse(packet, dnsStart, question.questionEndOffset)
             patchIPv6Response(packet, srcPort, dnsResponseLength)
             val responseLength = dnsStart + dnsResponseLength
             outputMutex.withLock {
                 outputStream.write(packet, 0, responseLength)
-            }
-            return true
-        }
-
-        // 2. 检查缓存
-        val rawCached = dnsQueryExecutor?.getCachedResponseRaw(
-            domain = question.domain,
-            qtype = question.qtype,
-            qclass = question.qclass,
-            servers = servers,
-            query = packet,
-            queryOffset = dnsStart,
-            queryLength = dnsLength
-        )
-        if (rawCached != null) {
-            AppLog.d(TAG) { "DNS cache hit: ${question.domain}" }
-            statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
-            if (dnsStart + rawCached.size <= packet.size) {
-                val txId0 = packet[dnsStart]
-                val txId1 = packet[dnsStart + 1]
-                val rdBit = (packet[dnsStart + 2].toInt() and 0x01)
-                rawCached.copyInto(packet, destinationOffset = dnsStart)
-                packet[dnsStart] = txId0
-                packet[dnsStart + 1] = txId1
-                packet[dnsStart + 2] = ((packet[dnsStart + 2].toInt() and 0xFE) or rdBit).toByte()
-                patchIPv6Response(packet, srcPort, rawCached.size)
-                val responseLength = dnsStart + rawCached.size
-                outputMutex.withLock {
-                    outputStream.write(packet, 0, responseLength)
-                }
-            } else {
-                val dnsResponseLength = patchDnsTruncatedResponse(packet, dnsStart, question.questionEndOffset)
-                patchIPv6Response(packet, srcPort, dnsResponseLength)
-                val responseLength = dnsStart + dnsResponseLength
-                outputMutex.withLock {
-                    outputStream.write(packet, 0, responseLength)
-                }
             }
             return true
         }
@@ -556,9 +480,7 @@ class DnsVpnService : VpnService() {
     ) {
         if (result?.success == true && result.responseBytes != null) {
             AppLog.d(TAG) { "DNS response: ${task.question.domain} (${result.responseTime}ms)" }
-            val includeInAvg = !result.fromCache
-            val recordedTime = if (result.fromCache) 0 else result.responseTime
-            statisticsBuffer?.recordQuery(blocked = false, responseTime = recordedTime, includeInAvg = includeInAvg)
+            statisticsBuffer?.recordQuery(blocked = false, responseTime = result.responseTime)
             writeResponseAndPatch(task, result.responseBytes, outputStream)
         } else {
             AppLog.e(TAG) { "DNS query failed: ${result?.error}" }

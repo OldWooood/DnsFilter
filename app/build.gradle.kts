@@ -21,8 +21,8 @@ android {
         applicationId = "com.deatrg.dnsfilter"
         minSdk = 29
         targetSdk = 35
-        versionCode = 32
-        versionName = "2.0.2"
+        versionCode = 33
+        versionName = "3.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
