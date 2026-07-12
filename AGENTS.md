@@ -36,7 +36,8 @@ app/src/main/java/com/deatrg/dnsfilter/
 │   │   ├── BlocklistCacheManager.kt    # File-based cache for downloaded blocklists
 │   │   └── StatisticsBuffer.kt         # In-memory stats buffer to reduce disk I/O
 │   ├── remote/
-│   │   ├── DnsQueryExecutor.kt         # Races plain UDP upstreams and rewrites response TTLs
+│   │   ├── DnsQueryExecutor.kt         # Positive L2 cache, UDP upstream racing, TTL rewriting
+│   │   ├── DnsResponseCache.kt         # 4,096-entry positive-only LRU cache
 │   │   └── DomainFilter.kt             # Loads blocklists, checks domains, supports AdAway format
 │   ├── repository/
 │   │   ├── DnsServerRepositoryImpl.kt
@@ -95,9 +96,11 @@ APKs are output to `app/build/outputs/apk/`. The build produces split APKs by AB
 4. The app excludes itself from the VPN (`addDisallowedApplication`) to avoid routing loops.
 5. Packets are read from the VPN `ParcelFileDescriptor`, parsed (IPv4/IPv6 → UDP → DNS payload), and processed.
 6. If the domain is blocked, an `NXDOMAIN` response with a 24-hour SOA negative TTL is returned immediately.
-7. Matching concurrent requests are coalesced while they are in flight; completed responses are not cached by the app.
-8. Allowed queries are forwarded concurrently to all enabled upstream DNS servers; the first successful response is used.
-9. Positive response TTLs are clamped to 1–6 hours and caching is delegated to Android Resolver.
+7. Allowed queries check a 4,096-entry positive-only LRU cache; hits return correctly aged remaining TTLs.
+8. Matching concurrent cache misses are coalesced while they are in flight.
+9. Misses are forwarded concurrently to all enabled upstream DNS servers; the first successful response is used.
+10. Positive response TTLs are clamped to 1–6 hours and cached by both the app L2 and Android Resolver L1.
+11. L2 has no stale serving, prefetch, background refresh, or negative-response storage and is cleared on default-network or upstream-server changes.
 
 ### Domain Filtering
 - Blocklists use the **AdAway/hosts file format**: lines like `0.0.0.0 domain.com` or `127.0.0.1 domain.com`.
@@ -115,12 +118,12 @@ APKs are output to `app/build/outputs/apk/`. The build produces split APKs by AB
 ### Statistics
 - `StatisticsBuffer` keeps process-local counters in memory and updates the UI at most once per second.
 - Total and allowed counts represent requests handled by the VPN, not actual UDP packets sent upstream.
-- Blocked requests are counted without an upstream request; matching concurrent requests are counted individually before one coalesced lookup is sent to every enabled server.
+- Blocked and L2-hit requests are counted without an upstream request; matching concurrent L2 misses are counted individually before one coalesced lookup is sent to every enabled server.
 - Android Resolver cache hits do not reach the VPN and are not counted.
 
 ### Concurrency Control
 - `DnsVpnService` uses a bounded 1024-entry upstream queue and a fixed worker pool.
-- Matching in-flight requests share one logical lookup; `DnsQueryExecutor` still sends that lookup concurrently to every enabled server.
+- Matching in-flight L2 misses share one logical lookup; `DnsQueryExecutor` still sends that lookup concurrently to every enabled server.
 
 ## Code Style Guidelines
 
@@ -141,7 +144,7 @@ Current unit tests cover DNS TTL/NXDOMAIN wire-format behavior and blocklist ala
 
 ### Permissions
 The app requires these Android permissions:
-- `INTERNET` — upstream DNS queries and blocklist downloads
+- `INTERNET`, `ACCESS_NETWORK_STATE` — upstream queries, blocklist downloads, and L2 invalidation on network changes
 - `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_SPECIAL_USE` — foreground VPN service
 - `POST_NOTIFICATIONS` — service notification
 - `RECEIVE_BOOT_COMPLETED` — reschedule alarms after reboot

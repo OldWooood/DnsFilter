@@ -1,7 +1,7 @@
 package com.deatrg.dnsfilter.data.remote
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -14,9 +14,14 @@ class DnsProtocolCacheTest {
         val secondAnswerTtlOffset = 51
         val optMetadataOffset = 78
 
-        assertTrue(clampPositiveDnsTtlsInPlace(response))
+        assertEquals(POSITIVE_DNS_MIN_TTL_SECONDS, clampPositiveDnsTtlsInPlace(response))
         assertEquals(POSITIVE_DNS_MIN_TTL_SECONDS, readUInt32(response, firstAnswerTtlOffset))
         assertEquals(POSITIVE_DNS_MAX_TTL_SECONDS, readUInt32(response, secondAnswerTtlOffset))
+        assertEquals(0x8000L, readUInt32(response, optMetadataOffset))
+
+        assertTrue(agePositiveDnsTtlsInPlace(response, ageSeconds = 60))
+        assertEquals(POSITIVE_DNS_MIN_TTL_SECONDS - 60, readUInt32(response, firstAnswerTtlOffset))
+        assertEquals(POSITIVE_DNS_MAX_TTL_SECONDS - 60, readUInt32(response, secondAnswerTtlOffset))
         assertEquals(0x8000L, readUInt32(response, optMetadataOffset))
     }
 
@@ -55,7 +60,7 @@ class DnsProtocolCacheTest {
 
     @Test
     fun malformedDnsMessageIsNotRewritten() {
-        assertFalse(clampPositiveDnsTtlsInPlace(ByteArray(11)))
+        assertNull(clampPositiveDnsTtlsInPlace(ByteArray(11)))
     }
 
     private fun buildPositiveResponse(): ByteArray {

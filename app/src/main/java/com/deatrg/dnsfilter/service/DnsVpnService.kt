@@ -3,6 +3,8 @@ package com.deatrg.dnsfilter.service
 import android.app.*
 import android.content.Intent
 import android.graphics.drawable.Icon
+import android.net.ConnectivityManager
+import android.net.Network
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
 import com.deatrg.dnsfilter.AppLog
@@ -58,6 +60,9 @@ class DnsVpnService : VpnService() {
     private var servers: List<DnsServer> = emptyList()
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var serversJob: Job? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    @Volatile
+    private var activeNetwork: Network? = null
 
     // Upstream DNS queries mostly wait on IO, so keep this worker count modest.
     private val slowWorkerCount: Int get() = Runtime.getRuntime().availableProcessors().coerceIn(4, 16) * 2
@@ -173,6 +178,7 @@ class DnsVpnService : VpnService() {
         if (vpnInterface != null) {
             isRunning = true
             isServiceRunning = true
+            registerNetworkCallback()
             startDnsServerTracking(prefsManager)
             startForeground(NOTIFICATION_ID, createNotification())
             scope.launch { runDnsLoop() }
@@ -189,6 +195,7 @@ class DnsVpnService : VpnService() {
         isServiceRunning = false
         serversJob?.cancel()
         serversJob = null
+        unregisterNetworkCallback()
         vpnInterface?.close()
         vpnInterface = null
 
@@ -359,6 +366,18 @@ class DnsVpnService : VpnService() {
             isIPv6 = false,
             ipHeaderLength = ihl
         )
+        dnsQueryExecutor?.getCachedResponseForClient(
+            domain = question.domain,
+            qtype = question.qtype,
+            qclass = question.qclass,
+            query = packet,
+            queryOffset = dnsStart
+        )?.let { cachedResponse ->
+            AppLog.d(TAG) { "DNS L2 cache hit: ${question.domain}" }
+            statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
+            writeResponseAndPatch(task, cachedResponse, outputStream)
+            return true
+        }
         if (!enqueueUpstreamTask(task, upstreamQueue)) {
             // Queue full: return SERVFAIL immediately instead of blocking the main loop
             statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
@@ -420,6 +439,18 @@ class DnsVpnService : VpnService() {
             isIPv6 = true,
             ipHeaderLength = ipv6HeaderLength
         )
+        dnsQueryExecutor?.getCachedResponseForClient(
+            domain = question.domain,
+            qtype = question.qtype,
+            qclass = question.qclass,
+            query = packet,
+            queryOffset = dnsStart
+        )?.let { cachedResponse ->
+            AppLog.d(TAG) { "DNS L2 cache hit: ${question.domain}" }
+            statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
+            writeResponseAndPatch(task, cachedResponse, outputStream)
+            return true
+        }
         if (!enqueueUpstreamTask(task, upstreamQueue)) {
             statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
             val dnsResponseLength = patchDnsErrorResponse(packet, dnsStart, question.questionEndOffset, 0x0002)
@@ -480,7 +511,11 @@ class DnsVpnService : VpnService() {
     ) {
         if (result?.success == true && result.responseBytes != null) {
             AppLog.d(TAG) { "DNS response: ${task.question.domain} (${result.responseTime}ms)" }
-            statisticsBuffer?.recordQuery(blocked = false, responseTime = result.responseTime)
+            statisticsBuffer?.recordQuery(
+                blocked = false,
+                responseTime = result.responseTime,
+                includeInAvg = !result.fromCache
+            )
             writeResponseAndPatch(task, result.responseBytes, outputStream)
         } else {
             AppLog.e(TAG) { "DNS query failed: ${result?.error}" }
@@ -837,10 +872,59 @@ class DnsVpnService : VpnService() {
         serversJob?.cancel()
         serversJob = scope.launch {
             preferencesManager.dnsServers.collect { updatedServers ->
-                servers = updatedServers.filter(::isSupportedDnsServer)
+                val newServers = updatedServers.filter(::isSupportedDnsServer)
+                if (servers != newServers) {
+                    servers = newServers
+                    invalidateResponseCache("upstream DNS servers changed")
+                }
                 AppLog.d(TAG) { "Updated active DNS servers: ${servers.size}" }
             }
         }
+    }
+
+    private fun registerNetworkCallback() {
+        if (networkCallback != null) return
+        val connectivityManager = getSystemService(ConnectivityManager::class.java)
+        activeNetwork = connectivityManager.activeNetwork
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                val previous = activeNetwork
+                activeNetwork = network
+                if (previous != network) {
+                    invalidateResponseCache("default network changed")
+                }
+            }
+
+            override fun onLost(network: Network) {
+                if (activeNetwork == network) {
+                    activeNetwork = null
+                    invalidateResponseCache("default network lost")
+                }
+            }
+        }
+
+        try {
+            connectivityManager.registerDefaultNetworkCallback(callback)
+            networkCallback = callback
+        } catch (e: Exception) {
+            activeNetwork = null
+            AppLog.w(TAG) { "Failed to register network callback: ${e.message}" }
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        val callback = networkCallback ?: return
+        networkCallback = null
+        activeNetwork = null
+        try {
+            getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(callback)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun invalidateResponseCache(reason: String) {
+        dnsQueryExecutor?.clearResponseCache()
+        AppLog.d(TAG) { "DNS L2 cache cleared: $reason" }
     }
 
     private fun isSupportedDnsServer(server: DnsServer): Boolean {

@@ -92,17 +92,38 @@ fun skipDnsName(data: ByteArray, offset: Int, length: Int): Int? {
  * Applies the speed-first Android Resolver TTL policy to every real resource record.
  * OPT uses the TTL-shaped field for EDNS metadata and must never be rewritten.
  */
-internal fun clampPositiveDnsTtlsInPlace(response: ByteArray): Boolean {
+internal fun clampPositiveDnsTtlsInPlace(response: ByteArray): Long? {
+    if (response.size < DNS_HEADER_SIZE) return null
+    val flags = readUInt16(response, 2)
+    val rcode = flags and 0x0F
+    val answerCount = readUInt16(response, 6)
+    if (rcode != 0 || answerCount == 0) return null
+
+    return rewriteDnsTtlsInPlace(response, answerCount, ageSeconds = 0, clampToPolicy = true)
+}
+
+/** Decrements cached record TTLs without extending their original effective lifetime. */
+internal fun agePositiveDnsTtlsInPlace(response: ByteArray, ageSeconds: Long): Boolean {
     if (response.size < DNS_HEADER_SIZE) return false
     val flags = readUInt16(response, 2)
     val rcode = flags and 0x0F
     val answerCount = readUInt16(response, 6)
     if (rcode != 0 || answerCount == 0) return false
 
-    return clampDnsTtlsInPlace(response)
+    return rewriteDnsTtlsInPlace(
+        data = response,
+        answerCount = answerCount,
+        ageSeconds = ageSeconds.coerceAtLeast(0),
+        clampToPolicy = false
+    ) != null
 }
 
-private fun clampDnsTtlsInPlace(data: ByteArray): Boolean {
+private fun rewriteDnsTtlsInPlace(
+    data: ByteArray,
+    answerCount: Int,
+    ageSeconds: Long,
+    clampToPolicy: Boolean
+): Long? {
     val dnsEnd = data.size
     val questionCount = readUInt16(data, 4)
     val recordCount = readUInt16(data, 6) +
@@ -111,27 +132,36 @@ private fun clampDnsTtlsInPlace(data: ByteArray): Boolean {
 
     var offset = DNS_HEADER_SIZE
     repeat(questionCount) {
-        offset = (skipDnsName(data, offset, dnsEnd) ?: return false) + 4
-        if (offset > dnsEnd) return false
+        offset = (skipDnsName(data, offset, dnsEnd) ?: return null) + 4
+        if (offset > dnsEnd) return null
     }
 
-    repeat(recordCount) {
-        val headerOffset = skipDnsName(data, offset, dnsEnd) ?: return false
-        if (headerOffset + 10 > dnsEnd) return false
+    var minAnswerTtl: Long? = null
+    repeat(recordCount) { recordIndex ->
+        val headerOffset = skipDnsName(data, offset, dnsEnd) ?: return null
+        if (headerOffset + 10 > dnsEnd) return null
         val type = readUInt16(data, headerOffset)
         val ttlOffset = headerOffset + 4
         val rdataLength = readUInt16(data, headerOffset + 8)
         val nextOffset = headerOffset + 10 + rdataLength
-        if (nextOffset > dnsEnd) return false
+        if (nextOffset > dnsEnd) return null
 
         if (type != DNS_TYPE_OPT && type != DNS_TYPE_TKEY && type != DNS_TYPE_TSIG) {
             val originalTtl = readUInt32(data, ttlOffset)
-            val resolverTtl = originalTtl.coerceIn(POSITIVE_DNS_MIN_TTL_SECONDS, POSITIVE_DNS_MAX_TTL_SECONDS)
-            writeUInt32(data, ttlOffset, resolverTtl)
+            val effectiveTtl = if (clampToPolicy) {
+                originalTtl.coerceIn(POSITIVE_DNS_MIN_TTL_SECONDS, POSITIVE_DNS_MAX_TTL_SECONDS)
+            } else {
+                originalTtl
+            }
+            val remainingTtl = (effectiveTtl - ageSeconds).coerceAtLeast(0)
+            writeUInt32(data, ttlOffset, remainingTtl)
+            if (recordIndex < answerCount) {
+                minAnswerTtl = minAnswerTtl?.let { minOf(it, remainingTtl) } ?: remainingTtl
+            }
         }
         offset = nextOffset
     }
-    return true
+    return minAnswerTtl
 }
 
 /**

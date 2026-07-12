@@ -26,6 +26,7 @@ class DnsQueryExecutor(
 
     companion object {
         private const val TAG = "DnsQueryExecutor"
+        private const val DNS_RESPONSE_CACHE_SIZE = 4096
         private const val DNS_RESPONSE_BUFFER_SIZE = 2048
         private const val UDP_SOCKET_POOL_SIZE = 16
     }
@@ -55,12 +56,26 @@ class DnsQueryExecutor(
     private val udpSocketPools = ConcurrentHashMap<String, UdpSocketPool>()
     private val serverAddressCache = ConcurrentHashMap<String, InetAddress>()
     private val inFlightQueries = ConcurrentHashMap<String, CompletableDeferred<DnsQueryResult>>()
+    private val responseCache = DnsResponseCache(DNS_RESPONSE_CACHE_SIZE, ::monotonicNowMs)
 
     private fun monotonicNowMs(): Long = SystemClock.elapsedRealtime()
 
     private fun getQueryKey(domain: String, qtype: Int, qclass: Int): String {
         // domain is already lowercased by parseDnsQueryFromPacket
         return "$domain:$qtype:$qclass"
+    }
+
+    fun getCachedResponseForClient(
+        domain: String,
+        qtype: Int,
+        qclass: Int,
+        query: ByteArray,
+        queryOffset: Int
+    ): ByteArray? {
+        val cached = responseCache.get(getQueryKey(domain, qtype, qclass)) ?: return null
+        return patchResponseForClient(cached.response, query, queryOffset).also { response ->
+            agePositiveDnsTtlsInPlace(response, cached.ageSeconds)
+        }
     }
 
     suspend fun query(
@@ -76,6 +91,17 @@ class DnsQueryExecutor(
         val requestStart = monotonicNowMs()
         val queryKey = getQueryKey(domain, qtype, qclass)
         val activeServers = servers
+
+        getCachedResponseForClient(domain, qtype, qclass, query, queryOffset)?.let { response ->
+            AppLog.d(TAG) { "DNS L2 cache hit: domain=$domain qtype=$qtype" }
+            return DnsQueryResult(
+                success = true,
+                responseBytes = response,
+                responseTime = 0,
+                error = null,
+                fromCache = true
+            )
+        }
 
         if (activeServers.isEmpty()) {
             return DnsQueryResult(
@@ -101,6 +127,7 @@ class DnsQueryExecutor(
 
         try {
             val upstreamResult = queryUpstream(
+                queryKey = queryKey,
                 domain = domain,
                 servers = activeServers,
                 query = query,
@@ -125,6 +152,7 @@ class DnsQueryExecutor(
     }
 
     private suspend fun queryUpstream(
+        queryKey: String,
         domain: String,
         servers: List<DnsServer>,
         query: ByteArray,
@@ -133,6 +161,7 @@ class DnsQueryExecutor(
         qtype: Int,
         timeoutMs: Long
     ): DnsQueryResult = coroutineScope {
+        val cacheGeneration = responseCache.generation()
         val deferreds = servers.map { server ->
             async {
                 val startTime = monotonicNowMs()
@@ -152,7 +181,12 @@ class DnsQueryExecutor(
 
             if (result.result.success) {
                 deferreds.forEach { it.cancel() }
-                result.result.responseBytes?.let(::clampPositiveDnsTtlsInPlace)
+                result.result.responseBytes?.let { response ->
+                    val ttlSeconds = clampPositiveDnsTtlsInPlace(response)
+                    if (ttlSeconds != null) {
+                        responseCache.put(queryKey, response, ttlSeconds, cacheGeneration)
+                    }
+                }
                 AppLog.d(TAG) {
                     "DNS success: domain=$domain qtype=$qtype server=${result.server.name} time=${result.elapsedMs}ms"
                 }
@@ -341,6 +375,7 @@ class DnsQueryExecutor(
     }
 
     fun shutdown() {
+        responseCache.clear()
         inFlightQueries.values.forEach { it.cancel() }
         inFlightQueries.clear()
         udpSocketPools.values.forEach { pool ->
@@ -349,11 +384,18 @@ class DnsQueryExecutor(
         }
         udpSocketPools.clear()
     }
+
+    fun clearResponseCache() {
+        responseCache.clear()
+        // Requests started on the old network must not be joined by new callers.
+        inFlightQueries.clear()
+    }
 }
 
 data class DnsQueryResult(
     val success: Boolean,
     val responseBytes: ByteArray?,
     val responseTime: Long,
-    val error: String?
+    val error: String?,
+    val fromCache: Boolean = false
 )
