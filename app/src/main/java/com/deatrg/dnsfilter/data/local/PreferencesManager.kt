@@ -2,7 +2,9 @@ package com.deatrg.dnsfilter.data.local
 
 import android.content.Context
 import androidx.datastore.core.DataStore
-import androidx.datastore.preferences.core.*
+import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.deatrg.dnsfilter.R
 import com.deatrg.dnsfilter.domain.model.DnsServer
@@ -24,8 +26,7 @@ class PreferencesManager(private val context: Context) {
     }
 
     val dnsServers: Flow<List<DnsServer>> = dataStore.data.map { prefs ->
-        val json = prefs[DNS_SERVERS] ?: "[]"
-        parseServers(json)
+        parseServerList(prefs[DNS_SERVERS])
     }
 
     /**
@@ -40,8 +41,7 @@ class PreferencesManager(private val context: Context) {
     }
 
     val filterLists: Flow<List<FilterList>> = dataStore.data.map { prefs ->
-        val json = prefs[FILTER_LISTS] ?: "[]"
-        parseFilterLists(json)
+        parseFilterListList(prefs[FILTER_LISTS])
     }
 
     /**
@@ -55,87 +55,80 @@ class PreferencesManager(private val context: Context) {
         }
     }
 
-    suspend fun saveDnsServers(servers: List<DnsServer>) {
+    /**
+     * 原子地读-改-写 DNS 服务器列表。
+     * DataStore 保证同一时间只有一个 edit 在执行，消除并发读改写丢更新的问题。
+     */
+    suspend fun editDnsServers(transform: (List<DnsServer>) -> List<DnsServer>) {
         dataStore.edit { prefs ->
-            prefs[DNS_SERVERS] = serversToJson(servers)
+            val updated = transform(parseServerList(prefs[DNS_SERVERS]))
+            prefs[DNS_SERVERS] = serversToJson(updated)
         }
+    }
+
+    /** 原子地读-改-写过滤列表。 */
+    suspend fun editFilterLists(transform: (List<FilterList>) -> List<FilterList>) {
+        dataStore.edit { prefs ->
+            val updated = transform(parseFilterListList(prefs[FILTER_LISTS]))
+            prefs[FILTER_LISTS] = filterListsToJson(updated)
+        }
+    }
+
+    suspend fun saveDnsServers(servers: List<DnsServer>) {
+        editDnsServers { servers }
     }
 
     suspend fun resetDnsServersToDefaults() {
-        saveDnsServers(getDefaultServers())
+        editDnsServers { getDefaultServers() }
     }
 
     suspend fun saveFilterLists(lists: List<FilterList>) {
-        dataStore.edit { prefs ->
-            prefs[FILTER_LISTS] = filterListsToJson(lists)
-        }
+        editFilterLists { lists }
     }
 
-    private fun parseServers(json: String): List<DnsServer> {
-        return try {
-            val array = JSONArray(json)
-            (0 until array.length()).map { i ->
-                val obj = array.getJSONObject(i)
-                DnsServer(
-                    id = obj.getString("id"),
-                    name = obj.getString("name"),
-                    address = obj.getString("address"),
-                    isEnabled = obj.getBoolean("isEnabled"),
-                    isBuiltIn = obj.getBoolean("isBuiltIn")
-                )
-            }
-        } catch (e: Exception) {
-            getDefaultServers()
+    private fun parseServerList(json: String?): List<DnsServer> =
+        decodeJsonList(json, fallback = ::getDefaultServers) { obj ->
+            DnsServer(
+                id = obj.getString("id"),
+                name = obj.getString("name"),
+                address = obj.getString("address"),
+                isEnabled = obj.getBoolean("isEnabled"),
+                isBuiltIn = obj.getBoolean("isBuiltIn")
+            )
         }
-    }
 
-    private fun parseFilterLists(json: String): List<FilterList> {
-        return try {
-            val array = JSONArray(json)
-            (0 until array.length()).map { i ->
-                val obj = array.getJSONObject(i)
-                FilterList(
-                    id = obj.getString("id"),
-                    name = obj.getString("name"),
-                    url = obj.getString("url"),
-                    isEnabled = obj.getBoolean("isEnabled"),
-                    isBuiltIn = obj.getBoolean("isBuiltIn")
-                )
-            }
-        } catch (e: Exception) {
-            getDefaultFilterLists()
+    private fun parseFilterListList(json: String?): List<FilterList> =
+        decodeJsonList(json, fallback = ::getDefaultFilterLists) { obj ->
+            FilterList(
+                id = obj.getString("id"),
+                name = obj.getString("name"),
+                url = obj.getString("url"),
+                isEnabled = obj.getBoolean("isEnabled"),
+                isBuiltIn = obj.getBoolean("isBuiltIn")
+            )
         }
-    }
 
-    private fun serversToJson(servers: List<DnsServer>): String {
-        val array = JSONArray()
-        servers.forEach { server ->
-            val obj = JSONObject().apply {
+    private fun serversToJson(servers: List<DnsServer>): String =
+        encodeJsonList(servers) { server ->
+            JSONObject().apply {
                 put("id", server.id)
                 put("name", server.name)
                 put("address", server.address)
                 put("isEnabled", server.isEnabled)
                 put("isBuiltIn", server.isBuiltIn)
             }
-            array.put(obj)
         }
-        return array.toString()
-    }
 
-    private fun filterListsToJson(lists: List<FilterList>): String {
-        val array = JSONArray()
-        lists.forEach { list ->
-            val obj = JSONObject().apply {
+    private fun filterListsToJson(lists: List<FilterList>): String =
+        encodeJsonList(lists) { list ->
+            JSONObject().apply {
                 put("id", list.id)
                 put("name", list.name)
                 put("url", list.url)
                 put("isEnabled", list.isEnabled)
                 put("isBuiltIn", list.isBuiltIn)
             }
-            array.put(obj)
         }
-        return array.toString()
-    }
 
     private fun getDefaultServers(): List<DnsServer> = listOf(
         // Tencent DNS (Primary)
@@ -181,4 +174,34 @@ class PreferencesManager(private val context: Context) {
             isBuiltIn = true
         )
     )
+}
+
+private inline fun <T> encodeJsonList(items: List<T>, toJson: (T) -> JSONObject): String {
+    val array = JSONArray()
+    items.forEach { array.put(toJson(it)) }
+    return array.toString()
+}
+
+/**
+ * 解析 JSON 数组。整个数组损坏时返回 fallback 默认值；
+ * 单条损坏时只跳过该条，避免一条脏数据导致用户全部配置丢失。
+ */
+private inline fun <T : Any> decodeJsonList(
+    json: String?,
+    fallback: () -> List<T>,
+    fromJson: (JSONObject) -> T?
+): List<T> {
+    if (json.isNullOrEmpty()) return fallback()
+    return try {
+        val array = JSONArray(json)
+        (0 until array.length()).mapNotNull { i ->
+            try {
+                fromJson(array.getJSONObject(i))
+            } catch (e: Exception) {
+                null
+            }
+        }
+    } catch (e: Exception) {
+        fallback()
+    }
 }

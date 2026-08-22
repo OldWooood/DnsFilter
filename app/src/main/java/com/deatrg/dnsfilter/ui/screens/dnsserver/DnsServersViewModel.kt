@@ -3,6 +3,8 @@ package com.deatrg.dnsfilter.ui.screens.dnsserver
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
 import com.deatrg.dnsfilter.ServiceLocator
 import com.deatrg.dnsfilter.domain.model.DnsServer
 import com.deatrg.dnsfilter.domain.repository.DnsServerRepository
@@ -47,10 +49,11 @@ class DnsServersViewModel(
         }
     }
 
-    class Factory : ViewModelProvider.Factory {
-        @Suppress("UNCHECKED_CAST")
-        override fun <T : ViewModel> create(modelClass: Class<T>): T {
-            return DnsServersViewModel(ServiceLocator.provideDnsServerRepository()) as T
+    companion object {
+        val Factory: ViewModelProvider.Factory = viewModelFactory {
+            initializer {
+                DnsServersViewModel(ServiceLocator.provideDnsServerRepository())
+            }
         }
     }
 }

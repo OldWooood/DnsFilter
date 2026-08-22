@@ -9,6 +9,7 @@ import com.deatrg.dnsfilter.data.repository.DnsServerRepositoryImpl
 import com.deatrg.dnsfilter.data.repository.FilterListRepositoryImpl
 import com.deatrg.dnsfilter.domain.repository.DnsServerRepository
 import com.deatrg.dnsfilter.domain.repository.FilterListRepository
+import com.deatrg.dnsfilter.service.VpnStateHolder
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -28,12 +29,20 @@ object ServiceLocator {
     @Volatile
     private var preferencesManager: PreferencesManager? = null
 
-    @SuppressLint("StaticFieldLeak")
     @Volatile
     private var domainFilter: DomainFilter? = null
 
     @Volatile
     private var statisticsBuffer: StatisticsBuffer? = null
+
+    @Volatile
+    private var vpnStateHolder: VpnStateHolder? = null
+
+    @Volatile
+    private var dnsServerRepository: DnsServerRepository? = null
+
+    @Volatile
+    private var filterListRepository: FilterListRepository? = null
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -78,11 +87,26 @@ object ServiceLocator {
         }
     }
 
-    fun provideDnsServerRepository(): DnsServerRepository {
-        return DnsServerRepositoryImpl(providePreferencesManager())
+    fun provideVpnStateHolder(): VpnStateHolder {
+        return vpnStateHolder ?: synchronized(this) {
+            vpnStateHolder ?: VpnStateHolder().also { vpnStateHolder = it }
+        }
     }
 
-    fun provideFilterListRepository(): FilterListRepositoryImpl {
-        return FilterListRepositoryImpl(providePreferencesManager(), provideDomainFilter())
+    fun provideDnsServerRepository(): DnsServerRepository {
+        return dnsServerRepository ?: synchronized(this) {
+            dnsServerRepository ?: DnsServerRepositoryImpl(
+                providePreferencesManager()
+            ).also { dnsServerRepository = it }
+        }
+    }
+
+    fun provideFilterListRepository(): FilterListRepository {
+        return filterListRepository ?: synchronized(this) {
+            filterListRepository ?: FilterListRepositoryImpl(
+                providePreferencesManager(),
+                provideDomainFilter()
+            ).also { filterListRepository = it }
+        }
     }
 }

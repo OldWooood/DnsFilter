@@ -3,6 +3,8 @@ package com.deatrg.dnsfilter.ui.screens.filterlist
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
 import com.deatrg.dnsfilter.ServiceLocator
 import com.deatrg.dnsfilter.domain.model.FilterList
 import com.deatrg.dnsfilter.domain.repository.FilterListRepository
@@ -70,10 +72,11 @@ class FilterListsViewModel(
         }
     }
 
-    class Factory : ViewModelProvider.Factory {
-        @Suppress("UNCHECKED_CAST")
-        override fun <T : ViewModel> create(modelClass: Class<T>): T {
-            return FilterListsViewModel(ServiceLocator.provideFilterListRepository()) as T
+    companion object {
+        val Factory: ViewModelProvider.Factory = viewModelFactory {
+            initializer {
+                FilterListsViewModel(ServiceLocator.provideFilterListRepository())
+            }
         }
     }
 }

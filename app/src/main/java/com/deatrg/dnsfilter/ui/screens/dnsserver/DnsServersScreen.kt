@@ -57,7 +57,7 @@ import com.deatrg.dnsfilter.ui.components.StatusDot
 
 @Composable
 fun DnsServersScreen(
-    viewModel: DnsServersViewModel = viewModel(factory = DnsServersViewModel.Factory())
+    viewModel: DnsServersViewModel = viewModel(factory = DnsServersViewModel.Factory)
 ) {
     val servers by viewModel.dnsServers.collectAsStateWithLifecycle(initialValue = emptyList())
     var showAddDialog by remember { mutableStateOf(false) }

@@ -11,6 +11,8 @@
     <string name="dashboard_eyebrow">On-device resolver</string>
     <string name="dashboard_rules_loaded">%1$s rules</string>
     <string name="dashboard_snackbar_no_dns_servers">Please enable at least one DNS server</string>
+    <string name="dashboard_snackbar_no_blocklist">No blocklist data available. Check your filter lists and network connection.</string>
+    <string name="dashboard_snackbar_vpn_start_failed">Failed to start VPN. Please try again.</string>
     <string name="status_stopping">Stopping…</string>
     <string name="status_starting">Starting…</string>
     <string name="status_protection_active">Protection Active</string>

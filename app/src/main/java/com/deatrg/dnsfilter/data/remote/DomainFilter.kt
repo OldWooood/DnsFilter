@@ -4,8 +4,14 @@ import android.content.Context
 import com.deatrg.dnsfilter.AppLog
 import com.deatrg.dnsfilter.data.local.BlocklistCacheManager
 import com.deatrg.dnsfilter.domain.model.FilterList
-import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.BufferedReader
@@ -26,6 +32,9 @@ class DomainFilter(
     @Volatile
     private var blockedDomains: Set<String> = emptySet()
 
+    @Volatile
+    private var filterListsToLoad: List<FilterList> = emptyList()
+
     private val _isLoaded = MutableStateFlow(false)
     val isLoaded: StateFlow<Boolean> = _isLoaded.asStateFlow()
 
@@ -34,7 +43,7 @@ class DomainFilter(
 
     private val _filterListCount = MutableStateFlow(0)
     val filterListCount: StateFlow<Int> = _filterListCount.asStateFlow()
-    
+
     // 下载进度：已下载数量 / 总数
     private val _downloadProgress = MutableStateFlow<Pair<Int, Int>?>(null)
     val downloadProgress: StateFlow<Pair<Int, Int>?> = _downloadProgress.asStateFlow()
@@ -44,14 +53,13 @@ class DomainFilter(
 
     private val cacheVersionCounter = AtomicLong(0L)
 
-    private var filterListsToLoad: List<FilterList> = emptyList()
-
     /**
      * 设置要加载的过滤列表（从本地缓存加载，如果没有缓存则标记需要下载）
      */
     suspend fun setFilterLists(filterLists: List<FilterList>) = withContext(Dispatchers.IO) {
-        filterListsToLoad = filterLists.filter { it.isEnabled }
-        
+        val enabled = filterLists.filter { it.isEnabled }
+        filterListsToLoad = enabled
+
         // 重置状态
         _isLoaded.value = false
         _isLoading.value = false
@@ -60,34 +68,17 @@ class DomainFilter(
         blockedDomains = emptySet()
 
         // 如果没有启用的过滤列表，直接标记为已加载（空 blocklist 是合法状态）
-        if (filterListsToLoad.isEmpty()) {
-            _filterListCount.value = 0
-            _isLoaded.value = true
+        if (enabled.isEmpty()) {
             AppLog.d(TAG, "No filter lists enabled, marking as loaded with empty blocklist")
+            _isLoaded.value = true
             return@withContext
         }
 
-        // 从本地缓存加载
-        var totalLoaded = 0
-        val newBlockedDomains = HashSet<String>()
-        val cachedBlocklists = loadCachedBlocklists(filterListsToLoad)
-        filterListsToLoad.forEach { filterList ->
-            val cachedDomains = cachedBlocklists[filterList]
-            if (cachedDomains != null) {
-                addDomainsToBlocklist(cachedDomains, newBlockedDomains)
-                totalLoaded += cachedDomains.size
-                AppLog.d(TAG, "Loaded ${cachedDomains.size} domains from cache for ${filterList.name}")
-            }
+        // 并行从本地缓存加载
+        val cachedBlocklists = coroutineScope {
+            enabled.map { list -> async { cacheManager.loadBlocklist(list) } }.awaitAll()
         }
-
-        blockedDomains = newBlockedDomains
-        _filterListCount.value = newBlockedDomains.size
-
-        // 只要有数据就标记为已加载（允许部分列表失败）
-        if (totalLoaded > 0) {
-            _isLoaded.value = true
-            AppLog.d(TAG, "Total loaded from cache: $totalLoaded domains")
-        }
+        applyMergedDomains(cachedBlocklists.filterNotNull())
     }
 
     /**
@@ -127,11 +118,11 @@ class DomainFilter(
                         }
                 }
             }
-            
+
             // 保存到缓存
             cacheManager.saveBlocklist(filterList, domains)
             notifyCacheChanged()
-            
+
             AppLog.d(TAG, "Downloaded ${domains.size} domains for ${filterList.name}")
             domains
         } catch (e: Exception) {
@@ -148,60 +139,54 @@ class DomainFilter(
     suspend fun loadFilterLists(forceReload: Boolean = false): Boolean = withContext(Dispatchers.IO) {
         if (_isLoading.value) return@withContext _isLoaded.value
 
+        val lists = filterListsToLoad
+
         // 如果没有需要加载的列表，直接返回 true（空 blocklist 是合法状态）
-        if (filterListsToLoad.isEmpty()) {
+        if (lists.isEmpty()) {
             _isLoaded.value = true
             AppLog.d(TAG, "No filter lists to load, returning success with empty blocklist")
             return@withContext true
         }
 
         _isLoading.value = true
-        _downloadProgress.value = Pair(0, filterListsToLoad.size)
-        val downloadedCount = AtomicInteger(0)
+        _downloadProgress.value = Pair(0, lists.size)
 
         try {
-            var loadedCount = 0
-            val newBlockedDomains = HashSet<String>()
-
-            filterListsToLoad.forEach { filterList ->
-                val hasCache = cacheManager.hasCache(filterList)
-
-                val domains = if (hasCache && !forceReload && !cacheManager.needsUpdate(filterList)) {
-                    // 使用缓存（除非强制刷新）
-                    cacheManager.loadBlocklist(filterList)
-                } else {
-                    // 需要下载
-                    val downloadedDomains = downloadFilterListDomains(filterList)
-                    if (downloadedDomains != null) {
-                        loadedCount++
-                        downloadedDomains
-                    } else {
-                        // 下载失败，尝试使用旧缓存
-                        if (hasCache) {
-                            AppLog.w(TAG, "Download failed for ${filterList.name}, using old cache")
-                            cacheManager.loadBlocklist(filterList)
-                        } else {
-                            null
-                        }
+            // 各列表并行下载/加载，互不阻塞
+            val sources = coroutineScope {
+                val completed = AtomicInteger(0)
+                lists.map { filterList ->
+                    async {
+                        val result = obtainDomains(filterList, forceReload)
+                        _downloadProgress.value = Pair(completed.incrementAndGet(), lists.size)
+                        result
                     }
-                }
-
-                domains?.let { addDomainsToBlocklist(it, newBlockedDomains) }
-                downloadedCount.incrementAndGet()
-                _downloadProgress.value = Pair(downloadedCount.get(), filterListsToLoad.size)
+                }.awaitAll()
             }
 
-            blockedDomains = newBlockedDomains
-            _filterListCount.value = newBlockedDomains.size
-
-            val hasAnyData = newBlockedDomains.isNotEmpty()
-            _isLoaded.value = hasAnyData
-
-            AppLog.d(TAG, "loadFilterLists completed: ${newBlockedDomains.size} domains, loaded=$loadedCount/${filterListsToLoad.size}")
-            hasAnyData
+            applyMergedDomains(sources.filterNotNull())
+            _isLoaded.value
         } finally {
             _isLoading.value = false
             _downloadProgress.value = null
+        }
+    }
+
+    /** 缓存优先；过期或强制刷新时下载，下载失败回退旧缓存。 */
+    private suspend fun obtainDomains(filterList: FilterList, forceReload: Boolean): Set<String>? {
+        val hasCache = cacheManager.hasCache(filterList)
+
+        return if (hasCache && !forceReload && !cacheManager.needsUpdate(filterList)) {
+            cacheManager.loadBlocklist(filterList)
+        } else {
+            downloadFilterListDomains(filterList) ?: run {
+                if (hasCache) {
+                    AppLog.w(TAG, "Download failed for ${filterList.name}, using old cache")
+                    cacheManager.loadBlocklist(filterList)
+                } else {
+                    null
+                }
+            }
         }
     }
 
@@ -216,66 +201,29 @@ class DomainFilter(
      * 从缓存重新加载所有列表
      */
     suspend fun reloadAllFromCache() = withContext(Dispatchers.IO) {
-        val cachedBlocklists = loadCachedBlocklists(filterListsToLoad)
-        val totalDomains = cachedBlocklists.values.sumOf { it.size }
+        val cachedBlocklists = coroutineScope {
+            filterListsToLoad.map { list -> async { cacheManager.loadBlocklist(list) } }.awaitAll()
+        }
+        applyMergedDomains(cachedBlocklists.filterNotNull())
+    }
 
-        // 使用预分配容量创建新集合
-        val newBlockedDomains = HashSet<String>(totalDomains.coerceAtLeast(1000))
-
-        filterListsToLoad.forEach { filterList ->
-            val cachedDomains = cachedBlocklists[filterList]
-            if (cachedDomains != null) {
-                cachedDomains.forEach { domain ->
-                    if (!domain.contains("*")) {
-                        newBlockedDomains.add(domain)
-                    }
+    /** 合并各列表域名（忽略通配符条目）并发布到内存与状态流。 */
+    private fun applyMergedDomains(sources: List<Set<String>>) {
+        var capacityHint = 0
+        sources.forEach { capacityHint += it.size }
+        val merged = HashSet<String>(capacityHint.coerceAtLeast(1000))
+        sources.forEach { source ->
+            source.forEach { domain ->
+                if (!domain.contains("*")) {
+                    merged.add(domain)
                 }
             }
         }
 
-        blockedDomains = newBlockedDomains
-        _filterListCount.value = newBlockedDomains.size
-        _isLoaded.value = newBlockedDomains.isNotEmpty()
-    }
-
-    private fun addDomainsToBlocklist(
-        domains: Set<String>,
-        blockedDomains: MutableSet<String>
-    ) {
-        domains.forEach { domain ->
-            if (!domain.contains("*")) {
-                blockedDomains.add(domain)
-            }
-        }
-    }
-
-    private fun parseHostLine(line: String): String? {
-        if (line.isEmpty() || line[0] == '#') return null
-
-        val firstWhitespace = line.indexOfFirst { it.isWhitespace() }
-        if (firstWhitespace >= 0) {
-            val ip = line.substring(0, firstWhitespace)
-            if (ip != "0.0.0.0" && ip != "127.0.0.1") return null
-
-            var domainStart = firstWhitespace + 1
-            while (domainStart < line.length && line[domainStart].isWhitespace()) {
-                domainStart++
-            }
-            if (domainStart >= line.length) return null
-
-            var domainEnd = domainStart
-            while (domainEnd < line.length && !line[domainEnd].isWhitespace()) {
-                domainEnd++
-            }
-            val domain = line.substring(domainStart, domainEnd).lowercase().trimEnd('.')
-            return if (domain.isNotEmpty()) domain else null
-        }
-
-        return if (line.contains(".")) {
-            line.lowercase().trimEnd('.')
-        } else {
-            null
-        }
+        blockedDomains = merged
+        _filterListCount.value = merged.size
+        _isLoaded.value = merged.isNotEmpty()
+        AppLog.d(TAG, "Blocklist updated: ${merged.size} domains from ${sources.size} lists")
     }
 
     fun isDomainBlocked(domain: String): Boolean {
@@ -286,18 +234,49 @@ class DomainFilter(
      * 获取指定过滤列表的最后更新时间
      */
     fun getFilterLastUpdated(filterList: FilterList): Long? {
-        return cacheManager.getLastUpdated(filterList.url)
-    }
-
-    private suspend fun loadCachedBlocklists(filterLists: List<FilterList>): Map<FilterList, Set<String>> {
-        val loaded = LinkedHashMap<FilterList, Set<String>>(filterLists.size)
-        filterLists.forEach { filterList ->
-            cacheManager.loadBlocklist(filterList)?.let { loaded[filterList] = it }
-        }
-        return loaded
+        return cacheManager.getLastUpdated(filterList.id)
     }
 
     private fun notifyCacheChanged() {
         _cacheVersion.value = cacheVersionCounter.incrementAndGet()
     }
+}
+
+/**
+ * 解析 hosts 格式行（`0.0.0.0 domain` / `127.0.0.1 domain`）或纯域名行，
+ * 返回小写化并去掉尾部点的域名；无法解析时返回 null。
+ */
+internal fun parseHostLine(rawLine: String): String? {
+    val line = rawLine.trim()
+    if (line.isEmpty() || line[0] == '#') return null
+
+    val firstWhitespace = line.indexOfFirst { it.isWhitespace() }
+    if (firstWhitespace >= 0) {
+        val ip = line.substring(0, firstWhitespace)
+        if (ip != "0.0.0.0" && ip != "127.0.0.1") return null
+
+        var domainStart = firstWhitespace + 1
+        while (domainStart < line.length && line[domainStart].isWhitespace()) {
+            domainStart++
+        }
+        if (domainStart >= line.length) return null
+
+        var domainEnd = domainStart
+        while (domainEnd < line.length && !line[domainEnd].isWhitespace()) {
+            domainEnd++
+        }
+        val domain = line.substring(domainStart, domainEnd).lowercase().trimEnd('.')
+        return if (domain.isNotEmpty()) domain else null
+    }
+
+    return if (line.contains(".") && !looksLikeIpLiteral(line)) {
+        line.lowercase().trimEnd('.')
+    } else {
+        null
+    }
+}
+
+/** 仅由数字和点组成（如 `0.0.0.0`）的 token 是 IP 字面量，不是可拦截的域名。 */
+private fun looksLikeIpLiteral(token: String): Boolean {
+    return token.isNotEmpty() && token.all { it.isDigit() || it == '.' }
 }

@@ -11,6 +11,9 @@ internal const val POSITIVE_DNS_MIN_TTL_SECONDS = 60L * 60L
 internal const val POSITIVE_DNS_MAX_TTL_SECONDS = 6L * 60L * 60L
 internal const val BLOCKED_DOMAIN_TTL_SECONDS = 24L * 60L * 60L
 
+internal const val DNS_RCODE_NOERROR = 0
+internal const val DNS_RCODE_SERVFAIL = 2
+
 private const val DNS_HEADER_SIZE = 12
 private const val DNS_TYPE_OPT = 41
 private const val DNS_TYPE_TKEY = 249
@@ -222,6 +225,65 @@ internal fun patchBlockedNxDomainResponse(
     writeUInt32(packet, offset, BLOCKED_DOMAIN_TTL_SECONDS) // Negative cache TTL
     offset += 4
     return offset - dnsStart
+}
+
+/**
+ * Restores the client's transaction ID and RD bit on an upstream response
+ * that was copied into the client packet buffer.
+ */
+internal fun patchDnsResponseForClient(
+    packet: ByteArray,
+    dnsStart: Int,
+    transactionId0: Byte,
+    transactionId1: Byte,
+    recursionDesired: Int
+) {
+    packet[dnsStart] = transactionId0
+    packet[dnsStart + 1] = transactionId1
+    packet[dnsStart + 2] = (
+        (packet[dnsStart + 2].toInt() and 0xFE) or recursionDesired
+    ).toByte()
+}
+
+/**
+ * Builds a question-only error response with the given RCODE.
+ * Returns the DNS message length.
+ */
+internal fun patchDnsErrorResponse(
+    packet: ByteArray,
+    dnsStart: Int,
+    questionEndOffset: Int,
+    errorCode: Int
+): Int {
+    val rdBit = packet[dnsStart + 2].toInt() and 0x01
+    packet[dnsStart + 2] = (0x80 or rdBit).toByte()
+    packet[dnsStart + 3] = (0x80 or (errorCode and 0x0F)).toByte()
+
+    // QDCOUNT = 1; ANCOUNT, NSCOUNT and ARCOUNT = 0.
+    packet[dnsStart + 4] = 0
+    packet[dnsStart + 5] = 1
+    packet[dnsStart + 6] = 0
+    packet[dnsStart + 7] = 0
+    packet[dnsStart + 8] = 0
+    packet[dnsStart + 9] = 0
+    packet[dnsStart + 10] = 0
+    packet[dnsStart + 11] = 0
+
+    return questionEndOffset - dnsStart
+}
+
+/**
+ * Builds an error response with RCODE=0 plus the TC (truncated) flag set,
+ * telling the client to retry over TCP.
+ */
+internal fun patchDnsTruncatedResponse(
+    packet: ByteArray,
+    dnsStart: Int,
+    questionEndOffset: Int
+): Int {
+    val responseLength = patchDnsErrorResponse(packet, dnsStart, questionEndOffset, DNS_RCODE_NOERROR)
+    packet[dnsStart + 2] = (packet[dnsStart + 2].toInt() or 0x02).toByte()
+    return responseLength
 }
 
 /**

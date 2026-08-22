@@ -1,7 +1,6 @@
 package com.deatrg.dnsfilter.ui.screens.dashboard
 
 import android.app.Activity
-import android.app.Application
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
@@ -34,7 +33,6 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
@@ -45,9 +43,6 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.deatrg.dnsfilter.R
@@ -61,11 +56,9 @@ import java.util.Locale
 
 @Composable
 fun DashboardScreen(
-    viewModel: DashboardViewModel = viewModel(
-        factory = DashboardViewModel.Factory(LocalContext.current.applicationContext as Application)
-    )
+    viewModel: DashboardViewModel = viewModel(factory = DashboardViewModel.Factory)
 ) {
-    val isRunning by viewModel.isVpnActuallyRunning.collectAsStateWithLifecycle(initialValue = false)
+    val isRunning by viewModel.isVpnRunning.collectAsStateWithLifecycle(initialValue = false)
     val isProcessing by viewModel.isVpnProcessing.collectAsStateWithLifecycle(initialValue = false)
     val statistics by viewModel.statistics.collectAsStateWithLifecycle(initialValue = null)
     val filterCount by viewModel.filterListCount.collectAsStateWithLifecycle(initialValue = 0)
@@ -81,22 +74,14 @@ fun DashboardScreen(
     }
 
     LaunchedEffect(Unit) {
-        viewModel.showNoDnsServersError.collect {
-            snackbarHostState.showSnackbar(context.getString(R.string.dashboard_snackbar_no_dns_servers))
-        }
-    }
-
-    val lifecycleOwner = LocalLifecycleOwner.current
-    DisposableEffect(lifecycleOwner) {
-        val observer = LifecycleEventObserver { _, event ->
-            when (event) {
-                Lifecycle.Event.ON_RESUME -> viewModel.resume()
-                Lifecycle.Event.ON_PAUSE -> viewModel.pause()
-                else -> Unit
+        viewModel.vpnErrors.collect { error ->
+            val messageRes = when (error) {
+                VpnError.NoDnsServers -> R.string.dashboard_snackbar_no_dns_servers
+                VpnError.NoBlocklistData -> R.string.dashboard_snackbar_no_blocklist
+                VpnError.StartFailed -> R.string.dashboard_snackbar_vpn_start_failed
             }
+            snackbarHostState.showSnackbar(context.getString(messageRes))
         }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     val toggleVpn: (Boolean) -> Unit = { enabled ->

@@ -53,7 +53,10 @@ app/src/main/java/com/deatrg/dnsfilter/
 │   └── repository/
 │       └── Repositories.kt       # DnsServerRepository and FilterListRepository interfaces
 ├── service/
-│   └── DnsVpnService.kt          # Core VpnService: intercepts packets, parses DNS, filters, responds
+│   ├── DnsVpnService.kt          # Core VpnService: intercepts packets, parses DNS, filters, responds
+│   ├── PacketRewriter.kt         # Rewrites intercepted query packets into responses (IP/UDP headers + checksums)
+│   ├── VpnNotifications.kt       # Foreground notification channel and builder
+│   └── VpnStateHolder.kt         # Single source of truth for VPN running state; UI subscribes instead of polling
 └── ui/
     ├── MainActivity.kt
     ├── navigation/
@@ -123,7 +126,12 @@ APKs are output to `app/build/outputs/apk/`. The build produces split APKs by AB
 
 ### Concurrency Control
 - `DnsVpnService` uses a bounded 1024-entry upstream queue and a fixed worker pool.
+- Query coalescing lives in exactly one place: `DnsQueryExecutor.inFlightQueries`. Do not add a second coalescing layer in `DnsVpnService`.
+- `DnsVpnService` serializes start/stop through `lifecycleMutex`; the service `scope` is never cancelled, only individual jobs are (fast off→on toggles must keep working).
 - Matching in-flight L2 misses share one logical lookup; `DnsQueryExecutor` still sends that lookup concurrently to every enabled server.
+
+### VPN State
+- `VpnStateHolder` (provided by `ServiceLocator`) is the single source of truth for whether the VPN is running. `DnsVpnService` writes it; UI and waiters subscribe to its `StateFlow`. Never poll static flags or reintroduce `runBlocking` on the main thread.
 
 ## Code Style Guidelines
 

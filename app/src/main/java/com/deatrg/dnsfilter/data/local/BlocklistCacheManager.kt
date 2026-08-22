@@ -1,25 +1,38 @@
 package com.deatrg.dnsfilter.data.local
 
 import android.content.Context
+import com.deatrg.dnsfilter.AppLog
 import com.deatrg.dnsfilter.domain.model.FilterList
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.io.*
+import org.json.JSONObject
+import java.io.BufferedReader
+import java.io.BufferedWriter
+import java.io.File
+import java.io.FileReader
+import java.io.FileWriter
+import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 /**
  * Blocklist 本地缓存管理器
  * 将下载的过滤规则持久化到磁盘，避免每次启动都重新下载
+ *
+ * 缓存文件与元数据均按 filterList.id 做 key，保证编辑 URL 后元数据一致。
  */
 class BlocklistCacheManager(private val context: Context) {
 
     companion object {
+        private const val TAG = "BlocklistCache"
         private const val CACHE_DIR = "blocklist_cache"
         private const val META_FILE = "cache_meta.json"
+        private const val CACHE_SUFFIX = ".txt"
+        private const val TMP_SUFFIX = ".tmp"
         private const val UPDATE_INTERVAL_HOURS = 24L // Cache freshness window; manual refresh bypasses this.
-        
+
         // 缓存元数据
         private data class CacheMeta(
+            val id: String,
             val url: String,
             val lastUpdated: Long,
             val domainCount: Int
@@ -35,37 +48,39 @@ class BlocklistCacheManager(private val context: Context) {
     @Volatile
     private var metaCache: MutableMap<String, CacheMeta>? = null
 
-    /**
-     * 获取缓存文件
-     */
     private fun getCacheFile(filterListId: String): File {
-        return File(cacheDir, "${filterListId}.txt")
+        return File(cacheDir, "$filterListId$CACHE_SUFFIX")
     }
 
     /**
-     * 获取元数据文件
-     */
-    private fun getMetaFile(): File {
-        return File(cacheDir, META_FILE)
-    }
-
-    /**
-     * 保存 blocklist 到缓存
+     * 保存 blocklist 到缓存。
+     * 先写临时文件再原子 rename，避免写一半崩溃留下损坏的缓存。
      */
     suspend fun saveBlocklist(filterList: FilterList, domains: Set<String>) = withContext(Dispatchers.IO) {
-        val cacheFile = getCacheFile(filterList.id)
+        val target = getCacheFile(filterList.id)
+        val tmp = File(cacheDir, "$filterList.id$CACHE_SUFFIX$TMP_SUFFIX")
         try {
-            BufferedWriter(FileWriter(cacheFile)).use { writer ->
+            BufferedWriter(FileWriter(tmp)).use { writer ->
                 domains.forEach { domain ->
                     writer.write(domain)
                     writer.newLine()
                 }
             }
-            
+            if (!tmp.renameTo(target)) {
+                // 某些文件系统上 rename 不能覆盖已存在的文件
+                if (target.exists() && !target.delete()) {
+                    throw IOException("Failed to delete old cache file ${target.name}")
+                }
+                if (!tmp.renameTo(target)) {
+                    throw IOException("Failed to rename cache file ${tmp.name}")
+                }
+            }
+
             // 更新元数据
             updateMeta(filterList, domains.size)
         } catch (e: Exception) {
-            e.printStackTrace()
+            tmp.delete()
+            AppLog.e(TAG, "Failed to save blocklist cache for ${filterList.name}", e)
         }
     }
 
@@ -75,7 +90,7 @@ class BlocklistCacheManager(private val context: Context) {
     suspend fun loadBlocklist(filterList: FilterList): Set<String>? = withContext(Dispatchers.IO) {
         val cacheFile = getCacheFile(filterList.id)
         if (!cacheFile.exists()) return@withContext null
-        
+
         try {
             val domains = mutableSetOf<String>()
             BufferedReader(FileReader(cacheFile)).use { reader ->
@@ -87,7 +102,7 @@ class BlocklistCacheManager(private val context: Context) {
             }
             domains
         } catch (e: Exception) {
-            e.printStackTrace()
+            AppLog.e(TAG, "Failed to load blocklist cache for ${filterList.name}", e)
             null
         }
     }
@@ -96,9 +111,9 @@ class BlocklistCacheManager(private val context: Context) {
      * 检查缓存是否需要更新
      */
     fun needsUpdate(filterList: FilterList): Boolean {
-        val meta = getMeta(filterList.url)
+        val meta = getMeta(filterList.id)
         if (meta == null) return true
-        
+
         val hoursSinceUpdate = (System.currentTimeMillis() - meta.lastUpdated) / TimeUnit.HOURS.toMillis(1)
         return hoursSinceUpdate >= UPDATE_INTERVAL_HOURS
     }
@@ -111,10 +126,10 @@ class BlocklistCacheManager(private val context: Context) {
     }
 
     /**
-     * 获取指定 URL 的最后更新时间
+     * 获取指定列表的最后更新时间
      */
-    fun getLastUpdated(url: String): Long? {
-        return getMeta(url)?.lastUpdated
+    fun getLastUpdated(filterListId: String): Long? {
+        return getMeta(filterListId)?.lastUpdated
     }
 
     /**
@@ -122,13 +137,14 @@ class BlocklistCacheManager(private val context: Context) {
      */
     suspend fun clearCache(filterList: FilterList) = withContext(Dispatchers.IO) {
         getCacheFile(filterList.id).delete()
-        removeMeta(filterList.url)
+        removeMeta(filterList.id)
     }
 
     private fun updateMeta(filterList: FilterList, domainCount: Int) {
         val snapshot = synchronized(metaLock) {
             val metaMap = getOrLoadMetaCache()
-            metaMap[filterList.url] = CacheMeta(
+            metaMap[filterList.id] = CacheMeta(
+                id = filterList.id,
                 url = filterList.url,
                 lastUpdated = System.currentTimeMillis(),
                 domainCount = domainCount
@@ -138,31 +154,32 @@ class BlocklistCacheManager(private val context: Context) {
         saveAllMeta(snapshot)
     }
 
-    private fun getMeta(url: String): CacheMeta? {
+    private fun getMeta(id: String): CacheMeta? {
         return synchronized(metaLock) {
-            getOrLoadMetaCache()[url]
+            getOrLoadMetaCache()[id]
         }
     }
 
-    private fun removeMeta(url: String) {
+    private fun removeMeta(id: String) {
         val snapshot = synchronized(metaLock) {
             val metaMap = getOrLoadMetaCache()
-            metaMap.remove(url)
+            metaMap.remove(id)
             metaMap.toMap()
         }
         saveAllMeta(snapshot)
     }
 
     private fun loadAllMetaFromDisk(): Map<String, CacheMeta> {
-        val metaFile = getMetaFile()
+        val metaFile = File(cacheDir, META_FILE)
         if (!metaFile.exists()) return emptyMap()
-        
+
         return try {
             BufferedReader(FileReader(metaFile)).use { reader ->
                 val json = reader.readText()
                 parseMetaJson(json)
             }
         } catch (e: Exception) {
+            AppLog.w(TAG) { "Failed to load cache meta: ${e.message}" }
             emptyMap()
         }
     }
@@ -178,40 +195,53 @@ class BlocklistCacheManager(private val context: Context) {
     }
 
     private fun saveAllMeta(metaMap: Map<String, CacheMeta>) {
+        val tmp = File(cacheDir, "$META_FILE$TMP_SUFFIX")
         try {
-            BufferedWriter(FileWriter(getMetaFile())).use { writer ->
+            BufferedWriter(FileWriter(tmp)).use { writer ->
                 writer.write(metaMapToJson(metaMap))
             }
+            val target = File(cacheDir, META_FILE)
+            if (!tmp.renameTo(target)) {
+                if (target.exists() && !target.delete()) {
+                    throw IOException("Failed to delete old meta file")
+                }
+                if (!tmp.renameTo(target)) {
+                    throw IOException("Failed to rename meta file")
+                }
+            }
         } catch (e: Exception) {
-            e.printStackTrace()
+            tmp.delete()
+            AppLog.e(TAG, "Failed to save cache meta", e)
         }
     }
 
     private fun parseMetaJson(json: String): Map<String, CacheMeta> {
         val map = mutableMapOf<String, CacheMeta>()
         try {
-            val obj = org.json.JSONObject(json)
-            obj.keys().forEach { url ->
-                val metaObj = obj.getJSONObject(url)
-                map[url] = CacheMeta(
-                    url = url,
+            val obj = JSONObject(json)
+            obj.keys().forEach { id ->
+                val metaObj = obj.getJSONObject(id)
+                map[id] = CacheMeta(
+                    id = id,
+                    url = metaObj.optString("url"),
                     lastUpdated = metaObj.getLong("lastUpdated"),
-                    domainCount = metaObj.getInt("domainCount")
+                    domainCount = metaObj.optInt("domainCount")
                 )
             }
         } catch (e: Exception) {
-            e.printStackTrace()
+            AppLog.w(TAG) { "Failed to parse cache meta: ${e.message}" }
         }
         return map
     }
 
     private fun metaMapToJson(metaMap: Map<String, CacheMeta>): String {
-        val obj = org.json.JSONObject()
-        metaMap.forEach { (url, meta) ->
-            val metaObj = org.json.JSONObject()
+        val obj = JSONObject()
+        metaMap.forEach { (id, meta) ->
+            val metaObj = JSONObject()
+            metaObj.put("url", meta.url)
             metaObj.put("lastUpdated", meta.lastUpdated)
             metaObj.put("domainCount", meta.domainCount)
-            obj.put(url, metaObj)
+            obj.put(id, metaObj)
         }
         return obj.toString()
     }

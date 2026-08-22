@@ -64,7 +64,7 @@ import java.util.Locale
 
 @Composable
 fun FilterListsScreen(
-    viewModel: FilterListsViewModel = viewModel(factory = FilterListsViewModel.Factory())
+    viewModel: FilterListsViewModel = viewModel(factory = FilterListsViewModel.Factory)
 ) {
     val filterLists by viewModel.filterListsUi.collectAsStateWithLifecycle(initialValue = emptyList())
     val filterCount by viewModel.filterCount.collectAsStateWithLifecycle(initialValue = 0)
