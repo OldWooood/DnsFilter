@@ -30,6 +30,16 @@ class BlocklistCacheManager(private val context: Context) {
         private const val TMP_SUFFIX = ".tmp"
         private const val UPDATE_INTERVAL_HOURS = 24L // Cache freshness window; manual refresh bypasses this.
 
+        internal fun cacheFileName(filterListId: String): String {
+            return "$filterListId$CACHE_SUFFIX"
+        }
+
+        internal fun cacheTmpFileName(filterListId: String): String {
+            // 注意：必须用 ${} 包住属性访问，否则 $filterListId 之后的 .id 不会生效，
+            // 且 data class 的 toString 会把 URL（含 '/'）带进文件名导致写入失败。
+            return "${filterListId}$CACHE_SUFFIX$TMP_SUFFIX"
+        }
+
         // 缓存元数据
         private data class CacheMeta(
             val id: String,
@@ -49,7 +59,7 @@ class BlocklistCacheManager(private val context: Context) {
     private var metaCache: MutableMap<String, CacheMeta>? = null
 
     private fun getCacheFile(filterListId: String): File {
-        return File(cacheDir, "$filterListId$CACHE_SUFFIX")
+        return File(cacheDir, cacheFileName(filterListId))
     }
 
     /**
@@ -58,7 +68,7 @@ class BlocklistCacheManager(private val context: Context) {
      */
     suspend fun saveBlocklist(filterList: FilterList, domains: Set<String>) = withContext(Dispatchers.IO) {
         val target = getCacheFile(filterList.id)
-        val tmp = File(cacheDir, "$filterList.id$CACHE_SUFFIX$TMP_SUFFIX")
+        val tmp = File(cacheDir, cacheTmpFileName(filterList.id))
         try {
             BufferedWriter(FileWriter(tmp)).use { writer ->
                 domains.forEach { domain ->
