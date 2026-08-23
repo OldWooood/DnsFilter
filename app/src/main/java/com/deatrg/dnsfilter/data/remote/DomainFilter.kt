@@ -234,7 +234,7 @@ class DomainFilter(
      * 获取指定过滤列表的最后更新时间
      */
     fun getFilterLastUpdated(filterList: FilterList): Long? {
-        return cacheManager.getLastUpdated(filterList.id)
+        return cacheManager.getLastUpdated(filterList)
     }
 
     private fun notifyCacheChanged() {

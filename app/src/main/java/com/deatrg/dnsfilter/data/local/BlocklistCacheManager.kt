@@ -111,7 +111,7 @@ class BlocklistCacheManager(private val context: Context) {
      * 检查缓存是否需要更新
      */
     fun needsUpdate(filterList: FilterList): Boolean {
-        val meta = getMeta(filterList.id)
+        val meta = getMetaCompat(filterList)
         if (meta == null) return true
 
         val hoursSinceUpdate = (System.currentTimeMillis() - meta.lastUpdated) / TimeUnit.HOURS.toMillis(1)
@@ -128,8 +128,8 @@ class BlocklistCacheManager(private val context: Context) {
     /**
      * 获取指定列表的最后更新时间
      */
-    fun getLastUpdated(filterListId: String): Long? {
-        return getMeta(filterListId)?.lastUpdated
+    fun getLastUpdated(filterList: FilterList): Long? {
+        return getMetaCompat(filterList)?.lastUpdated
     }
 
     /**
@@ -137,7 +137,7 @@ class BlocklistCacheManager(private val context: Context) {
      */
     suspend fun clearCache(filterList: FilterList) = withContext(Dispatchers.IO) {
         getCacheFile(filterList.id).delete()
-        removeMeta(filterList.id)
+        removeMeta(filterList)
     }
 
     private fun updateMeta(filterList: FilterList, domainCount: Int) {
@@ -149,6 +149,8 @@ class BlocklistCacheManager(private val context: Context) {
                 lastUpdated = System.currentTimeMillis(),
                 domainCount = domainCount
             )
+            // 清理 3.0.2 之前按 URL 做 key 的遗留条目
+            metaMap.remove(filterList.url)
             metaMap.toMap()
         }
         saveAllMeta(snapshot)
@@ -160,10 +162,19 @@ class BlocklistCacheManager(private val context: Context) {
         }
     }
 
-    private fun removeMeta(id: String) {
+    /**
+     * 兼容历史数据：3.0.2 之前元数据以 URL 为 key，之后改为 id。
+     * 升级用户磁盘上的旧 meta 只有 URL 键，按 id 查不到时回退 URL。
+     */
+    private fun getMetaCompat(filterList: FilterList): CacheMeta? {
+        return getMeta(filterList.id) ?: getMeta(filterList.url)
+    }
+
+    private fun removeMeta(filterList: FilterList) {
         val snapshot = synchronized(metaLock) {
             val metaMap = getOrLoadMetaCache()
-            metaMap.remove(id)
+            metaMap.remove(filterList.id)
+            metaMap.remove(filterList.url)
             metaMap.toMap()
         }
         saveAllMeta(snapshot)
