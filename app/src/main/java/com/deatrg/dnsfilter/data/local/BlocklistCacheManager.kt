@@ -26,18 +26,69 @@ class BlocklistCacheManager(private val context: Context) {
         private const val TAG = "BlocklistCache"
         private const val CACHE_DIR = "blocklist_cache"
         private const val META_FILE = "cache_meta.json"
-        private const val CACHE_SUFFIX = ".txt"
+        private const val CACHE_BIN_SUFFIX = ".bin"
         private const val TMP_SUFFIX = ".tmp"
         private const val UPDATE_INTERVAL_HOURS = 24L // Cache freshness window; manual refresh bypasses this.
 
-        internal fun cacheFileName(filterListId: String): String {
-            return "$filterListId$CACHE_SUFFIX"
+        internal const val BIN_MAGIC = 0x444E5342 // "DNSB"
+        internal const val BIN_VERSION = 1
+        internal const val BIN_MAX_DOMAINS = 2_000_000
+        internal const val BIN_MAX_DOMAIN_BYTES = 256
+
+        internal fun cacheBinFileName(filterListId: String): String {
+            return "$filterListId$CACHE_BIN_SUFFIX"
         }
 
-        internal fun cacheTmpFileName(filterListId: String): String {
-            // 注意：必须用 ${} 包住属性访问，否则 $filterListId 之后的 .id 不会生效，
-            // 且 data class 的 toString 会把 URL（含 '/'）带进文件名导致写入失败。
-            return "${filterListId}$CACHE_SUFFIX$TMP_SUFFIX"
+        internal fun cacheBinTmpFileName(filterListId: String): String {
+            return "${filterListId}$CACHE_BIN_SUFFIX$TMP_SUFFIX"
+        }
+
+        /**
+         * 紧凑二进制格式：MAGIC u32 | VERSION u32 | COUNT u32 | 条目…。
+         * 每条目：LEN u32 + UTF-8 bytes。纯函数，便于单测与发版校验。
+         */
+        internal fun encodeBlocklistBinary(domains: Set<String>): ByteArray {
+            val out = java.io.ByteArrayOutputStream(domains.size.coerceAtMost(1 shl 20) * 24 + 12)
+            val data = java.io.DataOutputStream(out)
+            data.writeInt(BIN_MAGIC)
+            data.writeInt(BIN_VERSION)
+            data.writeInt(domains.size)
+            domains.forEach { domain ->
+                val bytes = domain.toByteArray(Charsets.UTF_8)
+                data.writeInt(bytes.size)
+                data.write(bytes)
+            }
+            data.flush()
+            return out.toByteArray()
+        }
+
+        /**
+         * 解析二进制缓存；MAGIC/VERSION/长度任一非法即返回 null，
+         * 调用方回退到文本缓存。
+         */
+        internal fun decodeBlocklistBinary(bytes: ByteArray): Set<String>? {
+            try {
+                val data = java.io.DataInputStream(bytes.inputStream())
+                if (data.readInt() != BIN_MAGIC) return null
+                if (data.readInt() != BIN_VERSION) return null
+                val count = data.readInt()
+                if (count < 0 || count > BIN_MAX_DOMAINS) return null
+                val domains = HashSet<String>((count * 4 / 3).coerceAtLeast(16))
+                repeat(count) {
+                    val len = data.readInt()
+                    if (len <= 0 || len > BIN_MAX_DOMAIN_BYTES) return null
+                    val buf = ByteArray(len)
+                    data.readFully(buf)
+                    val domain = String(buf, Charsets.UTF_8).trim()
+                    if (domain.isEmpty()) return null
+                    domains.add(domain)
+                }
+                // 尾部有多余字节视为损坏，避免半截写入被误用。
+                if (data.available() > 0) return null
+                return domains
+            } catch (_: Exception) {
+                return null
+            }
         }
 
         // 缓存元数据
@@ -58,31 +109,26 @@ class BlocklistCacheManager(private val context: Context) {
     @Volatile
     private var metaCache: MutableMap<String, CacheMeta>? = null
 
-    private fun getCacheFile(filterListId: String): File {
-        return File(cacheDir, cacheFileName(filterListId))
+    private fun getCacheBinFile(filterListId: String): File {
+        return File(cacheDir, cacheBinFileName(filterListId))
     }
 
     /**
-     * 保存 blocklist 到缓存。
+     * 保存 blocklist 到缓存：只写二进制格式。
      * 先写临时文件再原子 rename，避免写一半崩溃留下损坏的缓存。
      */
     suspend fun saveBlocklist(filterList: FilterList, domains: Set<String>) = withContext(Dispatchers.IO) {
-        val target = getCacheFile(filterList.id)
-        val tmp = File(cacheDir, cacheTmpFileName(filterList.id))
+        val target = getCacheBinFile(filterList.id)
+        val tmp = File(cacheDir, cacheBinTmpFileName(filterList.id))
         try {
-            BufferedWriter(FileWriter(tmp)).use { writer ->
-                domains.forEach { domain ->
-                    writer.write(domain)
-                    writer.newLine()
-                }
-            }
+            tmp.writeBytes(encodeBlocklistBinary(domains))
             if (!tmp.renameTo(target)) {
                 // 某些文件系统上 rename 不能覆盖已存在的文件
                 if (target.exists() && !target.delete()) {
-                    throw IOException("Failed to delete old cache file ${target.name}")
+                    throw IOException("Failed to delete old binary cache ${target.name}")
                 }
                 if (!tmp.renameTo(target)) {
-                    throw IOException("Failed to rename cache file ${tmp.name}")
+                    throw IOException("Failed to rename binary cache ${tmp.name}")
                 }
             }
 
@@ -95,26 +141,29 @@ class BlocklistCacheManager(private val context: Context) {
     }
 
     /**
-     * 从缓存加载 blocklist
+     * 从缓存加载 blocklist：只读二进制。缺失或损坏时返回 null，
+     * 调用方按无缓存处理并重新下载。
      */
     suspend fun loadBlocklist(filterList: FilterList): Set<String>? = withContext(Dispatchers.IO) {
-        val cacheFile = getCacheFile(filterList.id)
-        if (!cacheFile.exists()) return@withContext null
+        loadBlocklistBinary(filterList)
+    }
 
-        try {
-            val domains = mutableSetOf<String>()
-            BufferedReader(FileReader(cacheFile)).use { reader ->
-                reader.lineSequence().forEach { line ->
-                    if (line.isNotBlank()) {
-                        domains.add(line.trim())
-                    }
-                }
-            }
-            domains
+    private fun loadBlocklistBinary(filterList: FilterList): Set<String>? {
+        val binFile = getCacheBinFile(filterList.id)
+        if (!binFile.exists()) return null
+        return try {
+            decodeBlocklistBinary(binFile.readBytes())
         } catch (e: Exception) {
-            AppLog.e(TAG, "Failed to load blocklist cache for ${filterList.name}", e)
+            AppLog.w(TAG) { "Binary cache unreadable for ${filterList.name}" }
             null
         }
+    }
+
+    /**
+     * 检查是否有缓存
+     */
+    fun hasCache(filterList: FilterList): Boolean {
+        return getCacheBinFile(filterList.id).exists()
     }
 
     /**
@@ -129,13 +178,6 @@ class BlocklistCacheManager(private val context: Context) {
     }
 
     /**
-     * 检查是否有缓存
-     */
-    fun hasCache(filterList: FilterList): Boolean {
-        return getCacheFile(filterList.id).exists()
-    }
-
-    /**
      * 获取指定列表的最后更新时间
      */
     fun getLastUpdated(filterList: FilterList): Long? {
@@ -146,7 +188,7 @@ class BlocklistCacheManager(private val context: Context) {
      * 清除指定 blocklist 的缓存
      */
     suspend fun clearCache(filterList: FilterList) = withContext(Dispatchers.IO) {
-        getCacheFile(filterList.id).delete()
+        getCacheBinFile(filterList.id).delete()
         removeMeta(filterList)
     }
 

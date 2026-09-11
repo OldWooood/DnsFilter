@@ -19,7 +19,7 @@ DnsFilter is an Android application that acts as a local DNS filtering proxy. It
 | Architecture | MVVM with manual DI (ServiceLocator pattern) |
 | Async | Kotlin Coroutines + Flow |
 | Networking | OkHttp 4.12.0 (blocklist downloads), custom `DatagramSocket` (plain DNS) |
-| Persistence | DataStore Preferences (settings), local file cache (blocklists) |
+| Persistence | DataStore Preferences (settings), file cache (blocklists: binary only, one-time legacy text migration) |
 | Background updates | `AlarmManager` + `BroadcastReceiver` (WorkManager is deprecated in this project) |
 
 **Important**: The project **does not use Hilt**. Dependency injection is done manually via `ServiceLocator` in `app/src/main/java/com/deatrg/dnsfilter/ServiceLocator.kt`.
@@ -36,8 +36,8 @@ app/src/main/java/com/deatrg/dnsfilter/
 │   │   ├── BlocklistCacheManager.kt    # File-based cache for downloaded blocklists
 │   │   └── StatisticsBuffer.kt         # In-memory stats buffer to reduce disk I/O
 │   ├── remote/
-│   │   ├── DnsQueryExecutor.kt         # Positive L2 cache, UDP upstream racing, TTL rewriting
-│   │   ├── DnsResponseCache.kt         # 4,096-entry positive-only LRU cache
+│   │   ├── DnsQueryExecutor.kt         # L2 cache, UDP racing + TCP fallback, TTL rewriting
+│   │   ├── DnsResponseCache.kt         # 4,096-entry LRU: positive + negative + SERVFAIL + serve-stale + prefetch
 │   │   └── DomainFilter.kt             # Loads blocklists, checks domains, supports AdAway format
 │   ├── repository/
 │   │   ├── DnsServerRepositoryImpl.kt
@@ -99,11 +99,13 @@ APKs are output to `app/build/outputs/apk/`. The build produces split APKs by AB
 4. The app excludes itself from the VPN (`addDisallowedApplication`) to avoid routing loops.
 5. Packets are read from the VPN `ParcelFileDescriptor`, parsed (IPv4/IPv6 → UDP → DNS payload), and processed.
 6. If the domain is blocked, an `NXDOMAIN` response with a 24-hour SOA negative TTL is returned immediately.
-7. Allowed queries check a 4,096-entry positive-only LRU cache; hits return correctly aged remaining TTLs.
+7. Allowed queries check a 4,096-entry LRU cache (positive + RFC 2308 negative + RFC 9520 SERVFAIL markers); fresh hits return correctly aged remaining TTLs.
 8. Matching concurrent cache misses are coalesced while they are in flight.
-9. Misses are forwarded concurrently to all enabled upstream DNS servers; the first successful response is used.
-10. Positive response TTLs are clamped to 1–6 hours and cached by both the app L2 and Android Resolver L1.
-11. L2 has no stale serving, prefetch, background refresh, or negative-response storage and is cleared on default-network or upstream-server changes.
+9. Misses are forwarded concurrently to all enabled upstream DNS servers; the first successful response is used. Truncated (TC=1) UDP answers are retried over TCP to the same server (RFC 7766).
+10. Expired entries may serve stale for up to 3 days (RFC 8767, stamped with a 30s TTL) while a background refresh repopulates the cache; hot near-expiry entries trigger Unbound-style prefetch. Stale serving also covers default-network transitions, which no longer clear the cache.
+11. Positive response TTLs are clamped per qtype (A/AAAA: 1–6 hours; others: 10min–2h) and cached by both the app L2 and Android Resolver L1.
+12. Positive answers whose CNAME chain hits the blocklist are answered `NXDOMAIN` instead, and the QNAME verdict is remembered (TTL-capped, max 2h) so repeats skip upstream.
+13. L2 is cleared on upstream-server changes; on default-network changes only in-flight joins are dropped while entries are kept for stale-serve.
 
 ### Domain Filtering
 - Blocklists use the **AdAway/hosts file format**: lines like `0.0.0.0 domain.com` or `127.0.0.1 domain.com`.
@@ -125,7 +127,7 @@ APKs are output to `app/build/outputs/apk/`. The build produces split APKs by AB
 - Android Resolver cache hits do not reach the VPN and are not counted.
 
 ### Concurrency Control
-- `DnsVpnService` uses a bounded 1024-entry upstream queue and a fixed worker pool.
+- `DnsVpnService` uses a bounded 1024-entry upstream queue, a fixed worker pool, and a single-writer response queue feeding the TUN interface (no write-lock contention).
 - Query coalescing lives in exactly one place: `DnsQueryExecutor.inFlightQueries`. Do not add a second coalescing layer in `DnsVpnService`.
 - `DnsVpnService` serializes start/stop through `lifecycleMutex`; the service `scope` is never cancelled, only individual jobs are (fast off→on toggles must keep working).
 - Matching in-flight L2 misses share one logical lookup; `DnsQueryExecutor` still sends that lookup concurrently to every enabled server.
@@ -169,7 +171,7 @@ Release builds are signed using credentials from `key.properties` (not in repo).
 
 ## Important Caveats for Agents
 
-1. **Only plain UDP DNS is implemented**: DoH, DoT, and TCP fallback are not available.
+1. **Upstream transport is UDP-first**: plain UDP racing is the hot path; UDP responses with TC=1 are retried over TCP to the same server (RFC 7766). DoH and DoT are not available.
 2. **Do not introduce Hilt**: The project intentionally uses manual DI. Do not add Hilt annotations or modify build files to enable it unless explicitly requested.
 3. **Prefer AlarmManager over WorkManager** for new background scheduling tasks.
 4. **VPN is split-tunnel only**: The VPN routes only DNS traffic. Do not change routing to capture all traffic unless explicitly required.

@@ -6,6 +6,7 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import com.deatrg.dnsfilter.AppLog
 import com.deatrg.dnsfilter.ServiceLocator
 import com.deatrg.dnsfilter.data.local.StatisticsBuffer
@@ -14,6 +15,7 @@ import com.deatrg.dnsfilter.data.remote.DnsQueryExecutor
 import com.deatrg.dnsfilter.data.remote.DnsQueryResult
 import com.deatrg.dnsfilter.data.remote.DnsQuestion
 import com.deatrg.dnsfilter.data.remote.DNS_RCODE_SERVFAIL
+import com.deatrg.dnsfilter.data.remote.minAnswerTtlSeconds
 import com.deatrg.dnsfilter.data.remote.parseDnsQueryFromPacket
 import com.deatrg.dnsfilter.data.remote.patchBlockedNxDomainResponse
 import com.deatrg.dnsfilter.data.remote.patchDnsErrorResponse
@@ -81,8 +83,38 @@ class DnsVpnService : VpnService() {
     // Upstream DNS queries mostly wait on IO, so keep this worker count modest.
     private val slowWorkerCount: Int get() = Runtime.getRuntime().availableProcessors().coerceIn(4, 16) * 2
 
-    // Serialize writes to the VPN descriptor without blocking dispatcher threads.
-    private val outputMutex = Mutex()
+    // All TUN writes funnel through one writer coroutine fed by responseQueue,
+    // so workers never contend on a lock in the hot path.
+    private data class QueuedResponse(
+        val packet: ByteArray,
+        val length: Int
+    )
+
+    // CNAME-cloaking verdicts: QNAME -> expiresAtMs (monotonic). Lets repeat
+    // queries for cloaked ad domains answer NXDOMAIN without another upstream
+    // round-trip. Bounded LRU; TTL-capped like ordinary DNS cache entries.
+    private val cnameVerdictLock = Any()
+    private val cnameBlockedVerdicts =
+        object : LinkedHashMap<String, Long>(256, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?): Boolean {
+                return size > 1024
+            }
+        }
+
+    private fun isCnameBlockedCached(domain: String, nowMs: Long): Boolean = synchronized(cnameVerdictLock) {
+        val expiresAt = cnameBlockedVerdicts[domain] ?: return false
+        if (nowMs >= expiresAt) {
+            cnameBlockedVerdicts.remove(domain)
+            return false
+        }
+        true
+    }
+
+    private fun rememberCnameBlocked(domain: String, ttlSeconds: Long, nowMs: Long) {
+        synchronized(cnameVerdictLock) {
+            cnameBlockedVerdicts[domain] = nowMs + ttlSeconds.coerceIn(60L, 7200L) * 1000L
+        }
+    }
 
     // Reuse packet buffers to reduce allocations during DNS bursts.
     private val packetPool = ArrayBlockingQueue<ByteArray>(256)
@@ -96,7 +128,9 @@ class DnsVpnService : VpnService() {
         val dnsLength: Int,
         val question: DnsQuestion,
         val srcPort: Int,
-        val ctx: PacketContext
+        val ctx: PacketContext,
+        // Reader 线程已算好的 L2/in-flight key，worker 复用以避免重复拼串。
+        var cacheKeyHint: String? = null
     )
 
     override fun onCreate() {
@@ -105,9 +139,10 @@ class DnsVpnService : VpnService() {
         domainFilter = ServiceLocator.provideDomainFilter()
         statisticsBuffer = ServiceLocator.provideStatisticsBuffer()
         vpnState = ServiceLocator.provideVpnStateHolder()
-        dnsQueryExecutor = DnsQueryExecutor { socket ->
-            protect(socket)
-        }
+        dnsQueryExecutor = DnsQueryExecutor(
+            socketProtector = { socket -> protect(socket) },
+            tcpSocketProtector = { socket -> protect(socket) }
+        )
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -177,6 +212,9 @@ class DnsVpnService : VpnService() {
         startDnsServerTracking(prefsManager)
         startForeground(VpnNotifications.NOTIFICATION_ID, createNotification())
         dnsLoopJob = scope.launch { runDnsLoop(vpn) }
+        // Warm connected UDP sockets now so the first real queries skip
+        // the create + protect() cost (P1-1).
+        scope.launch { dnsQueryExecutor?.prewarm(servers) }
         AppLog.d(TAG, "VPN established successfully")
     }
 
@@ -206,19 +244,41 @@ class DnsVpnService : VpnService() {
         val inputStream = FileInputStream(vpn.fileDescriptor)
         val outputStream = FileOutputStream(vpn.fileDescriptor)
         val upstreamQueue = Channel<UpstreamTask>(capacity = UPSTREAM_QUEUE_CAPACITY)
+        val responseQueue = Channel<QueuedResponse>(capacity = UPSTREAM_QUEUE_CAPACITY)
+
+        // Single writer: the only coroutine touching outputStream. Workers and
+        // the reader only enqueue, so there is no write-lock contention.
+        val writerJob = scope.launch(Dispatchers.IO) {
+            for (queued in responseQueue) {
+                try {
+                    outputStream.write(queued.packet, 0, queued.length)
+                } catch (e: Exception) {
+                    AppLog.e(TAG) { "Failed to send DNS response: ${e.message}" }
+                } finally {
+                    recyclePacket(queued.packet)
+                }
+            }
+        }
 
         val slowWorkers = List(slowWorkerCount) {
             scope.launch(Dispatchers.IO) {
                 for (task in upstreamQueue) {
+                    // Buffer ownership: each path below enqueues task.packet into
+                    // responseQueue exactly once; recycle locally only when nothing
+                    // was enqueued (e.g. send threw during shutdown).
+                    var enqueued = false
                     try {
                         val result = queryUpstream(task)
-                        deliverUpstreamResult(task, result, outputStream)
+                        deliverUpstreamResult(task, result, responseQueue)
+                        enqueued = true
                     } catch (e: Exception) {
                         AppLog.e(TAG) { "Error in upstream worker: ${e.message}" }
                         // 让客户端立即收到 SERVFAIL 而不是等到超时
-                        runCatching { writeErrorResponse(task, outputStream, DNS_RCODE_SERVFAIL) }
+                        enqueued = runCatching {
+                            writeErrorResponse(task, responseQueue, DNS_RCODE_SERVFAIL)
+                        }.isSuccess
                     } finally {
-                        recyclePacket(task.packet)
+                        if (!enqueued) recyclePacket(task.packet)
                     }
                 }
             }
@@ -240,11 +300,11 @@ class DnsVpnService : VpnService() {
 
                 var handled = true
                 try {
-                    handled = processPacket(packet, length, outputStream, upstreamQueue)
+                    handled = processPacket(packet, length, responseQueue, upstreamQueue)
                 } catch (e: Exception) {
                     AppLog.e(TAG) { "Error while processing packet: ${e.message}" }
                 }
-                // false 表示包已移交给上游队列，所有权归 worker
+                // false 表示包已移交给上游队列或响应队列，所有权归 worker/writer
                 if (handled) recyclePacket(packet)
             }
         } catch (e: InterruptedIOException) {
@@ -252,10 +312,14 @@ class DnsVpnService : VpnService() {
         } catch (e: Exception) {
             AppLog.e(TAG, "Error in DNS loop", e)
         } finally {
-            // stopVpn 可能已取消本协程；清理必须继续执行完
+            // stopVpn 可能已取消本协程；清理必须继续执行完。
+            // 关闭顺序：先停上游队列让 workers 排空并把响应送入
+            // responseQueue，再关响应队列让 writer 排空，最后关流。
             withContext(NonCancellable) {
                 upstreamQueue.close()
                 slowWorkers.joinAll()
+                responseQueue.close()
+                writerJob.join()
                 runCatching { inputStream.close() }
                 runCatching { outputStream.close() }
                 packetPool.clear()
@@ -266,12 +330,12 @@ class DnsVpnService : VpnService() {
 
     /**
      * 统一处理 IPv4/IPv6 DNS 查询包。
-     * @return true 表示包的所有权仍在调用方（缓冲区可回收）；false 表示已移交上游队列。
+     * @return true 表示包的所有权仍在调用方（缓冲区可回收）；false 表示已移交上游队列或响应队列。
      */
     private suspend fun processPacket(
         packet: ByteArray,
         length: Int,
-        outputStream: FileOutputStream,
+        responseQueue: Channel<QueuedResponse>,
         upstreamQueue: Channel<UpstreamTask>
     ): Boolean {
         val ctx = probeIpHeader(packet, length) ?: return true
@@ -300,21 +364,33 @@ class DnsVpnService : VpnService() {
             AppLog.d(TAG) { "Domain ${question.domain} is blocked" }
             statisticsBuffer?.recordQuery(blocked = true, responseTime = 0, includeInAvg = false)
             val dnsResponseLength = patchBlockedNxDomainResponse(packet, dnsStart, question.questionEndOffset)
-            sendPrebuiltResponse(task, dnsResponseLength, outputStream)
-            return true
+            sendPrebuiltResponse(task, dnsResponseLength, responseQueue)
+            return false
         }
 
-        dnsQueryExecutor?.getCachedResponseForClient(
-            domain = question.domain,
-            qtype = question.qtype,
-            qclass = question.qclass,
-            query = packet,
-            queryOffset = dnsStart
-        )?.let { cachedResponse ->
-            AppLog.d(TAG) { "DNS L2 cache hit: ${question.domain}" }
-            statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
-            sendDnsPayload(task, cachedResponse, outputStream)
-            return true
+        // CNAME-cloaking 判决缓存：命中则直接 NXDOMAIN，跳过上游。
+        if (isCnameBlockedCached(question.domain, SystemClock.elapsedRealtime())) {
+            AppLog.d(TAG) { "Domain ${question.domain} is CNAME-cloak blocked (cached)" }
+            statisticsBuffer?.recordQuery(blocked = true, responseTime = 0, includeInAvg = false)
+            val dnsResponseLength = patchBlockedNxDomainResponse(packet, dnsStart, question.questionEndOffset)
+            sendPrebuiltResponse(task, dnsResponseLength, responseQueue)
+            return false
+        }
+
+        // Cache key 只算一次，miss 时复用给 executor，避免重复拼串与二次 L2 查询。
+        val executor = dnsQueryExecutor
+        val cacheKey = executor?.cacheKeyFor(question.domain, question.qtype, question.qclass)
+        if (executor != null && cacheKey != null) {
+            executor.getCachedResponseForClientWithKey(
+                key = cacheKey,
+                query = packet,
+                queryOffset = dnsStart
+            )?.let { cachedResponse ->
+                AppLog.d(TAG) { "DNS L2 cache hit: ${question.domain}" }
+                statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
+                sendDnsPayload(task, cachedResponse, responseQueue)
+                return false
+            }
         }
 
         if (!upstreamQueue.trySend(task).isSuccess) {
@@ -323,9 +399,10 @@ class DnsVpnService : VpnService() {
             val dnsResponseLength = patchDnsErrorResponse(
                 packet, dnsStart, question.questionEndOffset, DNS_RCODE_SERVFAIL
             )
-            sendPrebuiltResponse(task, dnsResponseLength, outputStream)
-            return true
+            sendPrebuiltResponse(task, dnsResponseLength, responseQueue)
+            return false
         }
+        task.cacheKeyHint = cacheKey
         return false
     }
 
@@ -355,7 +432,10 @@ class DnsVpnService : VpnService() {
             return DnsQueryResult(false, null, 0, "No DNS servers available")
         }
 
-        // 相同 domain:qtype 的并发请求由 DnsQueryExecutor 的 in-flight 表合并为一次上游查询
+        // Reader 已做过一次 L2 fresh 查询，这里跳过以避免双重查找；stale/
+        // SERVFAIL 标记与 in-flight 合并仍由 executor 处理。CNAME 链检查通过
+        // 回调完成，命中时 executor 直接返回 blocked  verdict 且不污染缓存。
+        val filter = domainFilter
         return dnsQueryExecutor?.query(
             domain = task.question.domain,
             servers = servers,
@@ -363,46 +443,64 @@ class DnsVpnService : VpnService() {
             queryOffset = task.dnsStart,
             queryLength = task.dnsLength,
             qtype = task.question.qtype,
-            qclass = task.question.qclass
+            qclass = task.question.qclass,
+            skipCacheLookup = true,
+            cacheKeyHint = task.cacheKeyHint,
+            cnameBlocklistCheck = filter?.let { f -> { domain: String -> f.isDomainBlocked(domain) } }
         ) ?: DnsQueryResult(false, null, 0, "Executor not initialized")
     }
 
     private suspend fun deliverUpstreamResult(
         task: UpstreamTask,
         result: DnsQueryResult,
-        outputStream: FileOutputStream
+        responseQueue: Channel<QueuedResponse>
     ) {
         val responseBytes = result.responseBytes
         if (result.success && responseBytes != null) {
+            if (result.blocked) {
+                // CNAME 链命中 blocklist：回 NXDOMAIN 并记住判决，后续同 QNAME
+                // 直接拦截不再走上游。
+                val verdictTtl = minAnswerTtlSeconds(responseBytes) ?: 3600L
+                rememberCnameBlocked(
+                    task.question.domain, verdictTtl, SystemClock.elapsedRealtime()
+                )
+                AppLog.d(TAG) { "DNS CNAME-cloak blocked: ${task.question.domain}" }
+                statisticsBuffer?.recordQuery(blocked = true, responseTime = 0, includeInAvg = false)
+                val dnsResponseLength = patchBlockedNxDomainResponse(
+                    task.packet, task.dnsStart, task.question.questionEndOffset
+                )
+                sendPrebuiltResponse(task, dnsResponseLength, responseQueue)
+                return
+            }
             AppLog.d(TAG) { "DNS response: ${task.question.domain} (${result.responseTime}ms)" }
             statisticsBuffer?.recordQuery(
                 blocked = false,
                 responseTime = result.responseTime,
-                includeInAvg = !result.fromCache
+                includeInAvg = !result.fromCache && !result.stale
             )
-            sendDnsPayload(task, responseBytes, outputStream)
+            sendDnsPayload(task, responseBytes, responseQueue)
         } else {
             AppLog.e(TAG) { "DNS query failed: ${result.error}" }
             statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
-            writeErrorResponse(task, outputStream, DNS_RCODE_SERVFAIL)
+            writeErrorResponse(task, responseQueue, DNS_RCODE_SERVFAIL)
         }
     }
 
     /**
      * 把 DNS 响应负载写回客户端：复制进包内、还原事务 ID/RD 位、改写 IP/UDP 头。
-     * 响应超出 MTU 时改发 TC=1 的截断应答，让客户端改走 TCP。
+     * 上游 TCP fallback 已保证大包完整；这里仅当响应仍塞不进 MTU 时才发 TC=1。
      */
     private suspend fun sendDnsPayload(
         task: UpstreamTask,
         dnsPayload: ByteArray,
-        outputStream: FileOutputStream
+        responseQueue: Channel<QueuedResponse>
     ) {
         val maxDnsResponseLength = task.packet.size - task.dnsStart
         if (dnsPayload.size > maxDnsResponseLength) {
             val truncatedLength = patchDnsTruncatedResponse(
                 task.packet, task.dnsStart, task.question.questionEndOffset
             )
-            sendPrebuiltResponse(task, truncatedLength, outputStream)
+            sendPrebuiltResponse(task, truncatedLength, responseQueue)
             return
         }
 
@@ -412,39 +510,30 @@ class DnsVpnService : VpnService() {
 
         dnsPayload.copyInto(task.packet, destinationOffset = task.dnsStart)
         patchDnsResponseForClient(task.packet, task.dnsStart, transactionId0, transactionId1, recursionDesired)
-        sendPrebuiltResponse(task, dnsPayload.size, outputStream)
+        sendPrebuiltResponse(task, dnsPayload.size, responseQueue)
     }
 
     private suspend fun writeErrorResponse(
         task: UpstreamTask,
-        outputStream: FileOutputStream,
+        responseQueue: Channel<QueuedResponse>,
         errorCode: Int
     ) {
         val dnsResponseLength = patchDnsErrorResponse(
             task.packet, task.dnsStart, task.question.questionEndOffset, errorCode
         )
-        sendPrebuiltResponse(task, dnsResponseLength, outputStream)
+        sendPrebuiltResponse(task, dnsResponseLength, responseQueue)
     }
 
-    /** 改写 IP/UDP 头并写入 TUN。 */
+    /** 改写 IP/UDP 头并送入单 writer 队列，由 writer 串行写入 TUN。 */
     private suspend fun sendPrebuiltResponse(
         task: UpstreamTask,
         dnsResponseLength: Int,
-        outputStream: FileOutputStream
+        responseQueue: Channel<QueuedResponse>
     ) {
         val responseLength = PacketRewriter.rewriteAsResponse(
             task.packet, task.ctx, task.srcPort, dnsResponseLength
         )
-        outputMutex.withLock {
-            try {
-                outputStream.write(task.packet, 0, responseLength)
-                AppLog.d(TAG) {
-                    "Sent ${if (task.ctx.isIPv6) "IPv6" else "IPv4"} DNS response to port=${task.srcPort}, length: $responseLength"
-                }
-            } catch (e: Exception) {
-                AppLog.e(TAG) { "Failed to send DNS response: ${e.message}" }
-            }
-        }
+        responseQueue.send(QueuedResponse(task.packet, responseLength))
     }
 
     private fun createNotification(): Notification {
@@ -488,14 +577,14 @@ class DnsVpnService : VpnService() {
                 val previous = activeNetwork
                 activeNetwork = network
                 if (previous != network) {
-                    invalidateResponseCache("default network changed")
+                    softenResponseCacheForNetwork("default network changed")
                 }
             }
 
             override fun onLost(network: Network) {
                 if (activeNetwork == network) {
                     activeNetwork = null
-                    invalidateResponseCache("default network lost")
+                    softenResponseCacheForNetwork("default network lost")
                 }
             }
         }
@@ -522,6 +611,16 @@ class DnsVpnService : VpnService() {
     private fun invalidateResponseCache(reason: String) {
         dnsQueryExecutor?.clearResponseCache()
         AppLog.d(TAG) { "DNS L2 cache cleared: $reason" }
+    }
+
+    /**
+     * 切网时只丢弃 in-flight 合并（旧网络上的抓包不能再被 join），L2 条目
+     * 保留：过期行以 serve-stale 先行应答并后台刷新，避免冷启动风暴。
+     */
+    private fun softenResponseCacheForNetwork(reason: String) {
+        dnsQueryExecutor?.onDefaultNetworkChanged()
+        scope.launch { dnsQueryExecutor?.prewarm(servers) }
+        AppLog.d(TAG) { "DNS L2 cache kept for stale-serve: $reason" }
     }
 
     private fun isSupportedDnsServer(server: DnsServer): Boolean {

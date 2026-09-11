@@ -11,14 +11,30 @@ internal const val POSITIVE_DNS_MIN_TTL_SECONDS = 60L * 60L
 internal const val POSITIVE_DNS_MAX_TTL_SECONDS = 6L * 60L * 60L
 internal const val BLOCKED_DOMAIN_TTL_SECONDS = 24L * 60L * 60L
 
+/** Negative responses (NXDOMAIN/NODATA) are cached by SOA MINIMUM, capped to this window. */
+internal const val NEGATIVE_DNS_DEFAULT_TTL_SECONDS = 60L
+internal const val NEGATIVE_DNS_MAX_TTL_SECONDS = 60L * 60L
+/** Upstream failures (timeout/refused/SERVFAIL) are cached briefly per RFC 9520. */
+internal const val SERVFAIL_CACHE_TTL_SECONDS = 10L
+/** TTL stamped on stale responses served per RFC 8767. */
+internal const val STALE_DNS_TTL_SECONDS = 30L
+/** How long after expiry an entry may still be served stale while refreshing in background. */
+internal const val STALE_DNS_MAX_WINDOW_SECONDS = 3L * 24L * 60L * 60L
+internal const val DNS_TCP_TIMEOUT_MS = 5000
+
 internal const val DNS_RCODE_NOERROR = 0
 internal const val DNS_RCODE_SERVFAIL = 2
 
 private const val DNS_HEADER_SIZE = 12
-private const val DNS_TYPE_OPT = 41
-private const val DNS_TYPE_TKEY = 249
-private const val DNS_TYPE_TSIG = 250
-private const val DNS_TYPE_SOA = 6
+internal const val DNS_TYPE_A = 1
+internal const val DNS_TYPE_CNAME = 5
+internal const val DNS_TYPE_OPT = 41
+internal const val DNS_TYPE_TKEY = 249
+internal const val DNS_TYPE_TSIG = 250
+internal const val DNS_TYPE_SOA = 6
+internal const val DNS_TYPE_AAAA = 28
+internal const val DNS_TYPE_SVCB = 64
+internal const val DNS_TYPE_HTTPS = 65
 private const val DNS_CLASS_IN = 1
 
 private val BLOCKED_SOA_MNAME = byteArrayOf(
@@ -92,17 +108,31 @@ fun skipDnsName(data: ByteArray, offset: Int, length: Int): Int? {
 }
 
 /**
+ * Per-qtype TTL policy. A/AAAA keep the aggressive 1-6h window for the Android
+ * Resolver L1; volatile types (HTTPS/SVCB/others, often CDN-routed) use a
+ * shorter 10min-2h window so failovers propagate faster.
+ */
+internal fun ttlBoundsForQtype(qtype: Int): Pair<Long, Long> = when (qtype) {
+    DNS_TYPE_A, DNS_TYPE_AAAA -> POSITIVE_DNS_MIN_TTL_SECONDS to POSITIVE_DNS_MAX_TTL_SECONDS
+    else -> 600L to 7200L
+}
+
+/**
  * Applies the speed-first Android Resolver TTL policy to every real resource record.
  * OPT uses the TTL-shaped field for EDNS metadata and must never be rewritten.
  */
-internal fun clampPositiveDnsTtlsInPlace(response: ByteArray): Long? {
+internal fun clampPositiveDnsTtlsInPlace(response: ByteArray, qtype: Int = DNS_TYPE_A): Long? {
     if (response.size < DNS_HEADER_SIZE) return null
     val flags = readUInt16(response, 2)
     val rcode = flags and 0x0F
     val answerCount = readUInt16(response, 6)
     if (rcode != 0 || answerCount == 0) return null
 
-    return rewriteDnsTtlsInPlace(response, answerCount, ageSeconds = 0, clampToPolicy = true)
+    val (minTtl, maxTtl) = ttlBoundsForQtype(qtype)
+    return rewriteDnsTtlsInPlace(
+        response, answerCount, ageSeconds = 0, clampToPolicy = true,
+        minTtlSeconds = minTtl, maxTtlSeconds = maxTtl
+    )
 }
 
 /** Decrements cached record TTLs without extending their original effective lifetime. */
@@ -125,7 +155,9 @@ private fun rewriteDnsTtlsInPlace(
     data: ByteArray,
     answerCount: Int,
     ageSeconds: Long,
-    clampToPolicy: Boolean
+    clampToPolicy: Boolean,
+    minTtlSeconds: Long = POSITIVE_DNS_MIN_TTL_SECONDS,
+    maxTtlSeconds: Long = POSITIVE_DNS_MAX_TTL_SECONDS
 ): Long? {
     val dnsEnd = data.size
     val questionCount = readUInt16(data, 4)
@@ -152,7 +184,7 @@ private fun rewriteDnsTtlsInPlace(
         if (type != DNS_TYPE_OPT && type != DNS_TYPE_TKEY && type != DNS_TYPE_TSIG) {
             val originalTtl = readUInt32(data, ttlOffset)
             val effectiveTtl = if (clampToPolicy) {
-                originalTtl.coerceIn(POSITIVE_DNS_MIN_TTL_SECONDS, POSITIVE_DNS_MAX_TTL_SECONDS)
+                originalTtl.coerceIn(minTtlSeconds, maxTtlSeconds)
             } else {
                 originalTtl
             }
@@ -165,6 +197,236 @@ private fun rewriteDnsTtlsInPlace(
         offset = nextOffset
     }
     return minAnswerTtl
+}
+
+/** RCODE of a standalone DNS message, or null when malformed. */
+internal fun dnsResponseRcode(response: ByteArray): Int? {
+    if (response.size < DNS_HEADER_SIZE) return null
+    return readUInt16(response, 2) and 0x0F
+}
+
+/** ANCOUNT of a standalone DNS message, or null when malformed. */
+internal fun dnsResponseAnswerCount(response: ByteArray): Int? {
+    if (response.size < DNS_HEADER_SIZE) return null
+    return readUInt16(response, 6)
+}
+
+/** Whether the UDP response has the TC bit set and must be retried over TCP (RFC 7766). */
+internal fun isTruncatedResponse(response: ByteArray): Boolean {
+    if (response.size < DNS_HEADER_SIZE) return false
+    return (response[2].toInt() and 0x02) != 0
+}
+
+/** Minimum TTL across answer RRs (excluding OPT/TKEY/TSIG); null when malformed or answerless. */
+internal fun minAnswerTtlSeconds(response: ByteArray): Long? {
+    if (response.size < DNS_HEADER_SIZE) return null
+    if ((readUInt16(response, 2) and 0x0F) != 0) return null
+    val answerCount = readUInt16(response, 6)
+    if (answerCount == 0) return null
+    return rewriteDnsTtlsInPlace(response, answerCount, ageSeconds = 0, clampToPolicy = false)
+        ?: 0L
+}
+
+/**
+ * Negative caching TTL per RFC 2308: min(SOA TTL, SOA MINIMUM), capped to
+ * [NEGATIVE_DNS_MAX_TTL_SECONDS]. Returns null when the message is not a
+ * cacheable negative response (NXDOMAIN or NODATA without SOA, MINIMUM == 0,
+ * or malformed).
+ */
+internal fun extractNegativeTtlSeconds(
+    response: ByteArray,
+    defaultTtlSeconds: Long = NEGATIVE_DNS_DEFAULT_TTL_SECONDS,
+    maxTtlSeconds: Long = NEGATIVE_DNS_MAX_TTL_SECONDS
+): Long? {
+    if (response.size < DNS_HEADER_SIZE) return null
+    val rcode = readUInt16(response, 2) and 0x0F
+    val answerCount = readUInt16(response, 6)
+    val isNxDomain = rcode == 3 && answerCount == 0
+    val isNoData = rcode == 0 && answerCount == 0
+    if (!isNxDomain && !isNoData) return null
+
+    val soaTtl = findFirstSoaTtl(response) ?: return defaultTtlSeconds.coerceIn(1, maxTtlSeconds)
+    if (soaTtl <= 0) return null
+    return soaTtl.coerceIn(1, maxTtlSeconds)
+}
+
+private data class AuthorityPosition(val recordOffset: Int, val answerCount: Int)
+
+/** Walks QD + AN sections and returns the offset of the first authority record, or null. */
+private fun authorityStart(response: ByteArray): AuthorityPosition? {
+    val end = response.size
+    val questionCount = readUInt16(response, 4)
+    val answerCount = readUInt16(response, 6)
+    val authorityCount = readUInt16(response, 8)
+    if (authorityCount == 0) return null
+    var offset = DNS_HEADER_SIZE
+    repeat(questionCount) {
+        offset = (skipDnsName(response, offset, end) ?: return null) + 4
+        if (offset > end) return null
+    }
+    repeat(answerCount) {
+        val headerOffset = skipDnsName(response, offset, end) ?: return null
+        if (headerOffset + 10 > end) return null
+        val rdataLength = readUInt16(response, headerOffset + 8)
+        offset = headerOffset + 10 + rdataLength
+        if (offset > end) return null
+    }
+    return AuthorityPosition(offset, answerCount)
+}
+
+/** Finds the first SOA in the authority section; returns min(record TTL, MINIMUM). */
+private fun findFirstSoaTtl(response: ByteArray): Long? {
+    val end = response.size
+    val authorityCount = readUInt16(response, 8)
+    val start = authorityStart(response) ?: return null
+    var offset = start.recordOffset
+    repeat(authorityCount) {
+        val headerOffset = skipDnsName(response, offset, end) ?: return null
+        if (headerOffset + 10 > end) return null
+        val type = readUInt16(response, headerOffset)
+        val ttl = readUInt32(response, headerOffset + 4)
+        val rdataLength = readUInt16(response, headerOffset + 8)
+        val rdataStart = headerOffset + 10
+        val nextOffset = rdataStart + rdataLength
+        if (nextOffset > end) return null
+        if (type == DNS_TYPE_SOA && rdataLength >= 20) {
+            // MINIMUM is the last 4 bytes of the SOA rdata.
+            val minimum = readUInt32(response, nextOffset - 4)
+            return minOf(ttl, minimum)
+        }
+        offset = nextOffset
+    }
+    return null
+}
+
+/**
+ * Ages a cached negative response in place: rewrites the first authority SOA
+ * record TTL and its MINIMUM field to the remaining TTL. Returns false when
+ * malformed (caller may still serve the bytes as-is).
+ */
+internal fun ageNegativeDnsTtlsInPlace(response: ByteArray, ageSeconds: Long): Boolean {
+    if (response.size < DNS_HEADER_SIZE) return false
+    val end = response.size
+    val authorityCount = readUInt16(response, 8)
+    val start = authorityStart(response) ?: return false
+    var offset = start.recordOffset
+    repeat(authorityCount) {
+        val headerOffset = skipDnsName(response, offset, end) ?: return false
+        if (headerOffset + 10 > end) return false
+        val type = readUInt16(response, headerOffset)
+        val rdataLength = readUInt16(response, headerOffset + 8)
+        val rdataStart = headerOffset + 10
+        val nextOffset = rdataStart + rdataLength
+        if (nextOffset > end) return false
+        if (type == DNS_TYPE_SOA && rdataLength >= 20) {
+            val ttl = readUInt32(response, headerOffset + 4)
+            val minimum = readUInt32(response, nextOffset - 4)
+            val remaining = (minOf(ttl, minimum) - ageSeconds.coerceAtLeast(0)).coerceAtLeast(0)
+            writeUInt32(response, headerOffset + 4, remaining)
+            writeUInt32(response, nextOffset - 4, remaining)
+            return true
+        }
+        offset = nextOffset
+    }
+    return false
+}
+
+/**
+ * Stamps every real RR TTL to [staleTtlSeconds] so RFC 8767 serve-stale answers
+ * are cached downstream only briefly while a background refresh runs.
+ */
+internal fun stampStaleTtlsInPlace(response: ByteArray, staleTtlSeconds: Long = STALE_DNS_TTL_SECONDS): Boolean {
+    if (response.size < DNS_HEADER_SIZE) return false
+    val end = response.size
+    val questionCount = readUInt16(response, 4)
+    val recordCount = readUInt16(response, 6) + readUInt16(response, 8) + readUInt16(response, 10)
+    var offset = DNS_HEADER_SIZE
+    repeat(questionCount) {
+        offset = (skipDnsName(response, offset, end) ?: return false) + 4
+        if (offset > end) return false
+    }
+    var touched = false
+    repeat(recordCount) {
+        val headerOffset = skipDnsName(response, offset, end) ?: return false
+        if (headerOffset + 10 > end) return false
+        val type = readUInt16(response, headerOffset)
+        val rdataLength = readUInt16(response, headerOffset + 8)
+        val nextOffset = headerOffset + 10 + rdataLength
+        if (nextOffset > end) return false
+        if (type != DNS_TYPE_OPT && type != DNS_TYPE_TKEY && type != DNS_TYPE_TSIG) {
+            writeUInt32(response, headerOffset + 4, staleTtlSeconds)
+            touched = true
+        }
+        offset = nextOffset
+    }
+    return touched
+}
+
+private fun readMessageName(data: ByteArray, start: Int, end: Int): Pair<String, Int>? {
+    val name = StringBuilder(64)
+    var idx = start
+    var jumped = false
+    var nextOffset = start
+    var jumps = 0
+    while (idx < end) {
+        val len = data[idx].toInt() and 0xFF
+        if (len == 0) {
+            if (!jumped) nextOffset = idx + 1
+            break
+        }
+        if ((len and 0xC0) == 0xC0) {
+            if (idx + 1 >= end) return null
+            val pointer = ((len and 0x3F) shl 8) or (data[idx + 1].toInt() and 0xFF)
+            if (pointer >= end) return null
+            if (!jumped) nextOffset = idx + 2
+            idx = pointer
+            jumped = true
+            jumps++
+            if (jumps > 8) return null
+            continue
+        }
+        idx++
+        if (idx + len > end) return null
+        if (name.isNotEmpty()) name.append('.')
+        appendLowercaseAscii(name, data, idx, len)
+        idx += len
+        if (!jumped) nextOffset = idx
+    }
+    if (name.isEmpty()) return null
+    return Pair(name.toString(), nextOffset)
+}
+
+/**
+ * Extracts CNAME chain targets from the answer section for CNAME-cloaking
+ * checks. Returns an empty list when there are no CNAME answers or the message
+ * is malformed. Capped to 16 targets against hostile chains.
+ */
+internal fun extractCnameTargets(response: ByteArray, maxTargets: Int = 16): List<String> {
+    if (response.size < DNS_HEADER_SIZE) return emptyList()
+    val end = response.size
+    val questionCount = readUInt16(response, 4)
+    val answerCount = readUInt16(response, 6)
+    if (answerCount == 0) return emptyList()
+    var offset = DNS_HEADER_SIZE
+    repeat(questionCount) {
+        offset = (skipDnsName(response, offset, end) ?: return emptyList()) + 4
+        if (offset > end) return emptyList()
+    }
+    val targets = ArrayList<String>(4)
+    repeat(answerCount) {
+        val headerOffset = skipDnsName(response, offset, end) ?: return targets
+        if (headerOffset + 10 > end) return targets
+        val type = readUInt16(response, headerOffset)
+        val rdataLength = readUInt16(response, headerOffset + 8)
+        val rdataStart = headerOffset + 10
+        val nextOffset = rdataStart + rdataLength
+        if (nextOffset > end) return targets
+        if (type == DNS_TYPE_CNAME && targets.size < maxTargets) {
+            readMessageName(response, rdataStart, end)?.let { targets.add(it.first) }
+        }
+        offset = nextOffset
+    }
+    return targets
 }
 
 /**

@@ -63,6 +63,68 @@ class DnsProtocolCacheTest {
         assertNull(clampPositiveDnsTtlsInPlace(ByteArray(11)))
     }
 
+    @Test
+    fun perQtypeTtlBoundsApplyToVolatileTypes() {
+        val response = buildPositiveResponse()
+        val firstAnswerTtlOffset = 35
+
+        // A/AAAA keep the aggressive 1-6h window (default path unchanged).
+        assertEquals(POSITIVE_DNS_MIN_TTL_SECONDS, clampPositiveDnsTtlsInPlace(response, DNS_TYPE_A))
+
+        val https = buildPositiveResponse()
+        assertEquals(600L, clampPositiveDnsTtlsInPlace(https, DNS_TYPE_HTTPS))
+        assertEquals(600L, readUInt32(https, firstAnswerTtlOffset))
+    }
+
+    @Test
+    fun truncatedBitIsDetected() {
+        val response = buildPositiveResponse()
+        assertEquals(false, isTruncatedResponse(response))
+        response[2] = (response[2].toInt() or 0x02).toByte()
+        assertEquals(true, isTruncatedResponse(response))
+    }
+
+    @Test
+    fun negativeTtlComesFromSoaMinimum() {
+        val nxdomain = buildNxDomainResponse(soaTtl = 86_400, soaMinimum = 300)
+        assertEquals(300L, extractNegativeTtlSeconds(nxdomain))
+
+        val noSoa = buildNxDomainResponseWithoutAuthority()
+        assertEquals(NEGATIVE_DNS_DEFAULT_TTL_SECONDS, extractNegativeTtlSeconds(noSoa))
+
+        val positive = buildPositiveResponse()
+        assertNull(extractNegativeTtlSeconds(positive))
+    }
+
+    @Test
+    fun cnameTargetsAreExtractedLowercased() {
+        val response = buildCnameResponse()
+        assertEquals(listOf("target.example.com"), extractCnameTargets(response))
+
+        val positive = buildPositiveResponse()
+        assertEquals(emptyList<String>(), extractCnameTargets(positive))
+    }
+
+    @Test
+    fun staleStampCapsAllRecordTtls() {
+        val response = buildPositiveResponse()
+        val firstAnswerTtlOffset = 35
+        val secondAnswerTtlOffset = 51
+        val optMetadataOffset = 78
+
+        assertTrue(stampStaleTtlsInPlace(response, 30))
+        assertEquals(30L, readUInt32(response, firstAnswerTtlOffset))
+        assertEquals(30L, readUInt32(response, secondAnswerTtlOffset))
+        // OPT metadata untouched.
+        assertEquals(0x8000L, readUInt32(response, optMetadataOffset))
+    }
+
+    @Test
+    fun minAnswerTtlReadsWithoutClamping() {
+        val response = buildPositiveResponse()
+        assertEquals(30L, minAnswerTtlSeconds(response))
+    }
+
     private fun buildPositiveResponse(): ByteArray {
         val question = exampleQuestion()
         val response = ByteArray(84)
@@ -99,6 +161,91 @@ class DnsProtocolCacheTest {
             3, 'c'.code.toByte(), 'o'.code.toByte(), 'm'.code.toByte(), 0,
             0, 1, 0, 1
         )
+    }
+
+    private fun buildNxDomainResponse(soaTtl: Long, soaMinimum: Long): ByteArray {
+        val question = exampleQuestion()
+        // SOA rdata: mname(1,'a',0) + rname(1,'b',0) + 5 x u32.
+        val soaRdata = byteArrayOf(1, 'a'.code.toByte(), 0, 1, 'b'.code.toByte(), 0) +
+            u32(1) + u32(3600) + u32(600) + u32(604800) + u32(soaMinimum)
+        val response = ByteArray(12 + question.size + 2 + 10 + soaRdata.size)
+        response[0] = 0x12
+        response[1] = 0x34
+        response[2] = 0x81.toByte()
+        response[3] = 0x83.toByte() // RCODE=3 NXDOMAIN
+        writeUInt16(response, 4, 1)
+        writeUInt16(response, 6, 0)
+        writeUInt16(response, 8, 1)
+        writeUInt16(response, 10, 0)
+        question.copyInto(response, destinationOffset = 12)
+        var offset = 12 + question.size
+        writeUInt16(response, offset, 0xC00C)
+        offset += 2
+        writeUInt16(response, offset, 6) // SOA
+        offset += 2
+        writeUInt16(response, offset, 1)
+        offset += 2
+        writeUInt32(response, offset, soaTtl)
+        offset += 4
+        writeUInt16(response, offset, soaRdata.size)
+        offset += 2
+        soaRdata.copyInto(response, destinationOffset = offset)
+        return response
+    }
+
+    private fun buildNxDomainResponseWithoutAuthority(): ByteArray {
+        val question = exampleQuestion()
+        val response = ByteArray(12 + question.size)
+        response[0] = 0x12
+        response[1] = 0x34
+        response[2] = 0x81.toByte()
+        response[3] = 0x83.toByte()
+        writeUInt16(response, 4, 1)
+        writeUInt16(response, 6, 0)
+        writeUInt16(response, 8, 0)
+        writeUInt16(response, 10, 0)
+        question.copyInto(response, destinationOffset = 12)
+        return response
+    }
+
+    private fun buildCnameResponse(): ByteArray {
+        val question = exampleQuestion()
+        val target = byteArrayOf(
+            6, 'T'.code.toByte(), 'A'.code.toByte(), 'R'.code.toByte(),
+            'G'.code.toByte(), 'E'.code.toByte(), 'T'.code.toByte(),
+            7, 'e'.code.toByte(), 'x'.code.toByte(), 'a'.code.toByte(), 'm'.code.toByte(),
+            'p'.code.toByte(), 'l'.code.toByte(), 'e'.code.toByte(),
+            3, 'c'.code.toByte(), 'o'.code.toByte(), 'm'.code.toByte(), 0
+        )
+        val response = ByteArray(12 + question.size + 2 + 10 + target.size)
+        response[0] = 0x12
+        response[1] = 0x34
+        response[2] = 0x81.toByte()
+        response[3] = 0x80.toByte()
+        writeUInt16(response, 4, 1)
+        writeUInt16(response, 6, 1)
+        writeUInt16(response, 8, 0)
+        writeUInt16(response, 10, 0)
+        question.copyInto(response, destinationOffset = 12)
+        var offset = 12 + question.size
+        writeUInt16(response, offset, 0xC00C)
+        offset += 2
+        writeUInt16(response, offset, 5) // CNAME
+        offset += 2
+        writeUInt16(response, offset, 1)
+        offset += 2
+        writeUInt32(response, offset, 3600)
+        offset += 4
+        writeUInt16(response, offset, target.size)
+        offset += 2
+        target.copyInto(response, destinationOffset = offset)
+        return response
+    }
+
+    private fun u32(value: Long): ByteArray {
+        val out = ByteArray(4)
+        writeUInt32(out, 0, value)
+        return out
     }
 
     private fun writeAnswer(data: ByteArray, start: Int, type: Int, ttl: Long, rdata: ByteArray): Int {
