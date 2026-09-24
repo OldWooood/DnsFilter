@@ -7,6 +7,7 @@ import com.deatrg.dnsfilter.domain.model.DnsServer
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
@@ -35,11 +36,23 @@ class DnsQueryExecutor(
     companion object {
         private const val TAG = "DnsQueryExecutor"
         private const val DNS_RESPONSE_CACHE_SIZE = 4096
-        private const val DNS_RESPONSE_BUFFER_SIZE = 2048
+        // 4096: covers any answer the client could have advertised via EDNS;
+        // anything filling it completely is treated as suspect-truncated and
+        // retried over TCP (the kernel truncates oversized datagrams silently).
+        private const val DNS_RESPONSE_BUFFER_SIZE = 4096
         private const val UDP_SOCKET_POOL_SIZE = 32
         private const val PREWARM_SOCKETS_PER_SERVER = 2
         private val STALE_WINDOW_MS = STALE_DNS_MAX_WINDOW_SECONDS * 1000L
         private const val PREFETCH_GUARD_MS = 30_000L
+        /** Default per-server upstream timeout for foreground queries and prefetch refreshes. */
+        const val DEFAULT_QUERY_TIMEOUT_MS = 3000L
+        // Blocked upstream receives park a thread each (workers x servers in
+        // flight); give them dedicated permits instead of borrowing from the
+        // shared 64-thread Dispatchers.IO pool.
+        private const val UPSTREAM_IO_PARALLELISM = 256
+
+        @OptIn(ExperimentalCoroutinesApi::class)
+        private val upstreamIo = Dispatchers.IO.limitedParallelism(UPSTREAM_IO_PARALLELISM)
     }
 
     // Each server reuses a small UDP socket pool to avoid repeated create/protect cost.
@@ -80,7 +93,7 @@ class DnsQueryExecutor(
     private val serverAddressCache = ConcurrentHashMap<String, InetAddress>()
     private val inFlightQueries = ConcurrentHashMap<String, CompletableDeferred<DnsQueryResult>>()
     private val responseCache = DnsResponseCache(DNS_RESPONSE_CACHE_SIZE, ::monotonicNowMs)
-    private val refreshScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val refreshScope = CoroutineScope(upstreamIo + SupervisorJob())
     private val lastRefreshMs = ConcurrentHashMap<String, Long>()
 
     private fun monotonicNowMs(): Long = SystemClock.elapsedRealtime()
@@ -130,7 +143,7 @@ class DnsQueryExecutor(
         queryLength: Int,
         qtype: Int = 1,
         qclass: Int = 1,
-        timeoutMs: Long = 3000,
+        timeoutMs: Long = DEFAULT_QUERY_TIMEOUT_MS,
         skipCacheLookup: Boolean = false,
         cacheKeyHint: String? = null,
         cnameBlocklistCheck: ((String) -> Boolean)? = null
@@ -237,7 +250,14 @@ class DnsQueryExecutor(
         }
     }
 
-    private fun maybePrefetch(
+    /**
+     * Reader-thread hook after an L2 fresh hit: kicks off an Unbound-style
+     * background refresh for hot near-expiry entries while serving from cache.
+     * Cheap (one lock + map ops + a small copy); safe on the packet-reader
+     * hot path. The worker path always calls [query] with skipCacheLookup, so
+     * this is the only place prefetch triggers on real VPN traffic.
+     */
+    fun maybePrefetch(
         queryKey: String,
         domain: String,
         servers: List<DnsServer>,
@@ -245,8 +265,8 @@ class DnsQueryExecutor(
         queryOffset: Int,
         queryLength: Int,
         qtype: Int,
-        timeoutMs: Long,
-        cnameBlocklistCheck: ((String) -> Boolean)?
+        timeoutMs: Long = DEFAULT_QUERY_TIMEOUT_MS,
+        cnameBlocklistCheck: ((String) -> Boolean)? = null
     ) {
         if (!responseCache.prefetchHint(queryKey)) return
         AppLog.d(TAG) { "DNS prefetch: domain=$domain qtype=$qtype" }
@@ -332,9 +352,11 @@ class DnsQueryExecutor(
                 val startTime = monotonicNowMs()
                 val udpResult = queryPlainDns(query, queryOffset, queryLength, server.address, timeoutMs)
                 val result = if (udpResult.success && udpResult.responseBytes != null &&
-                    isTruncatedResponse(udpResult.responseBytes)
+                    (isTruncatedResponse(udpResult.responseBytes) || udpResult.udpBufferSaturated)
                 ) {
-                    // UDP truncated (RFC 7766): retry the same server over TCP.
+                    // UDP truncated (TC=1, RFC 7766) or receive buffer completely
+                    // filled (kernel truncates oversized datagrams silently):
+                    // retry the same server over TCP.
                     val tcpResult = queryTcpDns(
                         query, queryOffset, queryLength, server.address, DNS_TCP_TIMEOUT_MS.toLong()
                     )
@@ -453,53 +475,28 @@ class DnsQueryExecutor(
         requestLength: Int,
         serverAddress: String,
         timeoutMs: Long
-    ): DnsQueryResult = withContext(Dispatchers.IO) {
+    ): DnsQueryResult = withContext(upstreamIo) {
         val expectedAddress = getServerAddress(serverAddress)
         val wrapper = acquireUdpSocket(serverAddress, expectedAddress)
 
         suspendCancellableCoroutine { continuation ->
             val completed = AtomicBoolean(false)
             continuation.invokeOnCancellation {
-                if (completed.compareAndSet(false, true)) {
-                    wrapper.isValid = false
-                    closeUdpSocket(wrapper)
-                }
+                // Lost the race: do NOT close the pooled socket. The blocked
+                // receive below finishes on its own (this query's late response
+                // or the deadline) and hands the socket back to the pool; any
+                // leftover datagram is drained by the next receive loop via
+                // question-section matching.
+                completed.set(true)
             }
 
             val result = try {
-                wrapper.socket.soTimeout = timeoutMs.toInt()
-
                 wrapper.requestPacket.setData(request, requestOffset, requestLength)
                 wrapper.socket.send(wrapper.requestPacket)
 
-                wrapper.responsePacket.setData(wrapper.responseBuffer, 0, wrapper.responseBuffer.size)
-                wrapper.responsePacket.length = wrapper.responseBuffer.size
-                val responsePacket = wrapper.responsePacket
-                wrapper.socket.receive(responsePacket)
-
-                if (!isExpectedResponseSource(responsePacket, expectedAddress)) {
-                    wrapper.isValid = false
-                    closeUdpSocket(wrapper)
-                    DnsQueryResult(false, null, 0, "Unexpected DNS response source")
-                } else {
-                    val responseBytes = responsePacket.data.copyOfRange(0, responsePacket.length)
-                    if (!isValidDnsResponse(request, requestOffset, responseBytes)) {
-                        wrapper.isValid = false
-                        closeUdpSocket(wrapper)
-                        DnsQueryResult(false, null, 0, "Mismatched DNS response")
-                    } else {
-                        DnsQueryResult(
-                            success = true,
-                            responseBytes = responseBytes,
-                            responseTime = 0,
-                            error = null
-                        )
-                    }
-                }
-            } catch (e: SocketTimeoutException) {
-                wrapper.isValid = false
-                closeUdpSocket(wrapper)
-                DnsQueryResult(false, null, 0, "Timeout")
+                receiveMatchingResponse(
+                    wrapper, request, requestOffset, requestLength, expectedAddress, timeoutMs
+                )
             } catch (e: Exception) {
                 wrapper.isValid = false
                 closeUdpSocket(wrapper)
@@ -511,7 +508,55 @@ class DnsQueryExecutor(
                 if (continuation.isActive) {
                     continuation.resume(result)
                 }
+            } else {
+                // Cancelled while blocked, but the socket survived: hand it back.
+                releaseUdpSocket(serverAddress, wrapper)
             }
+        }
+    }
+
+    /**
+     * Drain-receive loop for a pooled connected socket. Skips stale datagrams
+     * left by previously cancelled queries and waits until this query's own
+     * response arrives or the overall deadline hits. Timeouts do NOT poison
+     * the socket, so it stays in the pool.
+     */
+    private fun receiveMatchingResponse(
+        wrapper: ReusableUdpSocket,
+        request: ByteArray,
+        requestOffset: Int,
+        requestLength: Int,
+        expectedAddress: InetAddress,
+        timeoutMs: Long
+    ): DnsQueryResult {
+        val buffer = wrapper.responseBuffer
+        val responsePacket = wrapper.responsePacket
+        val deadlineMs = monotonicNowMs() + timeoutMs
+        while (true) {
+            val remainingMs = (deadlineMs - monotonicNowMs()).coerceAtLeast(1L)
+            wrapper.socket.soTimeout = remainingMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+            responsePacket.setData(buffer, 0, buffer.size)
+            responsePacket.length = buffer.size
+            try {
+                wrapper.socket.receive(responsePacket)
+            } catch (_: SocketTimeoutException) {
+                return DnsQueryResult(false, null, 0, "Timeout")
+            }
+            if (!isExpectedResponseSource(responsePacket, expectedAddress)) {
+                continue
+            }
+            val length = responsePacket.length
+            val responseBytes = buffer.copyOfRange(0, length)
+            if (!isValidDnsResponse(request, requestOffset, requestLength, responseBytes)) {
+                continue
+            }
+            return DnsQueryResult(
+                success = true,
+                responseBytes = responseBytes,
+                responseTime = 0,
+                error = null,
+                udpBufferSaturated = length >= buffer.size
+            )
         }
     }
 
@@ -525,7 +570,7 @@ class DnsQueryExecutor(
         requestLength: Int,
         serverAddress: String,
         timeoutMs: Long
-    ): DnsQueryResult = withContext(Dispatchers.IO) {
+    ): DnsQueryResult = withContext(upstreamIo) {
         var socket: Socket? = null
         try {
             val expectedAddress = getServerAddress(serverAddress)
@@ -557,7 +602,7 @@ class DnsQueryExecutor(
                 if (n < 0) throw EOFException("TCP DNS body truncated")
                 read += n
             }
-            if (!isValidDnsResponse(request, requestOffset, responseBytes)) {
+            if (!isValidDnsResponse(request, requestOffset, requestLength, responseBytes)) {
                 return@withContext DnsQueryResult(false, null, 0, "Mismatched DNS response")
             }
             DnsQueryResult(success = true, responseBytes = responseBytes, responseTime = 0, error = null)
@@ -586,9 +631,10 @@ class DnsQueryExecutor(
     private fun isValidDnsResponse(
         request: ByteArray,
         requestOffset: Int,
+        requestLength: Int,
         response: ByteArray
     ): Boolean {
-        if (request.size - requestOffset < 12 || response.size < 12) return false
+        if (requestLength < 12 || response.size < 12) return false
 
         // Transaction ID match + connected UDP socket (kernel filters source) is sufficient
         if (response[0] != request[requestOffset] || response[1] != request[requestOffset + 1]) {
@@ -599,7 +645,10 @@ class DnsQueryExecutor(
         val qrBit = (responseFlags shr 15) and 1
         if (qrBit != 1) return false
 
-        return true
+        // The question section must match this query: pooled sockets serve many
+        // queries, and a stale datagram from a cancelled query can share the
+        // 16-bit transaction ID.
+        return dnsQuestionSectionMatches(request, requestOffset, requestLength, response)
     }
 
     private fun acquireUdpSocket(serverAddress: String, expectedAddress: InetAddress): ReusableUdpSocket {
@@ -707,5 +756,10 @@ data class DnsQueryResult(
     val fromCache: Boolean = false,
     val stale: Boolean = false,
     /** Positive answer whose CNAME chain hits the blocklist: answer NXDOMAIN. */
-    val blocked: Boolean = false
+    val blocked: Boolean = false,
+    /**
+     * UDP datagram filled the entire receive buffer: the kernel may have
+     * silently truncated it, so the caller retries the same server over TCP.
+     */
+    val udpBufferSaturated: Boolean = false
 )

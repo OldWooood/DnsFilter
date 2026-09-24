@@ -1,6 +1,7 @@
 package com.deatrg.dnsfilter.data.remote
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -123,6 +124,55 @@ class DnsProtocolCacheTest {
     fun minAnswerTtlReadsWithoutClamping() {
         val response = buildPositiveResponse()
         assertEquals(30L, minAnswerTtlSeconds(response))
+    }
+
+    @Test
+    fun questionSectionMatchAcceptsIdenticalQuery() {
+        val request = buildQueryPacket()
+        val response = buildPositiveResponse()
+        assertTrue(dnsQuestionSectionMatches(request, 0, request.size, response))
+    }
+
+    @Test
+    fun staleDatagramWithSameIdButDifferentQuestionIsRejected() {
+        val request = buildQueryPacket()
+        // Same transaction ID, but a late response for a different domain
+        // (pooled socket reused by a cancelled race).
+        val stale = buildPositiveResponse()
+        stale[12 + 1] = 'X'.code.toByte()
+        assertFalse(dnsQuestionSectionMatches(request, 0, request.size, stale))
+    }
+
+    @Test
+    fun questionMatchIgnoresBytesBeyondRequestLength() {
+        val question = exampleQuestion()
+        // Recycled packet buffer with trailing garbage past the real query.
+        val request = ByteArray(256)
+        request[0] = 0x12
+        request[1] = 0x34
+        writeUInt16(request, 4, 1)
+        question.copyInto(request, destinationOffset = 12)
+        request.fill(0x7F.toByte(), 12 + question.size)
+        val response = buildPositiveResponse()
+        assertTrue(dnsQuestionSectionMatches(request, 0, 12 + question.size, response))
+    }
+
+    @Test
+    fun questionMatchRejectsQdcountMismatch() {
+        val request = buildQueryPacket()
+        val response = buildPositiveResponse()
+        writeUInt16(response, 4, 2)
+        assertFalse(dnsQuestionSectionMatches(request, 0, request.size, response))
+    }
+
+    private fun buildQueryPacket(): ByteArray {
+        val question = exampleQuestion()
+        val request = ByteArray(12 + question.size)
+        request[0] = 0x12
+        request[1] = 0x34
+        writeUInt16(request, 4, 1)
+        question.copyInto(request, destinationOffset = 12)
+        return request
     }
 
     private fun buildPositiveResponse(): ByteArray {

@@ -45,7 +45,12 @@ class DnsVpnService : VpnService() {
         const val TAG = "DnsVpnService"
         const val ACTION_START = "com.deatrg.dnsfilter.START_VPN"
         const val ACTION_STOP = "com.deatrg.dnsfilter.STOP_VPN"
-        const val MTU = 1500
+        // TUN MTU: large enough for any realistic DNS answer. This link is
+        // local-only, so a big MTU costs nothing on the wire and lets oversized
+        // upstream answers (fetched via TCP fallback) reach the client in one
+        // UDP datagram instead of a TC=1 the client cannot follow (no TCP
+        // listener on the virtual DNS addresses).
+        const val MTU = 8000
         private const val UPSTREAM_QUEUE_CAPACITY = 1024
         private const val DNS_HEADER_LENGTH = 12
 
@@ -388,6 +393,21 @@ class DnsVpnService : VpnService() {
             )?.let { cachedResponse ->
                 AppLog.d(TAG) { "DNS L2 cache hit: ${question.domain}" }
                 statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
+                // Unbound-style prefetch: hot near-expiry entries refresh in the
+                // background while we serve from cache. The worker path always
+                // uses skipCacheLookup, so this reader hook is the only place
+                // prefetch triggers on real VPN traffic.
+                val filter = domainFilter
+                executor.maybePrefetch(
+                    queryKey = cacheKey,
+                    domain = question.domain,
+                    servers = servers,
+                    query = packet,
+                    queryOffset = dnsStart,
+                    queryLength = length - dnsStart,
+                    qtype = question.qtype,
+                    cnameBlocklistCheck = filter?.let { f -> { domain: String -> f.isDomainBlocked(domain) } }
+                )
                 sendDnsPayload(task, cachedResponse, responseQueue)
                 return false
             }

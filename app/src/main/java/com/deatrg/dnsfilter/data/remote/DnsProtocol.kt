@@ -108,6 +108,46 @@ fun skipDnsName(data: ByteArray, offset: Int, length: Int): Int? {
 }
 
 /**
+ * Whether the question section (QDCOUNT + encoded QNAME/QTYPE/QCLASS) of a
+ * standalone DNS [response] is byte-identical to the query at
+ * [requestOffset]..[requestOffset]+[requestLength] in [request].
+ *
+ * Used to reject stale datagrams on pooled UDP sockets: a previous cancelled
+ * query's late response can share the 16-bit transaction ID. Only the common
+ * single-question case is compared byte-wise; multi-question messages (which
+ * never occur from the resolver) fall back to the QDCOUNT check.
+ */
+internal fun dnsQuestionSectionMatches(
+    request: ByteArray,
+    requestOffset: Int,
+    requestLength: Int,
+    response: ByteArray
+): Boolean {
+    if (requestLength < 12 || response.size < 12) return false
+    if (requestOffset < 0 || request.size - requestOffset < requestLength) return false
+    val requestQdcount = ((request[requestOffset + 4].toInt() and 0xFF) shl 8) or
+        (request[requestOffset + 5].toInt() and 0xFF)
+    val responseQdcount = ((response[4].toInt() and 0xFF) shl 8) or
+        (response[5].toInt() and 0xFF)
+    if (requestQdcount != responseQdcount) return false
+    if (requestQdcount != 1) return true
+
+    val requestLimit = requestOffset + requestLength
+    val requestNameEnd = skipDnsName(request, requestOffset + 12, requestLimit) ?: return false
+    val requestQuestionEnd = requestNameEnd + 4
+    if (requestQuestionEnd > requestLimit) return false
+    val responseNameEnd = skipDnsName(response, 12, response.size) ?: return false
+    val responseQuestionEnd = responseNameEnd + 4
+    if (responseQuestionEnd > response.size) return false
+    val questionLength = requestQuestionEnd - (requestOffset + 12)
+    if (questionLength != responseQuestionEnd - 12) return false
+    for (i in 0 until questionLength) {
+        if (request[requestOffset + 12 + i] != response[12 + i]) return false
+    }
+    return true
+}
+
+/**
  * Per-qtype TTL policy. A/AAAA keep the aggressive 1-6h window for the Android
  * Resolver L1; volatile types (HTTPS/SVCB/others, often CDN-routed) use a
  * shorter 10min-2h window so failovers propagate faster.

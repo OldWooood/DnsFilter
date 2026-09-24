@@ -60,15 +60,15 @@ class DomainFilter(
         val enabled = filterLists.filter { it.isEnabled }
         filterListsToLoad = enabled
 
-        // 重置状态
-        _isLoaded.value = false
+        // 注意：这里不清 blockedDomains——旧集合一直服务到新数据 merge 完成并原子替换，
+        // 避免更新窗口内出现"零拦截"的广告放行期。
         _isLoading.value = false
         _downloadProgress.value = null
-        _filterListCount.value = 0
-        blockedDomains = emptySet()
 
         // 如果没有启用的过滤列表，直接标记为已加载（空 blocklist 是合法状态）
         if (enabled.isEmpty()) {
+            blockedDomains = emptySet()
+            _filterListCount.value = 0
             AppLog.d(TAG, "No filter lists enabled, marking as loaded with empty blocklist")
             _isLoaded.value = true
             return@withContext
@@ -207,7 +207,7 @@ class DomainFilter(
         applyMergedDomains(cachedBlocklists.filterNotNull())
     }
 
-    /** 合并各列表域名（忽略通配符条目）并发布到内存与状态流。 */
+    /** 合并各列表域名（忽略通配符条目）并原子发布到内存与状态流。 */
     private fun applyMergedDomains(sources: List<Set<String>>) {
         var capacityHint = 0
         sources.forEach { capacityHint += it.size }
@@ -220,9 +220,12 @@ class DomainFilter(
             }
         }
 
+        // build-then-swap：先在临时集合里 merge 完再一次替换引用，旧数据一直服务到此刻。
         blockedDomains = merged
         _filterListCount.value = merged.size
-        _isLoaded.value = merged.isNotEmpty()
+        // 拿到任一可用数据源即视为"已就绪"：纯通配符列表 merge 为空是合法的空拦截状态；
+        // 只有"启用的列表一个都拿不到数据"才算未加载（VPN 启动会被 NoBlocklistData 拦下）。
+        _isLoaded.value = sources.isNotEmpty()
         AppLog.d(TAG, "Blocklist updated: ${merged.size} domains from ${sources.size} lists")
     }
 
