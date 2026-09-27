@@ -2,8 +2,6 @@
 
 A fast local DNS filtering proxy for Android. Intercepts DNS queries via Android's `VpnService`, blocks ads and tracking domains using customizable blocklists, and forwards to multiple upstream servers concurrently for the fastest response.
 
-**Version:** 3.1.1 | **Package:** `com.deatrg.dnsfilter` | **minSdk:** 29 (Android 10+)
-
 ## Features
 
 - **Local VPN-based DNS Proxy** — Routes only DNS traffic into the app via split-tunnel VPN, all other traffic goes through normally
