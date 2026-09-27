@@ -25,6 +25,7 @@ class DomainFilter(
 
     companion object {
         private const val TAG = "DomainFilter"
+        private const val HTTP_NOT_MODIFIED = 304
     }
 
     private val cacheManager = BlocklistCacheManager(context)
@@ -69,7 +70,7 @@ class DomainFilter(
         if (enabled.isEmpty()) {
             blockedDomains = emptySet()
             _filterListCount.value = 0
-            AppLog.d(TAG, "No filter lists enabled, marking as loaded with empty blocklist")
+            AppLog.d(TAG) { "No filter lists enabled, marking as loaded with empty blocklist" }
             _isLoaded.value = true
             return@withContext
         }
@@ -91,25 +92,68 @@ class DomainFilter(
 
     private suspend fun downloadFilterListDomains(filterList: FilterList): Set<String>? = withContext(Dispatchers.IO) {
         try {
-            AppLog.d(TAG, "Downloading filter list: ${filterList.name} from ${filterList.url}")
-            val domains = mutableSetOf<String>()
+            AppLog.d(TAG) { "Downloading filter list: ${filterList.name} from ${filterList.url}" }
 
-            val request = Request.Builder()
-                .url(filterList.url)
-                .get()
-                .build()
+            // 条件请求：内容未变时服务器回 304，省流量省电省解析（每日自动更新的主力路径）
+            val conditionalHeaders = cacheManager.getConditionalHeaders(filterList)
+            when (val outcome = fetchAndApply(filterList, conditionalHeaders)) {
+                is DownloadOutcome.Success -> outcome.domains
+                // 条件命中 304 但本地缓存文件缺失/损坏：本地没有消息体，无条件重拉一次
+                DownloadOutcome.NotModifiedWithoutCache ->
+                    when (val retry = fetchAndApply(filterList, null)) {
+                        is DownloadOutcome.Success -> retry.domains
+                        else -> null
+                    }
+                DownloadOutcome.Failed -> null
+            }
+        } catch (e: Exception) {
+            AppLog.e(TAG, e) { "Failed to download ${filterList.name}" }
+            null
+        }
+    }
 
-            okHttpClient.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) {
-                    AppLog.w(TAG, "Failed to download ${filterList.name}: HTTP ${response.code}")
-                    return@withContext null
+    /** 下载结果：304 但本地缓存缺失时必须无条件重拉，区别于普通失败。 */
+    private sealed interface DownloadOutcome {
+        data class Success(val domains: Set<String>) : DownloadOutcome
+        data object NotModifiedWithoutCache : DownloadOutcome
+        data object Failed : DownloadOutcome
+    }
+
+    private suspend fun fetchAndApply(
+        filterList: FilterList,
+        conditionalHeaders: Map<String, String>?
+    ): DownloadOutcome = withContext(Dispatchers.IO) {
+        val requestBuilder = Request.Builder().url(filterList.url).get()
+        conditionalHeaders?.forEach { (name, value) -> requestBuilder.header(name, value) }
+
+        val response = try {
+            okHttpClient.newCall(requestBuilder.build()).execute()
+        } catch (e: Exception) {
+            AppLog.w(TAG) { "Network error downloading ${filterList.name}: ${e.message}" }
+            return@withContext DownloadOutcome.Failed
+        }
+
+        response.use {
+            if (it.code == HTTP_NOT_MODIFIED) {
+                val cached = cacheManager.loadBlocklist(filterList)
+                if (cached != null) {
+                    // 内容未变：只刷新元数据时间戳，跳过解析与写盘
+                    cacheManager.markCacheFresh(filterList)
+                    notifyCacheChanged()
+                    AppLog.d(TAG) {
+                        "Filter list ${filterList.name} unchanged (304), kept ${cached.size} domains"
+                    }
+                    DownloadOutcome.Success(cached)
+                } else {
+                    DownloadOutcome.NotModifiedWithoutCache
                 }
-
-                val body = response.body ?: return@withContext null
+            } else if (it.isSuccessful) {
+                val body = it.body ?: return@withContext DownloadOutcome.Failed
+                val domains = mutableSetOf<String>()
                 BufferedReader(body.charStream()).use { reader ->
                     reader.lineSequence()
-                        .map { it.trim() }
-                        .filter { it.isNotEmpty() && !it.startsWith("#") }
+                        .map { line -> line.trim() }
+                        .filter { line -> line.isNotEmpty() && !line.startsWith("#") }
                         .forEach { line ->
                             val domain = parseHostLine(line)
                             if (domain != null) {
@@ -117,17 +161,22 @@ class DomainFilter(
                             }
                         }
                 }
+
+                // 保存到缓存（连同验证器头，供下次条件请求使用）
+                cacheManager.saveBlocklist(
+                    filterList,
+                    domains,
+                    etag = it.header("ETag"),
+                    lastModified = it.header("Last-Modified")
+                )
+                notifyCacheChanged()
+
+                AppLog.d(TAG) { "Downloaded ${domains.size} domains for ${filterList.name}" }
+                DownloadOutcome.Success(domains)
+            } else {
+                AppLog.w(TAG) { "Failed to download ${filterList.name}: HTTP ${it.code}" }
+                DownloadOutcome.Failed
             }
-
-            // 保存到缓存
-            cacheManager.saveBlocklist(filterList, domains)
-            notifyCacheChanged()
-
-            AppLog.d(TAG, "Downloaded ${domains.size} domains for ${filterList.name}")
-            domains
-        } catch (e: Exception) {
-            AppLog.e(TAG, "Failed to download ${filterList.name}", e)
-            null
         }
     }
 
@@ -144,7 +193,7 @@ class DomainFilter(
         // 如果没有需要加载的列表，直接返回 true（空 blocklist 是合法状态）
         if (lists.isEmpty()) {
             _isLoaded.value = true
-            AppLog.d(TAG, "No filter lists to load, returning success with empty blocklist")
+            AppLog.d(TAG) { "No filter lists to load, returning success with empty blocklist" }
             return@withContext true
         }
 
@@ -181,7 +230,7 @@ class DomainFilter(
         } else {
             downloadFilterListDomains(filterList) ?: run {
                 if (hasCache) {
-                    AppLog.w(TAG, "Download failed for ${filterList.name}, using old cache")
+                    AppLog.w(TAG) { "Download failed for ${filterList.name}, using old cache" }
                     cacheManager.loadBlocklist(filterList)
                 } else {
                     null
@@ -226,7 +275,7 @@ class DomainFilter(
         // 拿到任一可用数据源即视为"已就绪"：纯通配符列表 merge 为空是合法的空拦截状态；
         // 只有"启用的列表一个都拿不到数据"才算未加载（VPN 启动会被 NoBlocklistData 拦下）。
         _isLoaded.value = sources.isNotEmpty()
-        AppLog.d(TAG, "Blocklist updated: ${merged.size} domains from ${sources.size} lists")
+        AppLog.d(TAG) { "Blocklist updated: ${merged.size} domains from ${sources.size} lists" }
     }
 
     fun isDomainBlocked(domain: String): Boolean {

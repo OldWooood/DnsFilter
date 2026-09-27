@@ -215,6 +215,9 @@ private fun AddDnsServerDialog(
     var name by remember { mutableStateOf("") }
     var address by remember { mutableStateOf("") }
     val focusManager = LocalFocusManager.current
+    // 与 executor 共用同一解析器：UI 校验和上游连接用的是同一套规则（含可选端口）。
+    val parsedAddress = DnsServer.parseAddress(address)
+    val addressHasError = address.isNotBlank() && parsedAddress == null
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -235,6 +238,12 @@ private fun AddDnsServerDialog(
                     onValueChange = { address = it },
                     label = { Text(stringResource(R.string.dns_server_address)) },
                     placeholder = { Text(stringResource(R.string.dns_server_address_placeholder)) },
+                    supportingText = if (addressHasError) {
+                        { Text(stringResource(R.string.dns_server_address_invalid)) }
+                    } else {
+                        null
+                    },
+                    isError = addressHasError,
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(14.dp)
@@ -247,7 +256,7 @@ private fun AddDnsServerDialog(
                     focusManager.clearFocus()
                     onAdd(name, address)
                 },
-                enabled = name.isNotBlank() && address.isNotBlank()
+                enabled = name.isNotBlank() && parsedAddress != null
             ) {
                 Text(stringResource(R.string.action_add))
             }

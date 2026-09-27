@@ -121,6 +121,7 @@ APKs are output to `app/build/outputs/apk/`. The build produces split APKs by AB
 - On `BOOT_COMPLETED`, the alarm is rescheduled.
 - Blocklist cache expires after 24 hours (`UPDATE_INTERVAL_HOURS = 24`).
 - Blocklist (re)loads are **build-then-swap**: the previous in-memory set keeps serving until the new merge is complete, so updates never open a zero-filtering window. Do not clear `blockedDomains` before a reload finishes.
+- Downloads send **conditional requests**: `CacheMeta` stores the ETag/Last-Modified validator and `DomainFilter.fetchAndApply` sends `If-None-Match`/`If-Modified-Since`. A 304 only refreshes the freshness timestamp (`markCacheFresh`) without re-parsing or rewriting the data file. A 304 with a missing/corrupt cache file falls back to exactly one unconditional GET.
 
 ### Statistics
 - `StatisticsBuffer` keeps process-local counters in memory and updates the UI at most once per second.
@@ -135,9 +136,15 @@ APKs are output to `app/build/outputs/apk/`. The build produces split APKs by AB
 - Matching in-flight L2 misses share one logical lookup; `DnsQueryExecutor` still sends that lookup concurrently to every enabled server.
 - UDP sockets that lose a race are NOT destroyed: the blocked receive drains to completion (late response or deadline) and returns the socket to the pool. Stale datagrams are rejected by DNS question-section matching (`dnsQuestionSectionMatches`); sockets are only closed on send/IO errors or shutdown. Do not close pooled sockets on cancellation.
 - Blocking upstream receives (UDP/TCP + background refreshes) run on a dedicated `Dispatchers.IO.limitedParallelism(256)` view (`upstreamIo` in `DnsQueryExecutor`), not the shared 64-thread IO pool.
+- Per-server failures (invalid address, unresolvable hostname, connect/send errors) are caught inside the race in `queryUpstream` and become that server's failed attempt; one broken server never fails the whole race. `CancellationException` must be rethrown, not swallowed, by this catch.
+
+### Upstream Server Addresses
+- Server addresses are parsed by `DnsServer.parseAddress`: `ip`, `ip:port`, bare IPv6, `[ipv6]:port`, or hostname (`:port` optional, default 53). UI validation and the executor use the same parser.
+- `DnsQueryExecutor` caches resolved `ServerEndpoint`s; the cache entry is invalidated on connect/send errors, so hostname-based servers re-resolve after their address changes.
 
 ### VPN State
 - `VpnStateHolder` (provided by `ServiceLocator`) is the single source of truth for whether the VPN is running. `DnsVpnService` writes it; UI and waiters subscribe to its `StateFlow`. Never poll static flags or reintroduce `runBlocking` on the main thread.
+- The manifest opts into always-on VPN support (`SUPPORTS_ALWAYS_ON = true`); a system restart with always-on re-enters via the null-intent START_STICKY path. `onRevoke()` routes through the same serialized `stopVpn()` as ACTION_STOP for full cleanup.
 
 ## Code Style Guidelines
 
@@ -176,7 +183,7 @@ Release builds are signed using credentials from `key.properties` (not in repo).
 
 ## Important Caveats for Agents
 
-1. **Upstream transport is UDP-first**: plain UDP racing is the hot path; UDP responses with TC=1 — or datagrams that fill the entire receive buffer (the kernel truncates oversized datagrams silently) — are retried over TCP to the same server (RFC 7766). DoH and DoT are not available.
+1. **Upstream transport is UDP-first**: plain UDP racing is the hot path; UDP responses with TC=1 — or datagrams that fill the entire receive buffer (the kernel truncates oversized datagrams silently) — are retried over TCP to the same server (RFC 7766). DoH and DoT are not available. Ports default to 53; `ip:port` / `[ipv6]:port` / hostname addresses are supported via `DnsServer.parseAddress`.
 2. **Do not introduce Hilt**: The project intentionally uses manual DI. Do not add Hilt annotations or modify build files to enable it unless explicitly requested.
 3. **Prefer AlarmManager over WorkManager** for new background scheduling tasks.
 4. **VPN is split-tunnel only**: The VPN routes only DNS traffic. Do not change routing to capture all traffic unless explicitly required.

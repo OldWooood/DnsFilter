@@ -156,9 +156,20 @@ class DnsVpnService : VpnService() {
             ACTION_START -> launchLifecycle { startVpn() }
             ACTION_STOP -> launchLifecycle { stopVpn() }
             // START_STICKY 重启时 intent 为 null，恢复之前的运行状态
+            // （always-on 模式下系统重启后也会以 null intent 拉起，走同一路径）
             null -> launchLifecycle { startVpn() }
         }
         return START_STICKY
+    }
+
+    /**
+     * 系统撤销 VPN 授权（用户切换到其他 VPN、在系统设置里关闭/忘记本 VPN、
+     * always-on 被关掉等）。走与 ACTION_STOP 相同的串行化停止路径，
+     * 保证通知、状态流、socket 池全部完整清理，而不是默认的 stopSelf()。
+     */
+    override fun onRevoke() {
+        AppLog.d(TAG) { "VPN authorization revoked by system" }
+        launchLifecycle { stopVpn() }
     }
 
     private fun launchLifecycle(block: suspend () -> Unit) {
@@ -169,7 +180,7 @@ class DnsVpnService : VpnService() {
 
     private suspend fun startVpn() {
         if (isRunning || vpnInterface != null) return
-        AppLog.d(TAG, "Starting VPN service")
+        AppLog.d(TAG) { "Starting VPN service" }
 
         val prefsManager = ServiceLocator.providePreferencesManager()
         // 挂起式读取配置（原实现为 runBlocking 阻塞主线程）
@@ -201,7 +212,7 @@ class DnsVpnService : VpnService() {
         val vpn = try {
             builder.establish()
         } catch (e: Exception) {
-            AppLog.e(TAG, "Failed to establish VPN interface", e)
+            AppLog.e(TAG, e) { "Failed to establish VPN interface" }
             null
         }
         if (vpn == null) {
@@ -220,7 +231,7 @@ class DnsVpnService : VpnService() {
         // Warm connected UDP sockets now so the first real queries skip
         // the create + protect() cost (P1-1).
         scope.launch { dnsQueryExecutor?.prewarm(servers) }
-        AppLog.d(TAG, "VPN established successfully")
+        AppLog.d(TAG) { "VPN established successfully" }
     }
 
     private fun stopVpn() {
@@ -242,7 +253,7 @@ class DnsVpnService : VpnService() {
         dnsQueryExecutor?.shutdown()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
-        AppLog.d(TAG, "VPN stopped")
+        AppLog.d(TAG) { "VPN stopped" }
     }
 
     private suspend fun runDnsLoop(vpn: ParcelFileDescriptor) {
@@ -289,7 +300,7 @@ class DnsVpnService : VpnService() {
             }
         }
 
-        AppLog.d(TAG, "DNS loop started with $slowWorkerCount upstream workers")
+        AppLog.d(TAG) { "DNS loop started with $slowWorkerCount upstream workers" }
 
         try {
             while (isRunning) {
@@ -298,7 +309,7 @@ class DnsVpnService : VpnService() {
                 if (length <= 0) {
                     recyclePacket(packet)
                     if (length == 0) {
-                        AppLog.w(TAG, "read() returned 0, no data available")
+                        AppLog.w(TAG) { "read() returned 0, no data available" }
                     }
                     continue
                 }
@@ -313,9 +324,9 @@ class DnsVpnService : VpnService() {
                 if (handled) recyclePacket(packet)
             }
         } catch (e: InterruptedIOException) {
-            AppLog.d(TAG, "DNS loop interrupted by stop")
+            AppLog.d(TAG) { "DNS loop interrupted by stop" }
         } catch (e: Exception) {
-            AppLog.e(TAG, "Error in DNS loop", e)
+            AppLog.e(TAG, e) { "Error in DNS loop" }
         } finally {
             // stopVpn 可能已取消本协程；清理必须继续执行完。
             // 关闭顺序：先停上游队列让 workers 排空并把响应送入
@@ -329,7 +340,7 @@ class DnsVpnService : VpnService() {
                 runCatching { outputStream.close() }
                 packetPool.clear()
             }
-            AppLog.d(TAG, "DNS loop stopped")
+            AppLog.d(TAG) { "DNS loop stopped" }
         }
     }
 
@@ -448,7 +459,7 @@ class DnsVpnService : VpnService() {
 
     private suspend fun queryUpstream(task: UpstreamTask): DnsQueryResult {
         if (servers.isEmpty()) {
-            AppLog.e(TAG, "No DNS servers available")
+            AppLog.e(TAG) { "No DNS servers available" }
             return DnsQueryResult(false, null, 0, "No DNS servers available")
         }
 

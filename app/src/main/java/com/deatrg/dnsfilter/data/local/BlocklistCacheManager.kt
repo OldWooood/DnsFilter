@@ -91,12 +91,14 @@ class BlocklistCacheManager(private val context: Context) {
             }
         }
 
-        // 缓存元数据
+        // 缓存元数据（etag/lastModified 为 HTTP 验证器，供条件请求使用）
         private data class CacheMeta(
             val id: String,
             val url: String,
             val lastUpdated: Long,
-            val domainCount: Int
+            val domainCount: Int,
+            val etag: String? = null,
+            val lastModified: String? = null
         )
     }
 
@@ -116,8 +118,14 @@ class BlocklistCacheManager(private val context: Context) {
     /**
      * 保存 blocklist 到缓存：只写二进制格式。
      * 先写临时文件再原子 rename，避免写一半崩溃留下损坏的缓存。
+     * [etag]/[lastModified] 来自下载响应的验证器头，供下次条件请求使用。
      */
-    suspend fun saveBlocklist(filterList: FilterList, domains: Set<String>) = withContext(Dispatchers.IO) {
+    suspend fun saveBlocklist(
+        filterList: FilterList,
+        domains: Set<String>,
+        etag: String? = null,
+        lastModified: String? = null
+    ) = withContext(Dispatchers.IO) {
         val target = getCacheBinFile(filterList.id)
         val tmp = File(cacheDir, cacheBinTmpFileName(filterList.id))
         try {
@@ -133,11 +141,38 @@ class BlocklistCacheManager(private val context: Context) {
             }
 
             // 更新元数据
-            updateMeta(filterList, domains.size)
+            updateMeta(filterList, domains.size, etag, lastModified)
         } catch (e: Exception) {
             tmp.delete()
-            AppLog.e(TAG, "Failed to save blocklist cache for ${filterList.name}", e)
+            AppLog.e(TAG, e) { "Failed to save blocklist cache for ${filterList.name}" }
         }
+    }
+
+    /**
+     * 条件请求头：有 ETag 用 If-None-Match，否则有 Last-Modified 用 If-Modified-Since。
+     * 两者皆无（或无元数据）返回 null，走无条件 GET。
+     */
+    fun getConditionalHeaders(filterList: FilterList): Map<String, String>? {
+        val meta = getMetaCompat(filterList) ?: return null
+        val etag = meta.etag
+        if (!etag.isNullOrEmpty()) return mapOf("If-None-Match" to etag)
+        val lastModified = meta.lastModified
+        if (!lastModified.isNullOrEmpty()) return mapOf("If-Modified-Since" to lastModified)
+        return null
+    }
+
+    /**
+     * 服务器 304 确认内容未变：只刷新时间戳（保留验证器与 domainCount），
+     * 不重新解析、不重写数据文件。
+     */
+    fun markCacheFresh(filterList: FilterList) {
+        val existing = getMetaCompat(filterList)
+        updateMeta(
+            filterList,
+            domainCount = existing?.domainCount ?: 0,
+            etag = existing?.etag,
+            lastModified = existing?.lastModified
+        )
     }
 
     /**
@@ -192,14 +227,21 @@ class BlocklistCacheManager(private val context: Context) {
         removeMeta(filterList)
     }
 
-    private fun updateMeta(filterList: FilterList, domainCount: Int) {
+    private fun updateMeta(
+        filterList: FilterList,
+        domainCount: Int,
+        etag: String? = null,
+        lastModified: String? = null
+    ) {
         val snapshot = synchronized(metaLock) {
             val metaMap = getOrLoadMetaCache()
             metaMap[filterList.id] = CacheMeta(
                 id = filterList.id,
                 url = filterList.url,
                 lastUpdated = System.currentTimeMillis(),
-                domainCount = domainCount
+                domainCount = domainCount,
+                etag = etag,
+                lastModified = lastModified
             )
             // 清理 3.0.2 之前按 URL 做 key 的遗留条目
             metaMap.remove(filterList.url)
@@ -274,7 +316,7 @@ class BlocklistCacheManager(private val context: Context) {
             }
         } catch (e: Exception) {
             tmp.delete()
-            AppLog.e(TAG, "Failed to save cache meta", e)
+            AppLog.e(TAG, e) { "Failed to save cache meta" }
         }
     }
 
@@ -288,7 +330,9 @@ class BlocklistCacheManager(private val context: Context) {
                     id = id,
                     url = metaObj.optString("url"),
                     lastUpdated = metaObj.getLong("lastUpdated"),
-                    domainCount = metaObj.optInt("domainCount")
+                    domainCount = metaObj.optInt("domainCount"),
+                    etag = metaObj.optString("etag").ifEmpty { null },
+                    lastModified = metaObj.optString("lastModified").ifEmpty { null }
                 )
             }
         } catch (e: Exception) {
@@ -304,6 +348,8 @@ class BlocklistCacheManager(private val context: Context) {
             metaObj.put("url", meta.url)
             metaObj.put("lastUpdated", meta.lastUpdated)
             metaObj.put("domainCount", meta.domainCount)
+            meta.etag?.let { metaObj.put("etag", it) }
+            meta.lastModified?.let { metaObj.put("lastModified", it) }
             obj.put(id, metaObj)
         }
         return obj.toString()

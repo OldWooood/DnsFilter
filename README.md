@@ -7,8 +7,9 @@ A fast local DNS filtering proxy for Android. Intercepts DNS queries via Android
 ## Features
 
 - **Local VPN-based DNS Proxy** — Routes only DNS traffic into the app via split-tunnel VPN, all other traffic goes through normally
+- **Always-on VPN** — Can be set as "Always-on" in system settings (auto-restarts after reboot, optional "block connections without VPN"); revocation runs the full stop cleanup
 - **Domain Blocking** — Filters against AdAway-format blocklists. Supports multiple lists, add/remove/toggle, and manual refresh
-- **Concurrent Multi-Server Queries** — Sends DNS queries to all enabled upstream servers simultaneously, uses the fastest successful response
+- **Concurrent Multi-Server Queries** — Sends DNS queries to all enabled upstream servers simultaneously, uses the fastest successful response; a broken server address only fails its own attempt, never the race
 - **Two-Level DNS Caching** — Android Resolver is L1; a 4,096-entry L2 stores positive, RFC 2308 negative (NXDOMAIN/NODATA) and brief RFC 9520 SERVFAIL entries, returns correctly aged remaining TTLs, serves expired entries stale for up to 3 days (RFC 8767) while refreshing in the background, and prefetches hot near-expiry entries
 - **In-flight Query Coalescing** — Concurrent requests for the same domain/type/class join one in-flight upstream lookup instead of sending duplicates
 - **CNAME Cloaking Protection** — Positive answers whose CNAME chain hits the blocklist are answered NXDOMAIN instead, without polluting the cache; the verdict is remembered so repeats skip upstream
@@ -16,9 +17,9 @@ A fast local DNS filtering proxy for Android. Intercepts DNS queries via Android
 - **UDP Socket Pooling** — Up to 32 reusable sockets per upstream server, prewarmed on VPN start and network change; sockets that lose a race are drained and reused instead of destroyed
 - **Statistics** — In-memory counters for DNS requests handled by the VPN, blocked requests, block rate, and average upstream response time
 - **Dashboard** — Protection status, start/stop toggle, statistics grid
-- **DNS Server Management** — Configure multiple upstream servers with enable/disable toggle
+- **DNS Server Management** — Configure multiple upstream plain DNS servers (add with validation, enable/disable, delete, reset to defaults); `ip:port`, `[ipv6]:port`, and hostname addresses are supported
 - **Foreground Service** — Runs as a foreground service with notification and stop action
-- **Automatic Blocklist Updates** — Refreshes enabled lists daily around local noon and reschedules after reboot or time-zone changes
+- **Automatic Blocklist Updates** — Refreshes enabled lists daily around local noon and reschedules after reboot or time-zone changes; downloads send conditional requests (`If-None-Match`/`If-Modified-Since`), so unchanged lists cost a 304 instead of a full re-download
 - **Low Overhead** — Packet buffer recycling, request coalescing, and minimal allocations in the hot path
 
 ## Screens
@@ -89,7 +90,7 @@ DnsVpnService — reads IP packets, parses IPv4/IPv6/UDP/DNS
 
 ## Protocol Support and Limits
 
-- Upstream DNS currently uses plain UDP on port 53. DoH and DoT are not implemented.
+- Upstream DNS currently uses plain UDP; the port defaults to 53, and custom `ip:port`, `[ipv6]:port`, and hostname server addresses are supported. DoH and DoT are not implemented.
 - IPv4 and IPv6 DNS packets are supported; IPv6 extension headers are not currently parsed.
 - Truncated upstream answers (TC=1, RFC 7766) and datagrams that fill the 4,096-byte receive buffer are retried over TCP to the same server. The TUN MTU is 8000, so oversized answers reach the client in a single UDP datagram; only answers larger than ~7.9 KB still get TC=1 (a client-facing TCP DNS listener is not implemented).
 - L2 caching and in-flight request deduplication use normalized domain, query type, and query class.

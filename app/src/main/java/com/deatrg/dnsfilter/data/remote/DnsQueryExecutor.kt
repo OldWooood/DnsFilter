@@ -72,6 +72,9 @@ class DnsQueryExecutor(
         val sockets = ArrayBlockingQueue<ReusableUdpSocket>(UDP_SOCKET_POOL_SIZE)
     }
 
+    /** 解析后的上游端点：地址 + 端口（支持 `ip:port` / `[ipv6]:port` / hostname）。 */
+    private data class ServerEndpoint(val address: InetAddress, val port: Int)
+
     private data class ServerQueryOutcome(
         val server: DnsServer,
         val result: DnsQueryResult,
@@ -93,7 +96,7 @@ class DnsQueryExecutor(
     private val udpSocketPools = ConcurrentHashMap<String, UdpSocketPool>()
     @Volatile
     private var isShutdown = false
-    private val serverAddressCache = ConcurrentHashMap<String, InetAddress>()
+    private val serverEndpoints = ConcurrentHashMap<String, ServerEndpoint>()
     private val inFlightQueries = ConcurrentHashMap<String, CompletableDeferred<DnsQueryResult>>()
     private val responseCache = DnsResponseCache(DNS_RESPONSE_CACHE_SIZE, ::monotonicNowMs)
     private val refreshScope = CoroutineScope(upstreamIo + SupervisorJob())
@@ -324,10 +327,10 @@ class DnsQueryExecutor(
         withContext(Dispatchers.IO) {
             servers.distinctBy { it.address }.forEach { server ->
                 try {
-                    val expected = getServerAddress(server.address)
+                    val endpoint = resolveServerEndpoint(server.address)
                     val pool = udpSocketPools.getOrPut(server.address) { UdpSocketPool() }
                     repeat((perServer - pool.sockets.size).coerceAtLeast(0)) {
-                        val wrapper = createUdpSocket(expected)
+                        val wrapper = createUdpSocket(endpoint)
                         if (!pool.sockets.offer(wrapper)) {
                             closeUdpSocket(wrapper)
                         }
@@ -353,20 +356,28 @@ class DnsQueryExecutor(
         val deferreds = servers.map { server ->
             async {
                 val startTime = monotonicNowMs()
-                val udpResult = queryPlainDns(query, queryOffset, queryLength, server.address, timeoutMs)
-                val result = if (udpResult.success && udpResult.responseBytes != null &&
-                    (isTruncatedResponse(udpResult.responseBytes) || udpResult.udpBufferSaturated)
-                ) {
-                    // UDP truncated (TC=1, RFC 7766) or receive buffer completely
-                    // filled (kernel truncates oversized datagrams silently):
-                    // retry the same server over TCP.
-                    val tcpResult = queryTcpDns(
-                        query, queryOffset, queryLength, server.address, DNS_TCP_TIMEOUT_MS.toLong()
-                    )
-                    if (tcpResult.success) tcpResult
-                    else DnsQueryResult(false, null, 0, "Truncated, TCP fallback failed")
-                } else {
-                    udpResult
+                // 单个服务器失败（地址非法/无法解析/连接错误）转成该服务器的失败结果，
+                // 不炸掉整个竞速，让其余服务器继续参与。
+                val result = try {
+                    val udpResult = queryPlainDns(query, queryOffset, queryLength, server.address, timeoutMs)
+                    if (udpResult.success && udpResult.responseBytes != null &&
+                        (isTruncatedResponse(udpResult.responseBytes) || udpResult.udpBufferSaturated)
+                    ) {
+                        // UDP truncated (TC=1, RFC 7766) or receive buffer completely
+                        // filled (kernel truncates oversized datagrams silently):
+                        // retry the same server over TCP.
+                        val tcpResult = queryTcpDns(
+                            query, queryOffset, queryLength, server.address, DNS_TCP_TIMEOUT_MS.toLong()
+                        )
+                        if (tcpResult.success) tcpResult
+                        else DnsQueryResult(false, null, 0, "Truncated, TCP fallback failed")
+                    } else {
+                        udpResult
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    DnsQueryResult(false, null, 0, e.message ?: "Upstream error")
                 }
                 ServerQueryOutcome(server, result, monotonicNowMs() - startTime)
             }
@@ -479,8 +490,8 @@ class DnsQueryExecutor(
         serverAddress: String,
         timeoutMs: Long
     ): DnsQueryResult = withContext(upstreamIo) {
-        val expectedAddress = getServerAddress(serverAddress)
-        val wrapper = acquireUdpSocket(serverAddress, expectedAddress)
+        val endpoint = resolveServerEndpoint(serverAddress)
+        val wrapper = acquireUdpSocket(serverAddress, endpoint)
         val completed = AtomicBoolean(false)
 
         try {
@@ -499,11 +510,13 @@ class DnsQueryExecutor(
                     wrapper.socket.send(wrapper.requestPacket)
 
                     receiveMatchingResponse(
-                        wrapper, request, requestOffset, requestLength, expectedAddress, timeoutMs
+                        wrapper, request, requestOffset, requestLength, endpoint, timeoutMs
                     )
                 } catch (e: Exception) {
                     wrapper.isValid = false
                     closeUdpSocket(wrapper)
+                    // 失效端点缓存：hostname 型服务器换地址后，下一次查询会重新解析。
+                    invalidateServerEndpoint(serverAddress)
                     DnsQueryResult(false, null, 0, e.message)
                 }
 
@@ -538,7 +551,7 @@ class DnsQueryExecutor(
         request: ByteArray,
         requestOffset: Int,
         requestLength: Int,
-        expectedAddress: InetAddress,
+        endpoint: ServerEndpoint,
         timeoutMs: Long
     ): DnsQueryResult {
         val buffer = wrapper.responseBuffer
@@ -554,7 +567,7 @@ class DnsQueryExecutor(
             } catch (_: SocketTimeoutException) {
                 return DnsQueryResult(false, null, 0, "Timeout")
             }
-            if (!isExpectedResponseSource(responsePacket, expectedAddress)) {
+            if (!isExpectedResponseSource(responsePacket, endpoint)) {
                 continue
             }
             val length = responsePacket.length
@@ -585,10 +598,10 @@ class DnsQueryExecutor(
     ): DnsQueryResult = withContext(upstreamIo) {
         var socket: Socket? = null
         try {
-            val expectedAddress = getServerAddress(serverAddress)
+            val endpoint = resolveServerEndpoint(serverAddress)
             socket = Socket()
             tcpSocketProtector?.invoke(socket)
-            socket.connect(InetSocketAddress(expectedAddress, 53), timeoutMs.toInt())
+            socket.connect(InetSocketAddress(endpoint.address, endpoint.port), timeoutMs.toInt())
             socket.soTimeout = timeoutMs.toInt()
 
             val out = socket.getOutputStream()
@@ -627,17 +640,32 @@ class DnsQueryExecutor(
         }
     }
 
-    private fun getServerAddress(serverAddress: String): InetAddress {
-        return serverAddressCache.getOrPut(serverAddress) {
-            InetAddress.getByName(serverAddress)
+    /**
+     * 解析并缓存上游端点。连接/发送失败时由 [invalidateServerEndpoint] 失效，
+     * hostname 型服务器换地址后下一次查询会重新解析。
+     */
+    private fun resolveServerEndpoint(serverAddress: String): ServerEndpoint {
+        return serverEndpoints[serverAddress] ?: buildServerEndpoint(serverAddress).also {
+            serverEndpoints[serverAddress] = it
         }
+    }
+
+    private fun buildServerEndpoint(serverAddress: String): ServerEndpoint {
+        val (host, port) = DnsServer.parseAddress(serverAddress)
+            ?: throw IllegalArgumentException("Invalid DNS server address: $serverAddress")
+        return ServerEndpoint(InetAddress.getByName(host), port)
+    }
+
+    /** 失效端点缓存：下次查询重新解析（仅 hostname 型会真正重新走 DNS）。 */
+    private fun invalidateServerEndpoint(serverAddress: String) {
+        serverEndpoints.remove(serverAddress)
     }
 
     private fun isExpectedResponseSource(
         responsePacket: DatagramPacket,
-        expectedAddress: InetAddress
+        endpoint: ServerEndpoint
     ): Boolean {
-        return responsePacket.port == 53 && responsePacket.address == expectedAddress
+        return responsePacket.port == endpoint.port && responsePacket.address == endpoint.address
     }
 
     private fun isValidDnsResponse(
@@ -663,9 +691,9 @@ class DnsQueryExecutor(
         return dnsQuestionSectionMatches(request, requestOffset, requestLength, response)
     }
 
-    private fun acquireUdpSocket(serverAddress: String, expectedAddress: InetAddress): ReusableUdpSocket {
+    private fun acquireUdpSocket(serverAddress: String, endpoint: ServerEndpoint): ReusableUdpSocket {
         val pool = udpSocketPools.getOrPut(serverAddress) { UdpSocketPool() }
-        return pool.sockets.poll() ?: createUdpSocket(expectedAddress)
+        return pool.sockets.poll() ?: createUdpSocket(endpoint)
     }
 
     private fun releaseUdpSocket(serverAddress: String, wrapper: ReusableUdpSocket) {
@@ -684,10 +712,10 @@ class DnsQueryExecutor(
         }
     }
 
-    private fun createUdpSocket(expectedAddress: InetAddress): ReusableUdpSocket {
+    private fun createUdpSocket(endpoint: ServerEndpoint): ReusableUdpSocket {
         val socket = DatagramSocket()
         socketProtector?.invoke(socket)
-        socket.connect(expectedAddress, 53)
+        socket.connect(endpoint.address, endpoint.port)
         return ReusableUdpSocket(socket)
     }
 

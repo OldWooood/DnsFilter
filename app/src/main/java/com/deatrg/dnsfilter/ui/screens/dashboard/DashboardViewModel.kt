@@ -101,7 +101,7 @@ class DashboardViewModel(
         // 初始化：从本地缓存加载 blocklist（不下载）
         viewModelScope.launch {
             runCatching { filterListRepository.loadFilterLists() }
-                .onFailure { AppLog.e(TAG, "Failed to load filter lists", it) }
+                .onFailure { AppLog.e(TAG, it) { "Failed to load filter lists" } }
         }
     }
 
@@ -131,7 +131,7 @@ class DashboardViewModel(
                     // 2. 确保 blocklist 已加载（从缓存或下载）
                     val hasData = ensureBlocklistsReady()
                     if (!hasData) {
-                        AppLog.e(TAG, "No blocklist data available, cannot start VPN")
+                        AppLog.e(TAG) { "No blocklist data available, cannot start VPN" }
                         _vpnErrors.tryEmit(VpnError.NoBlocklistData)
                         return@launch
                     }
@@ -139,21 +139,21 @@ class DashboardViewModel(
                     // 3. 启动 VPN 并等待状态就绪
                     appContext.startForegroundService(startIntent(appContext))
                     if (!waitForVpnState(true)) {
-                        AppLog.e(TAG, "VPN start timeout")
+                        AppLog.e(TAG) { "VPN start timeout" }
                         _vpnErrors.tryEmit(VpnError.StartFailed)
                     } else {
-                        AppLog.d(TAG, "VPN started successfully")
+                        AppLog.d(TAG) { "VPN started successfully" }
                     }
                 } else {
                     appContext.startService(stopIntent(appContext))
                     if (!waitForVpnState(false)) {
-                        AppLog.e(TAG, "VPN stop timeout")
+                        AppLog.e(TAG) { "VPN stop timeout" }
                     } else {
-                        AppLog.d(TAG, "VPN stopped successfully")
+                        AppLog.d(TAG) { "VPN stopped successfully" }
                     }
                 }
             } catch (e: Exception) {
-                AppLog.e(TAG, "Error toggling VPN", e)
+                AppLog.e(TAG, e) { "Error toggling VPN" }
             } finally {
                 _isVpnProcessing.value = false
             }
@@ -169,7 +169,7 @@ class DashboardViewModel(
                 filterListRepository.filterListCount.first() > 0
         if (alreadyLoaded) return true
 
-        AppLog.d(TAG, "Loading blocklists...")
+        AppLog.d(TAG) { "Loading blocklists..." }
         return filterListRepository.loadFilterLists()
     }
 

@@ -46,14 +46,14 @@ class BlocklistUpdateAlarmReceiver : BroadcastReceiver() {
                         ServiceLocator.init(appContext)
                         val domainFilter = ServiceLocator.provideDomainFilter()
                         if (domainFilter.isLoading.value) {
-                            AppLog.d(TAG, "Blocklist refresh already running; automatic update skipped")
+                            AppLog.d(TAG) { "Blocklist refresh already running; automatic update skipped" }
                         } else {
                             ServiceLocator.provideFilterListRepository().refreshLists()
-                            AppLog.d(TAG, "Automatic blocklist refresh completed")
+                            AppLog.d(TAG) { "Automatic blocklist refresh completed" }
                         }
                     } catch (e: Exception) {
                         // DomainFilter retains old cache data when a download fails.
-                        AppLog.e(TAG, "Automatic blocklist refresh failed", e)
+                        AppLog.e(TAG, e) { "Automatic blocklist refresh failed" }
                     } finally {
                         if (wakeLock.isHeld) wakeLock.release()
                         pendingResult.finish()

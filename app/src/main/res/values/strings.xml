@@ -41,7 +41,8 @@
     <string name="dns_server_add">Add DNS Server</string>
     <string name="dns_server_name">Name</string>
     <string name="dns_server_address">Address</string>
-    <string name="dns_server_address_placeholder">1.1.1.1</string>
+    <string name="dns_server_address_placeholder">1.1.1.1 or 1.1.1.1:5353</string>
+    <string name="dns_server_address_invalid">Enter an IPv4/IPv6/hostname, optionally with a port (e.g. 1.1.1.1:5353)</string>
     <string name="dns_server_enabled">Enabled</string>
     <string name="dns_server_disabled">Disabled</string>
     <string name="dns_server_delete">Delete</string>

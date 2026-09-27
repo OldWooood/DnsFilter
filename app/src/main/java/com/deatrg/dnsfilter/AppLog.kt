@@ -41,6 +41,12 @@ object AppLog {
         }
     }
 
+    inline fun e(tag: String, tr: Throwable, msg: () -> String) {
+        if (BuildConfig.DEBUG) {
+            Log.e(tag, msg(), tr)
+        }
+    }
+
     @JvmStatic
     fun w(tag: String, msg: String) {
         if (BuildConfig.DEBUG) {
