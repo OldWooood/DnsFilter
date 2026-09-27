@@ -4,6 +4,7 @@ import android.os.SystemClock
 import com.deatrg.dnsfilter.AppLog
 import com.deatrg.dnsfilter.domain.model.DnsServer
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -90,6 +91,8 @@ class DnsQueryExecutor(
     )
 
     private val udpSocketPools = ConcurrentHashMap<String, UdpSocketPool>()
+    @Volatile
+    private var isShutdown = false
     private val serverAddressCache = ConcurrentHashMap<String, InetAddress>()
     private val inFlightQueries = ConcurrentHashMap<String, CompletableDeferred<DnsQueryResult>>()
     private val responseCache = DnsResponseCache(DNS_RESPONSE_CACHE_SIZE, ::monotonicNowMs)
@@ -478,40 +481,49 @@ class DnsQueryExecutor(
     ): DnsQueryResult = withContext(upstreamIo) {
         val expectedAddress = getServerAddress(serverAddress)
         val wrapper = acquireUdpSocket(serverAddress, expectedAddress)
+        val completed = AtomicBoolean(false)
 
-        suspendCancellableCoroutine { continuation ->
-            val completed = AtomicBoolean(false)
-            continuation.invokeOnCancellation {
-                // Lost the race: do NOT close the pooled socket. The blocked
-                // receive below finishes on its own (this query's late response
-                // or the deadline) and hands the socket back to the pool; any
-                // leftover datagram is drained by the next receive loop via
-                // question-section matching.
-                completed.set(true)
-            }
-
-            val result = try {
-                wrapper.requestPacket.setData(request, requestOffset, requestLength)
-                wrapper.socket.send(wrapper.requestPacket)
-
-                receiveMatchingResponse(
-                    wrapper, request, requestOffset, requestLength, expectedAddress, timeoutMs
-                )
-            } catch (e: Exception) {
-                wrapper.isValid = false
-                closeUdpSocket(wrapper)
-                DnsQueryResult(false, null, 0, e.message)
-            }
-
-            if (completed.compareAndSet(false, true)) {
-                releaseUdpSocket(serverAddress, wrapper)
-                if (continuation.isActive) {
-                    continuation.resume(result)
+        try {
+            suspendCancellableCoroutine { continuation ->
+                continuation.invokeOnCancellation {
+                    // Lost the race: do NOT close the pooled socket. The blocked
+                    // receive below finishes on its own (this query's late response
+                    // or the deadline) and hands the socket back to the pool; any
+                    // leftover datagram is drained by the next receive loop via
+                    // question-section matching.
+                    completed.set(true)
                 }
-            } else {
-                // Cancelled while blocked, but the socket survived: hand it back.
-                releaseUdpSocket(serverAddress, wrapper)
+
+                val result = try {
+                    wrapper.requestPacket.setData(request, requestOffset, requestLength)
+                    wrapper.socket.send(wrapper.requestPacket)
+
+                    receiveMatchingResponse(
+                        wrapper, request, requestOffset, requestLength, expectedAddress, timeoutMs
+                    )
+                } catch (e: Exception) {
+                    wrapper.isValid = false
+                    closeUdpSocket(wrapper)
+                    DnsQueryResult(false, null, 0, e.message)
+                }
+
+                if (completed.compareAndSet(false, true)) {
+                    releaseUdpSocket(serverAddress, wrapper)
+                    if (continuation.isActive) {
+                        continuation.resume(result)
+                    }
+                } else {
+                    // Cancelled while blocked, but the socket survived: hand it back.
+                    releaseUdpSocket(serverAddress, wrapper)
+                }
             }
+        } catch (e: CancellationException) {
+            // 已取消且 block 从未运行（acquire 与挂起点注册之间的窗口）：
+            // socket 尚未使用也尚未归还，直接关闭，别靠 GC finalizer 兜底。
+            if (completed.compareAndSet(false, true)) {
+                closeUdpSocket(wrapper)
+            }
+            throw e
         }
     }
 
@@ -659,6 +671,13 @@ class DnsQueryExecutor(
     private fun releaseUdpSocket(serverAddress: String, wrapper: ReusableUdpSocket) {
         if (!wrapper.isValid) return
 
+        // 停机后归还的 socket（排水复用让竞速输家在 shutdown 之后才结束 receive）：
+        // 直接关闭，不要用 getOrPut 重建已被清空的池子把 socket 停进去。
+        if (isShutdown) {
+            closeUdpSocket(wrapper)
+            return
+        }
+
         val pool = udpSocketPools.getOrPut(serverAddress) { UdpSocketPool() }
         if (!pool.sockets.offer(wrapper)) {
             closeUdpSocket(wrapper)
@@ -720,6 +739,9 @@ class DnsQueryExecutor(
     }
 
     fun shutdown() {
+        // 先置位：排水复用下，竞速输家的 socket 会在 shutdown 之后才结束 receive
+        // 并归还，releaseUdpSocket 需要知道直接关闭而不是回池。
+        isShutdown = true
         refreshScope.cancel()
         lastRefreshMs.clear()
         responseCache.clear()
