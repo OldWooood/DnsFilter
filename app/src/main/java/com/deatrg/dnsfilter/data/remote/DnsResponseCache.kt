@@ -27,7 +27,9 @@ internal class DnsResponseCache(
         val response: ByteArray,
         val ageSeconds: Long,
         val stale: Boolean = false,
-        val kind: EntryKind = EntryKind.POSITIVE
+        val kind: EntryKind = EntryKind.POSITIVE,
+        /** 命中即得的 Unbound 式预取提示：热点且剩余 TTL < 10%，应后台刷新。 */
+        val prefetch: Boolean = false
     )
 
     private data class Entry(
@@ -52,7 +54,11 @@ internal class DnsResponseCache(
 
     fun generation(): Long = synchronized(lock) { generation }
 
-    /** Fresh hits only; increments the per-entry hit counter used for prefetch hints. */
+    /**
+     * Fresh hits only; increments the per-entry hit counter and evaluates the
+     * prefetch hint in the SAME lock acquisition — one lock per hot reader-path
+     * lookup, with the hint delivered on [Hit.prefetch].
+     */
     fun get(key: String): Hit? = synchronized(lock) {
         val entry = entries[key] ?: return@synchronized null
         val now = nowMs()
@@ -67,7 +73,8 @@ internal class DnsResponseCache(
             response = entry.response,
             ageSeconds = ((now - entry.storedAtMs).coerceAtLeast(0L) + 999L) / 1000L,
             stale = false,
-            kind = entry.kind
+            kind = entry.kind,
+            prefetch = prefetchConditionLocked(entry, now)
         )
     }
 
@@ -95,14 +102,18 @@ internal class DnsResponseCache(
     /**
      * Unbound-style prefetch hint: a hot entry (3+ hits) whose remaining TTL is
      * below 10% should be refreshed in the background while serving from cache.
+     * 仅测试/诊断使用：热路径上的判定已并入 [get] 同一把锁内（[Hit.prefetch]）。
      */
     fun prefetchHint(key: String): Boolean = synchronized(lock) {
         val entry = entries[key] ?: return@synchronized false
-        val now = nowMs()
+        prefetchConditionLocked(entry, nowMs())
+    }
+
+    private fun prefetchConditionLocked(entry: Entry, now: Long): Boolean {
         val remainingMs = entry.expiresAtMs - now
-        if (remainingMs <= 0) return@synchronized false
-        if (entry.originalTtlMs <= 0) return@synchronized false
-        entry.hits >= 3 && remainingMs * 10 < entry.originalTtlMs
+        if (remainingMs <= 0) return false
+        if (entry.originalTtlMs <= 0) return false
+        return entry.hits >= 3 && remainingMs * 10 < entry.originalTtlMs
     }
 
     fun put(

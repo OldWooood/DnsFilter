@@ -72,6 +72,11 @@ class DnsVpnService : VpnService() {
     @Volatile
     private var servers: List<DnsServer> = emptyList()
 
+    // CNAME 链 blocklist 回调：每个查询在 reader/worker 都要用，提升为字段
+    // 避免每次查询重新分配捕获 lambda。
+    @Volatile
+    private var cnameBlocklistCheck: ((String) -> Boolean)? = null
+
     // scope 与 service 实例同生命周期，stop 时只取消具体 Job，
     // 这样快速"关→开"时同一个实例可以直接重启 DNS 循环。
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -133,7 +138,9 @@ class DnsVpnService : VpnService() {
         val dnsLength: Int,
         val question: DnsQuestion,
         val srcPort: Int,
-        val ctx: PacketContext,
+        // IP 头信息直接内联：省去每包一个 PacketContext 分配。
+        val isIPv6: Boolean,
+        val ipHeaderLength: Int,
         // Reader 线程已算好的 L2/in-flight key，worker 复用以避免重复拼串。
         var cacheKeyHint: String? = null
     )
@@ -142,6 +149,7 @@ class DnsVpnService : VpnService() {
         super.onCreate()
         VpnNotifications.createChannel(this)
         domainFilter = ServiceLocator.provideDomainFilter()
+        cnameBlocklistCheck = domainFilter?.let { f -> { domain: String -> f.isDomainBlocked(domain) } }
         statisticsBuffer = ServiceLocator.provideStatisticsBuffer()
         vpnState = ServiceLocator.provideVpnStateHolder()
         dnsQueryExecutor = DnsQueryExecutor(
@@ -354,8 +362,13 @@ class DnsVpnService : VpnService() {
         responseQueue: Channel<QueuedResponse>,
         upstreamQueue: Channel<UpstreamTask>
     ): Boolean {
-        val ctx = probeIpHeader(packet, length) ?: return true
-        val udpStart = ctx.ipHeaderLength
+        // probeIpHeader 返回 IP 头长度：正数 = IPv4 的 IHL，负数 = IPv6 固定 40，
+        // 0 表示非 UDP 载体（丢弃）；版本由返回值符号区分，不再每包分配 PacketContext。
+        val ipHeaderLength = probeIpHeader(packet, length)
+        if (ipHeaderLength == 0) return true
+        val isIPv6 = ipHeaderLength < 0
+        val headerLength = if (isIPv6) -ipHeaderLength else ipHeaderLength
+        val udpStart = headerLength
         if (length < udpStart + PacketRewriter.UDP_HEADER_LENGTH) return true
 
         val srcPort = ((packet[udpStart].toInt() and 0xFF) shl 8) or (packet[udpStart + 1].toInt() and 0xFF)
@@ -372,7 +385,8 @@ class DnsVpnService : VpnService() {
             dnsLength = length - dnsStart,
             question = question,
             srcPort = srcPort,
-            ctx = ctx
+            isIPv6 = isIPv6,
+            ipHeaderLength = headerLength
         )
 
         // 检查拦截；24 小时 SOA TTL 交由 Android Resolver 负缓存。
@@ -397,33 +411,41 @@ class DnsVpnService : VpnService() {
         val executor = dnsQueryExecutor
         val cacheKey = executor?.cacheKeyFor(question.domain, question.qtype, question.qclass)
         if (executor != null && cacheKey != null) {
-            executor.getCachedResponseForClientWithKey(
+            // L2 命中快路径：应答单次拷贝就地写进 task.packet（TTL aging + TXID/RD
+            // 还原在副本上完成），热点临期条目同时触发后台预取。原实现先 patch 进
+            // 临时数组再 copyInto 包缓冲，每命中多一次全消息拷贝。
+            val servedLength = executor.serveCachedResponseForClient(
                 key = cacheKey,
                 query = packet,
-                queryOffset = dnsStart
-            )?.let { cachedResponse ->
-                AppLog.d(TAG) { "DNS L2 cache hit: ${question.domain}" }
+                queryOffset = dnsStart,
+                queryLength = length - dnsStart,
+                dest = packet,
+                destOffset = dnsStart,
+                destCapacity = packet.size - dnsStart,
+                domain = question.domain,
+                servers = servers,
+                qtype = question.qtype,
+                cnameBlocklistCheck = cnameBlocklistCheck
+            )
+            if (servedLength != DnsQueryExecutor.CACHED_SERVE_MISS) {
                 statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
-                // Unbound-style prefetch: hot near-expiry entries refresh in the
-                // background while we serve from cache. The worker path always
-                // uses skipCacheLookup, so this reader hook is the only place
-                // prefetch triggers on real VPN traffic.
-                val filter = domainFilter
-                executor.maybePrefetch(
-                    queryKey = cacheKey,
-                    domain = question.domain,
-                    servers = servers,
-                    query = packet,
-                    queryOffset = dnsStart,
-                    queryLength = length - dnsStart,
-                    qtype = question.qtype,
-                    cnameBlocklistCheck = filter?.let { f -> { domain: String -> f.isDomainBlocked(domain) } }
-                )
-                sendDnsPayload(task, cachedResponse, responseQueue)
+                if (servedLength == DnsQueryExecutor.CACHED_SERVE_OVERFLOW) {
+                    // 缓存应答塞不进包缓冲：与 sendDnsPayload 一致，回 TC=1。
+                    AppLog.d(TAG) { "DNS L2 cache hit too large: ${question.domain}" }
+                    val truncatedLength = patchDnsTruncatedResponse(
+                        packet, dnsStart, question.questionEndOffset
+                    )
+                    sendPrebuiltResponse(task, truncatedLength, responseQueue)
+                } else {
+                    AppLog.d(TAG) { "DNS L2 cache hit: ${question.domain}" }
+                    sendPrebuiltResponse(task, servedLength, responseQueue)
+                }
                 return false
             }
         }
 
+        // 先赋 hint 再入队：trySend 后 worker 可能在下一行执行前就把任务取走。
+        task.cacheKeyHint = cacheKey
         if (!upstreamQueue.trySend(task).isSuccess) {
             // Queue full: return SERVFAIL immediately instead of blocking the main loop
             statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
@@ -433,27 +455,28 @@ class DnsVpnService : VpnService() {
             sendPrebuiltResponse(task, dnsResponseLength, responseQueue)
             return false
         }
-        task.cacheKeyHint = cacheKey
         return false
     }
 
-    /** 解析 IP 通用头；非 UDP 或长度不足时返回 null。 */
-    private fun probeIpHeader(packet: ByteArray, length: Int): PacketContext? {
-        if (length < 20) return null
+    /**
+     * 解析 IP 通用头；非 UDP 或长度不足时返回 0，否则返回 IP 头长度，
+     * 版本由返回值符号区分：正数 = IPv4 的 IHL，负数 = IPv6（固定 [PacketRewriter.IPV6_HEADER_LENGTH]）。
+     * 免去每包分配 PacketContext。
+     */
+    private fun probeIpHeader(packet: ByteArray, length: Int): Int {
+        if (length < 20) return 0
         return when (packet[0].toInt() shr 4) {
             4 -> {
-                if ((packet[9].toInt() and 0xFF) != 17) return null
+                if ((packet[9].toInt() and 0xFF) != 17) return 0
                 val ihl = (packet[0].toInt() and 0x0F) * 4
-                if (ihl < 20 || length < ihl) return null
-                PacketContext(isIPv6 = false, ipHeaderLength = ihl)
+                if (ihl < 20 || length < ihl) 0 else ihl
             }
             6 -> {
-                if (length < PacketRewriter.IPV6_HEADER_LENGTH) return null
+                if (length < PacketRewriter.IPV6_HEADER_LENGTH) return 0
                 // 不处理 IPv6 扩展头，仅接受紧邻的 UDP
-                if ((packet[6].toInt() and 0xFF) != 17) return null
-                PacketContext(isIPv6 = true, ipHeaderLength = PacketRewriter.IPV6_HEADER_LENGTH)
+                if ((packet[6].toInt() and 0xFF) != 17) 0 else -PacketRewriter.IPV6_HEADER_LENGTH
             }
-            else -> null
+            else -> 0
         }
     }
 
@@ -465,8 +488,7 @@ class DnsVpnService : VpnService() {
 
         // Reader 已做过一次 L2 fresh 查询，这里跳过以避免双重查找；stale/
         // SERVFAIL 标记与 in-flight 合并仍由 executor 处理。CNAME 链检查通过
-        // 回调完成，命中时 executor 直接返回 blocked  verdict 且不污染缓存。
-        val filter = domainFilter
+        // 回调完成，命中时 executor 直接返回 blocked verdict 且不污染缓存。
         return dnsQueryExecutor?.query(
             domain = task.question.domain,
             servers = servers,
@@ -477,7 +499,7 @@ class DnsVpnService : VpnService() {
             qclass = task.question.qclass,
             skipCacheLookup = true,
             cacheKeyHint = task.cacheKeyHint,
-            cnameBlocklistCheck = filter?.let { f -> { domain: String -> f.isDomainBlocked(domain) } }
+            cnameBlocklistCheck = cnameBlocklistCheck
         ) ?: DnsQueryResult(false, null, 0, "Executor not initialized")
     }
 
@@ -562,7 +584,7 @@ class DnsVpnService : VpnService() {
         responseQueue: Channel<QueuedResponse>
     ) {
         val responseLength = PacketRewriter.rewriteAsResponse(
-            task.packet, task.ctx, task.srcPort, dnsResponseLength
+            task.packet, task.isIPv6, task.ipHeaderLength, task.srcPort, dnsResponseLength
         )
         responseQueue.send(QueuedResponse(task.packet, responseLength))
     }

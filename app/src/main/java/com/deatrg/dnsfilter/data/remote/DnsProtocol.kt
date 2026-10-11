@@ -78,6 +78,17 @@ private fun writeUInt32(data: ByteArray, offset: Int, value: Long) {
     data[offset + 3] = (value and 0xFF).toByte()
 }
 
+// DNS 名称解析的复用 builder：reader 线程每包解析一次，worker 用于 CNAME 提取。
+// ThreadLocal 免锁。工具链把 ThreadLocal.get() 的返回类型静态标注为可空
+// （android.jar 桩注解所致，与 initialValue() 的运行时保证无关），因此用
+// acquireNameBuilder() 把类型窄化回非空、保持零警告；elvis 分支运行时不可达。
+private val nameBuilder = object : ThreadLocal<StringBuilder>() {
+    override fun initialValue(): StringBuilder = StringBuilder(64)
+}
+
+private fun acquireNameBuilder(): StringBuilder =
+    nameBuilder.get() ?: StringBuilder(64).also { nameBuilder.set(it) }
+
 private fun appendLowercaseAscii(builder: StringBuilder, data: ByteArray, offset: Int, length: Int) {
     for (i in 0 until length) {
         val value = data[offset + i].toInt() and 0xFF
@@ -176,18 +187,25 @@ internal fun clampPositiveDnsTtlsInPlace(response: ByteArray, qtype: Int = DNS_T
 }
 
 /** Decrements cached record TTLs without extending their original effective lifetime. */
-internal fun agePositiveDnsTtlsInPlace(response: ByteArray, ageSeconds: Long): Boolean {
-    if (response.size < DNS_HEADER_SIZE) return false
-    val flags = readUInt16(response, 2)
+internal fun agePositiveDnsTtlsInPlace(
+    response: ByteArray,
+    ageSeconds: Long,
+    dnsStart: Int = 0,
+    dnsLength: Int = response.size - dnsStart
+): Boolean {
+    if (dnsLength < DNS_HEADER_SIZE) return false
+    val flags = readUInt16(response, dnsStart + 2)
     val rcode = flags and 0x0F
-    val answerCount = readUInt16(response, 6)
+    val answerCount = readUInt16(response, dnsStart + 6)
     if (rcode != 0 || answerCount == 0) return false
 
     return rewriteDnsTtlsInPlace(
         data = response,
         answerCount = answerCount,
         ageSeconds = ageSeconds.coerceAtLeast(0),
-        clampToPolicy = false
+        clampToPolicy = false,
+        dnsStart = dnsStart,
+        dnsLength = dnsLength
     ) != null
 }
 
@@ -197,15 +215,19 @@ private fun rewriteDnsTtlsInPlace(
     ageSeconds: Long,
     clampToPolicy: Boolean,
     minTtlSeconds: Long = POSITIVE_DNS_MIN_TTL_SECONDS,
-    maxTtlSeconds: Long = POSITIVE_DNS_MAX_TTL_SECONDS
+    maxTtlSeconds: Long = POSITIVE_DNS_MAX_TTL_SECONDS,
+    dnsStart: Int = 0,
+    dnsLength: Int = data.size - dnsStart
 ): Long? {
-    val dnsEnd = data.size
-    val questionCount = readUInt16(data, 4)
-    val recordCount = readUInt16(data, 6) +
-        readUInt16(data, 8) +
-        readUInt16(data, 10)
+    // dnsStart: DNS 报文在宿主缓冲内的起点（缓存命中路径把应答就地写进客户端
+    // 包缓冲，此时不再是从 0 开始的独立报文）；默认 0 保持独立报文语义。
+    val dnsEnd = dnsStart + dnsLength
+    val questionCount = readUInt16(data, dnsStart + 4)
+    val recordCount = readUInt16(data, dnsStart + 6) +
+        readUInt16(data, dnsStart + 8) +
+        readUInt16(data, dnsStart + 10)
 
-    var offset = DNS_HEADER_SIZE
+    var offset = dnsStart + DNS_HEADER_SIZE
     repeat(questionCount) {
         offset = (skipDnsName(data, offset, dnsEnd) ?: return null) + 4
         if (offset > dnsEnd) return null
@@ -293,13 +315,17 @@ internal fun extractNegativeTtlSeconds(
 private data class AuthorityPosition(val recordOffset: Int, val answerCount: Int)
 
 /** Walks QD + AN sections and returns the offset of the first authority record, or null. */
-private fun authorityStart(response: ByteArray): AuthorityPosition? {
-    val end = response.size
-    val questionCount = readUInt16(response, 4)
-    val answerCount = readUInt16(response, 6)
-    val authorityCount = readUInt16(response, 8)
+private fun authorityStart(
+    response: ByteArray,
+    dnsStart: Int = 0,
+    dnsLength: Int = response.size - dnsStart
+): AuthorityPosition? {
+    val end = dnsStart + dnsLength
+    val questionCount = readUInt16(response, dnsStart + 4)
+    val answerCount = readUInt16(response, dnsStart + 6)
+    val authorityCount = readUInt16(response, dnsStart + 8)
     if (authorityCount == 0) return null
-    var offset = DNS_HEADER_SIZE
+    var offset = dnsStart + DNS_HEADER_SIZE
     repeat(questionCount) {
         offset = (skipDnsName(response, offset, end) ?: return null) + 4
         if (offset > end) return null
@@ -344,11 +370,16 @@ private fun findFirstSoaTtl(response: ByteArray): Long? {
  * record TTL and its MINIMUM field to the remaining TTL. Returns false when
  * malformed (caller may still serve the bytes as-is).
  */
-internal fun ageNegativeDnsTtlsInPlace(response: ByteArray, ageSeconds: Long): Boolean {
-    if (response.size < DNS_HEADER_SIZE) return false
-    val end = response.size
-    val authorityCount = readUInt16(response, 8)
-    val start = authorityStart(response) ?: return false
+internal fun ageNegativeDnsTtlsInPlace(
+    response: ByteArray,
+    ageSeconds: Long,
+    dnsStart: Int = 0,
+    dnsLength: Int = response.size - dnsStart
+): Boolean {
+    if (dnsLength < DNS_HEADER_SIZE) return false
+    val end = dnsStart + dnsLength
+    val authorityCount = readUInt16(response, dnsStart + 8)
+    val start = authorityStart(response, dnsStart, dnsLength) ?: return false
     var offset = start.recordOffset
     repeat(authorityCount) {
         val headerOffset = skipDnsName(response, offset, end) ?: return false
@@ -403,7 +434,8 @@ internal fun stampStaleTtlsInPlace(response: ByteArray, staleTtlSeconds: Long = 
 }
 
 private fun readMessageName(data: ByteArray, start: Int, end: Int): Pair<String, Int>? {
-    val name = StringBuilder(64)
+    val name = acquireNameBuilder()
+    name.setLength(0)
     var idx = start
     var jumped = false
     var nextOffset = start
@@ -602,7 +634,8 @@ fun readDnsNameFromPacket(
     startOffset: Int,
     packetLength: Int
 ): Pair<String, Int>? {
-    val name = StringBuilder(64)
+    val name = acquireNameBuilder()
+    name.setLength(0)
     var idx = startOffset
     var jumped = false
     var nextOffset = startOffset

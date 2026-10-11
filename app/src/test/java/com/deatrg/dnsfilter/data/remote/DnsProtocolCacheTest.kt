@@ -1,5 +1,6 @@
 package com.deatrg.dnsfilter.data.remote
 
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -163,6 +164,53 @@ class DnsProtocolCacheTest {
         val response = buildPositiveResponse()
         writeUInt16(response, 4, 2)
         assertFalse(dnsQuestionSectionMatches(request, 0, request.size, response))
+    }
+
+    @Test
+    fun agePositiveRewritesOnlyTheEmbeddedMessageRegion() {
+        val payload = buildPositiveResponse()
+        // 模拟 L2 命中路径：DNS 报文嵌入更大的客户端包缓冲，前后均为无关字节。
+        val packet = ByteArray(28 + payload.size + 17) { 0x7F }
+        val dnsStart = 28
+        payload.copyInto(packet, dnsStart)
+        val expected = payload.copyOf()
+
+        assertTrue(
+            agePositiveDnsTtlsInPlace(packet, ageSeconds = 60, dnsStart = dnsStart, dnsLength = payload.size)
+        )
+        assertTrue(agePositiveDnsTtlsInPlace(expected, ageSeconds = 60))
+
+        // 嵌入报文老化结果与独立报文逐字节一致
+        assertArrayEquals(expected, packet.copyOfRange(dnsStart, dnsStart + payload.size))
+        assertEquals(0L, readUInt32(packet, dnsStart + 35)) // 30s - 60s 归零
+        // 直接 aging（未经 clamp），第二条记录保留原始 86400s TTL
+        assertEquals(86_400L - 60, readUInt32(packet, dnsStart + 51))
+        assertEquals(0x8000L, readUInt32(packet, dnsStart + 78)) // OPT 元数据不动
+        // 区外字节保持不变
+        assertArrayEquals(ByteArray(28) { 0x7F }, packet.copyOfRange(0, 28))
+        assertArrayEquals(ByteArray(17) { 0x7F }, packet.copyOfRange(dnsStart + payload.size, packet.size))
+    }
+
+    @Test
+    fun ageNegativeRewritesOnlyTheEmbeddedSoaRegion() {
+        val payload = buildNxDomainResponse(soaTtl = 86_400, soaMinimum = 300)
+        val packet = ByteArray(28 + payload.size + 11) { 0x7F }
+        val dnsStart = 28
+        payload.copyInto(packet, dnsStart)
+        val expected = payload.copyOf()
+
+        assertTrue(
+            ageNegativeDnsTtlsInPlace(packet, ageSeconds = 90, dnsStart = dnsStart, dnsLength = payload.size)
+        )
+        assertTrue(ageNegativeDnsTtlsInPlace(expected, ageSeconds = 90))
+
+        // SOA TTL 与 MINIMUM 均按剩余 min(86400, 300) - 90 = 210 改写，与独立报文一致
+        assertArrayEquals(expected, packet.copyOfRange(dnsStart, dnsStart + payload.size))
+        assertEquals(210L, readUInt32(packet, dnsStart + 35))
+        assertEquals(210L, readUInt32(packet, dnsStart + 63))
+        // 区外字节保持不变
+        assertArrayEquals(ByteArray(28) { 0x7F }, packet.copyOfRange(0, 28))
+        assertArrayEquals(ByteArray(11) { 0x7F }, packet.copyOfRange(dnsStart + payload.size, packet.size))
     }
 
     private fun buildQueryPacket(): ByteArray {

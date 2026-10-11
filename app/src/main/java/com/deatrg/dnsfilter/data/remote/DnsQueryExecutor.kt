@@ -52,6 +52,11 @@ class DnsQueryExecutor(
         // shared 64-thread Dispatchers.IO pool.
         private const val UPSTREAM_IO_PARALLELISM = 256
 
+        /** [serveCachedResponseForClient] result: no fresh cache entry (miss). */
+        const val CACHED_SERVE_MISS = -1
+        /** [serveCachedResponseForClient] result: cached payload exceeds destCapacity. */
+        const val CACHED_SERVE_OVERFLOW = -2
+
         @OptIn(ExperimentalCoroutinesApi::class)
         private val upstreamIo = Dispatchers.IO.limitedParallelism(UPSTREAM_IO_PARALLELISM)
     }
@@ -114,31 +119,72 @@ class DnsQueryExecutor(
         return "$domain:$qtype:$qclass"
     }
 
-    fun getCachedResponseForClient(
-        domain: String,
-        qtype: Int,
-        qclass: Int,
-        query: ByteArray,
-        queryOffset: Int
-    ): ByteArray? = getCachedResponseForClientWithKey(
-        key = cacheKeyFor(domain, qtype, qclass),
-        query = query,
-        queryOffset = queryOffset
-    )
-
-    fun getCachedResponseForClientWithKey(
+    /**
+     * Reader-thread L2 fresh-hit fast path: copies the cached response into
+     * [dest] at [destOffset] — normally the client packet buffer, right where
+     * its DNS message lives — so serving a hit costs ONE copy. TTLs are aged
+     * and the client's transaction ID / RD bit restored in place; a hot
+     * near-expiry entry additionally kicks off an Unbound-style background
+     * refresh (hint evaluated in the same cache-lock acquisition as the hit,
+     * and before [dest] is overwritten since dest may be the query itself).
+     *
+     * @return the DNS payload length written into [dest], [CACHED_SERVE_MISS]
+     *   when there is no fresh entry, or [CACHED_SERVE_OVERFLOW] when the
+     *   cached payload does not fit [destCapacity] ([dest] left untouched;
+     *   the caller answers TC=1).
+     *
+     * 前置条件由调用方保证并以 require 快速判定：
+     * query/reference 窗口至少 3 字节（读 TXID/RD），dest 窗口足以容纳 destCapacity；
+     * 当前唯一调用方 processPacket 已保证 length >= dnsStart + 12。
+     */
+    fun serveCachedResponseForClient(
         key: String,
         query: ByteArray,
-        queryOffset: Int
-    ): ByteArray? {
-        val cached = responseCache.get(key) ?: return null
-        return patchResponseForClient(cached.response, query, queryOffset).also { response ->
-            if (cached.kind == DnsResponseCache.EntryKind.NEGATIVE) {
-                ageNegativeDnsTtlsInPlace(response, cached.ageSeconds)
-            } else {
-                agePositiveDnsTtlsInPlace(response, cached.ageSeconds)
-            }
+        queryOffset: Int,
+        queryLength: Int,
+        dest: ByteArray,
+        destOffset: Int,
+        destCapacity: Int,
+        domain: String,
+        servers: List<DnsServer>,
+        qtype: Int,
+        cnameBlocklistCheck: ((String) -> Boolean)? = null
+    ): Int {
+        require(queryOffset >= 0 && query.size - queryOffset >= 3) {
+            "query window too small: offset=$queryOffset size=${query.size}"
         }
+        require(destOffset in 0..dest.size && destCapacity in 0..(dest.size - destOffset)) {
+            "dest window too small: offset=$destOffset capacity=$destCapacity size=${dest.size}"
+        }
+        val cached = responseCache.get(key) ?: return CACHED_SERVE_MISS
+        val payload = cached.response
+
+        // Prefetch BEFORE the overflow exit: the old reader path prefetched on
+        // every hit regardless of answer size, and the refresh snapshot-copies
+        // the request bytes synchronously before any possible dest overwrite.
+        if (cached.prefetch) {
+            AppLog.d(TAG) { "DNS prefetch: domain=$domain qtype=$qtype" }
+            refreshInBackground(key, domain, servers, query, queryOffset, queryLength,
+                qtype, DEFAULT_QUERY_TIMEOUT_MS, cnameBlocklistCheck)
+        }
+
+        if (payload.size > destCapacity) return CACHED_SERVE_OVERFLOW
+
+        // Save the client header fields first: dest === query on the reader path.
+        val transactionId0 = query[queryOffset]
+        val transactionId1 = query[queryOffset + 1]
+        val recursionDesired = query[queryOffset + 2].toInt() and 0x01
+
+        payload.copyInto(dest, destinationOffset = destOffset)
+        if (cached.kind == DnsResponseCache.EntryKind.NEGATIVE) {
+            ageNegativeDnsTtlsInPlace(dest, cached.ageSeconds, destOffset, payload.size)
+        } else {
+            agePositiveDnsTtlsInPlace(dest, cached.ageSeconds, destOffset, payload.size)
+        }
+        dest[destOffset] = transactionId0
+        dest[destOffset + 1] = transactionId1
+        dest[destOffset + 2] = ((dest[destOffset + 2].toInt() and 0xFE) or recursionDesired).toByte()
+        return payload.size
     }
 
     suspend fun query(
@@ -159,10 +205,21 @@ class DnsQueryExecutor(
         val activeServers = servers
 
         if (!skipCacheLookup) {
-            getCachedResponseForClientWithKey(queryKey, query, queryOffset)?.let { response ->
+            val hit = responseCache.get(queryKey)
+            if (hit != null) {
                 AppLog.d(TAG) { "DNS L2 cache hit: domain=$domain qtype=$qtype" }
-                maybePrefetch(queryKey, domain, activeServers, query, queryOffset, queryLength,
-                    qtype, timeoutMs, cnameBlocklistCheck)
+                // Unbound-style prefetch for hot near-expiry entries; the hint
+                // came back inside the same cache-lock acquisition as the hit.
+                if (hit.prefetch) {
+                    refreshInBackground(queryKey, domain, activeServers, query, queryOffset,
+                        queryLength, qtype, timeoutMs, cnameBlocklistCheck)
+                }
+                val response = patchResponseForClient(hit.response, query, queryOffset)
+                if (hit.kind == DnsResponseCache.EntryKind.NEGATIVE) {
+                    ageNegativeDnsTtlsInPlace(response, hit.ageSeconds)
+                } else {
+                    agePositiveDnsTtlsInPlace(response, hit.ageSeconds)
+                }
                 return DnsQueryResult(
                     success = true,
                     responseBytes = response,
@@ -179,17 +236,18 @@ class DnsQueryExecutor(
             AppLog.d(TAG) { "DNS stale hit: domain=$domain qtype=$qtype" }
             refreshInBackground(queryKey, domain, activeServers, query, queryOffset, queryLength,
                 qtype, timeoutMs, cnameBlocklistCheck)
-            val response = hit.response.copyOf()
+            // Single copy: patch TXID/RD while copying hit.response, then age and
+            // stamp stale TTLs in place on that copy.
+            val response = patchResponseForClient(hit.response, query, queryOffset)
             if (hit.kind == DnsResponseCache.EntryKind.NEGATIVE) {
                 ageNegativeDnsTtlsInPlace(response, hit.ageSeconds)
             } else {
                 agePositiveDnsTtlsInPlace(response, hit.ageSeconds)
             }
             stampStaleTtlsInPlace(response)
-            val patched = patchResponseForClient(response, query, queryOffset)
             return DnsQueryResult(
                 success = true,
-                responseBytes = patched,
+                responseBytes = response,
                 responseTime = monotonicNowMs() - requestStart,
                 error = null,
                 fromCache = true,
@@ -254,30 +312,6 @@ class DnsQueryExecutor(
         } finally {
             inFlightQueries.remove(queryKey, newQuery)
         }
-    }
-
-    /**
-     * Reader-thread hook after an L2 fresh hit: kicks off an Unbound-style
-     * background refresh for hot near-expiry entries while serving from cache.
-     * Cheap (one lock + map ops + a small copy); safe on the packet-reader
-     * hot path. The worker path always calls [query] with skipCacheLookup, so
-     * this is the only place prefetch triggers on real VPN traffic.
-     */
-    fun maybePrefetch(
-        queryKey: String,
-        domain: String,
-        servers: List<DnsServer>,
-        query: ByteArray,
-        queryOffset: Int,
-        queryLength: Int,
-        qtype: Int,
-        timeoutMs: Long = DEFAULT_QUERY_TIMEOUT_MS,
-        cnameBlocklistCheck: ((String) -> Boolean)? = null
-    ) {
-        if (!responseCache.prefetchHint(queryKey)) return
-        AppLog.d(TAG) { "DNS prefetch: domain=$domain qtype=$qtype" }
-        refreshInBackground(queryKey, domain, servers, query, queryOffset, queryLength,
-            qtype, timeoutMs, cnameBlocklistCheck)
     }
 
     private fun refreshInBackground(

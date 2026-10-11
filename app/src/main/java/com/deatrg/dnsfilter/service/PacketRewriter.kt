@@ -1,14 +1,6 @@
 package com.deatrg.dnsfilter.service
 
 /**
- * 描述一个已解析的 IP 包头中与改写响应相关的信息。
- */
-internal data class PacketContext(
-    val isIPv6: Boolean,
-    val ipHeaderLength: Int
-)
-
-/**
  * 将拦截到的出站 DNS 查询包原地改写为响应包：
  * 交换 src/dst 地址与端口、更新长度字段并重算校验和。
  */
@@ -16,19 +8,22 @@ internal object PacketRewriter {
 
     /**
      * 统一入口：按 IP 版本改写包头。
+     * @param isIPv6 true 为 IPv6 包
+     * @param ipHeaderLength IPv4 的 IHL（字节），IPv6 固定 40
      * @param dnsResponseLength DNS 报文长度（不含 IP/UDP 头）
      * @return 完整响应包长度
      */
     fun rewriteAsResponse(
         packet: ByteArray,
-        ctx: PacketContext,
+        isIPv6: Boolean,
+        ipHeaderLength: Int,
         srcPort: Int,
         dnsResponseLength: Int
     ): Int {
-        return if (ctx.isIPv6) {
+        return if (isIPv6) {
             rewriteIpv6(packet, srcPort, dnsResponseLength)
         } else {
-            rewriteIpv4(packet, ctx.ipHeaderLength, srcPort, dnsResponseLength)
+            rewriteIpv4(packet, ipHeaderLength, srcPort, dnsResponseLength)
         }
     }
 
@@ -115,35 +110,47 @@ internal object PacketRewriter {
     }
 
     /**
-     * 参考 personalDnsfilter 的 IPv6 UDP checksum 计算方式：
-     * 临时把 IPv6 header 前 8 bytes 改写成伪头部格式，
-     * 然后对整个 packet（从 offset 0 开始，长度 totalLength）计算 checksum，
-     * 最后恢复原 header。
+     * IPv6 UDP 校验和：直接累加 RFC 2460 伪头部的字序列——
+     * [udpLength 一个字] + [nextHeader(17) 一个字] + src/dst 地址（bytes 8..39）
+     * + UDP 头与载荷（bytes IPV6_HEADER_LENGTH..totalLength）。
+     * 与旧的"临时改写包头前 8 字节再恢复"方式逐字等价，但不再每包分配
+     * saved ByteArray、也不做两轮 copyInto，且天然线程安全。
      */
     internal fun computeIpv6UdpChecksum(packet: ByteArray, totalLength: Int): Int {
-        // 保存 IPv6 header 前 8 bytes
-        val saved = ByteArray(8)
-        packet.copyInto(saved, destinationOffset = 0, startIndex = 0, endIndex = 8)
-
         val udpLength = totalLength - IPV6_HEADER_LENGTH
 
-        // 临时构造伪头部到前 8 bytes（big-endian int 0 + int 1）
-        // int 0 (bytes 0-3) = UDP length
-        // int 1 (bytes 4-7) = 17 (protocol)
-        packet[0] = 0
-        packet[1] = 0
-        packet[2] = ((udpLength shr 8) and 0xFF).toByte()
-        packet[3] = (udpLength and 0xFF).toByte()
-        packet[4] = 0
-        packet[5] = 0
-        packet[6] = 0
-        packet[7] = 17.toByte()
+        // 旧伪头部字序列 [0,0,lenHi,lenLo,0,0,0,17] 等价于这两个字。
+        var sum = udpLength and 0xFFFF
+        sum += 17
 
-        val checksum = computeGenericChecksum(packet, 0, totalLength)
+        // src + dst（bytes 8..39）
+        var i = 8
+        while (i < IPV6_HEADER_LENGTH) {
+            sum += ((packet[i].toInt() and 0xFF) shl 8) or (packet[i + 1].toInt() and 0xFF)
+            if (sum > 0xFFFF) {
+                sum = (sum and 0xFFFF) + 1
+            }
+            i += 2
+        }
 
-        // 恢复原 header
-        saved.copyInto(packet, destinationOffset = 0)
+        // UDP 头 + 载荷（bytes 40..totalLength，含奇数尾字节按高字节补齐）
+        i = IPV6_HEADER_LENGTH
+        while (i + 1 < totalLength) {
+            sum += ((packet[i].toInt() and 0xFF) shl 8) or (packet[i + 1].toInt() and 0xFF)
+            if (sum > 0xFFFF) {
+                sum = (sum and 0xFFFF) + 1
+            }
+            i += 2
+        }
+        if (i < totalLength) {
+            sum += (packet[i].toInt() and 0xFF) shl 8
+            if (sum > 0xFFFF) {
+                sum = (sum and 0xFFFF) + 1
+            }
+        }
 
+        val checksum = sum.inv() and 0xFFFF
+        // UDP 校验和的 0x0000 表示"未计算"，计算结果为 0 时按标准发送 0xFFFF。
         return if (checksum == 0) 0xFFFF else checksum
     }
 
@@ -161,27 +168,6 @@ internal object PacketRewriter {
                 sum = (sum and 0xFFFF) + 1
             }
             i += 2
-        }
-        return sum.inv() and 0xFFFF
-    }
-
-    private fun computeGenericChecksum(data: ByteArray, offset: Int, length: Int): Int {
-        var sum = 0
-        var i = 0
-        while (i + 1 < length) {
-            val word = ((data[offset + i].toInt() and 0xFF) shl 8) or (data[offset + i + 1].toInt() and 0xFF)
-            sum += word
-            if (sum > 0xFFFF) {
-                sum = (sum and 0xFFFF) + 1
-            }
-            i += 2
-        }
-        if (i < length) {
-            val word = (data[offset + i].toInt() and 0xFF) shl 8
-            sum += word
-            if (sum > 0xFFFF) {
-                sum = (sum and 0xFFFF) + 1
-            }
         }
         return sum.inv() and 0xFFFF
     }

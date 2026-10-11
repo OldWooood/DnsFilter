@@ -66,8 +66,9 @@ class PacketRewriterTest {
         packet[23] = PacketRewriter.DNS_PORT.toByte()
         dnsPayload.copyInto(packet, 28)
 
-        val ctx = PacketContext(isIPv6 = false, ipHeaderLength = 20)
-        val resultLength = PacketRewriter.rewriteAsResponse(packet, ctx, srcPort = 5555, dnsResponseLength = dnsPayload.size)
+        val resultLength = PacketRewriter.rewriteAsResponse(
+            packet, isIPv6 = false, ipHeaderLength = 20, srcPort = 5555, dnsResponseLength = dnsPayload.size
+        )
 
         assertEquals(totalLength, resultLength)
         assertEquals(totalLength, u16(packet, 2))
@@ -104,8 +105,9 @@ class PacketRewriterTest {
         packet[43] = PacketRewriter.DNS_PORT.toByte()
         dnsPayload.copyInto(packet, 48)
 
-        val ctx = PacketContext(isIPv6 = true, ipHeaderLength = 40)
-        val resultLength = PacketRewriter.rewriteAsResponse(packet, ctx, srcPort = 5555, dnsResponseLength = dnsPayload.size)
+        val resultLength = PacketRewriter.rewriteAsResponse(
+            packet, isIPv6 = true, ipHeaderLength = 40, srcPort = 5555, dnsResponseLength = dnsPayload.size
+        )
 
         assertEquals(totalLength, resultLength)
         assertEquals(payloadLength, u16(packet, 4))
@@ -135,14 +137,92 @@ class PacketRewriterTest {
     }
 
     @Test
-    fun ipv6PseudoHeaderTrickRestoresOriginalBytes() {
-        val packet = ByteArray(48)
+    fun ipv6UdpChecksumDoesNotModifyPacketAndMatchesPseudoHeaderSum() {
+        // 奇数载荷长度，覆盖尾字节按高字节补齐的路径。
+        val dnsPayload = ByteArray(25) { (it + 3).toByte() }
+        val payloadLength = 8 + dnsPayload.size
+        val totalLength = 40 + payloadLength
+        val packet = ByteArray(totalLength)
+        packet[6] = 17
+
         val originalFirst8 = byteArrayOf(0x60, 1, 2, 3, 4, 5, 6, 7)
         originalFirst8.copyInto(packet)
+        val srcAddr = ByteArray(16) { (it + 1).toByte() }
+        val dstAddr = ByteArray(16) { (it + 9).toByte() }
+        srcAddr.copyInto(packet, 8)
+        dstAddr.copyInto(packet, 24)
+        packet[40] = ((5555 shr 8) and 0xFF).toByte()
+        packet[41] = (5555 and 0xFF).toByte()
+        packet[42] = 0
+        packet[43] = PacketRewriter.DNS_PORT.toByte()
+        dnsPayload.copyInto(packet, 48)
 
-        PacketRewriter.computeIpv6UdpChecksum(packet, 48)
+        val checksum = PacketRewriter.computeIpv6UdpChecksum(packet, totalLength)
 
-        // 计算过程中临时改写的前 8 字节必须被恢复
+        // 直接累加伪头部字序列，计算过程中不再改写包头。
         assertArrayEquals(originalFirst8, packet.copyOfRange(0, 8))
+
+        // 独立按 RFC 2460 伪头部复算
+        var sum = 0
+        fun addWord(value: Int) {
+            sum += value
+            if (sum > 0xFFFF) sum = (sum and 0xFFFF) + 1
+        }
+        for (i in 8 until 40 step 2) addWord(u16(packet, i))
+        addWord(payloadLength)
+        addWord(17)
+        var i = 40
+        while (i + 1 < totalLength) {
+            addWord(u16(packet, i))
+            i += 2
+        }
+        addWord((packet[i].toInt() and 0xFF) shl 8) // 奇数尾字节
+
+        assertEquals(sum.inv() and 0xFFFF, checksum)
+    }
+
+    @Test
+    fun ipv6UdpChecksumZeroSumIsSentAs0xFFFF() {
+        // 构造反码和恰为 0x0000 的向量（先把 dst 末字留 0 算出基准反码和，
+        // 再把该字设为补差值使总和归 0）：按 UDP 语义必须发送 0xFFFF。
+        val dnsPayload = ByteArray(24) { (it + 3).toByte() }
+        val payloadLength = 8 + dnsPayload.size
+        val totalLength = 40 + payloadLength
+        val packet = ByteArray(totalLength)
+        packet[6] = 17
+
+        val srcAddr = ByteArray(16) { (it + 1).toByte() }
+        val dstAddr = ByteArray(16) { (it + 9).toByte() }
+        srcAddr.copyInto(packet, 8)
+        dstAddr.copyInto(packet, 24)
+        packet[38] = 0 // dst 末字先留 0，待求差值
+        packet[39] = 0
+        packet[40] = ((5555 shr 8) and 0xFF).toByte()
+        packet[41] = (5555 and 0xFF).toByte()
+        packet[42] = 0
+        packet[43] = PacketRewriter.DNS_PORT.toByte()
+        dnsPayload.copyInto(packet, 48)
+
+        // 基准反码和（dst 末字为 0）
+        var sum = 0
+        fun addWord(value: Int) {
+            sum += value
+            if (sum > 0xFFFF) sum = (sum and 0xFFFF) + 1
+        }
+        for (i in 8 until 40 step 2) addWord(u16(packet, i))
+        addWord(payloadLength)
+        addWord(17)
+        var i = 40
+        while (i < totalLength) {
+            addWord(u16(packet, i))
+            i += 2
+        }
+
+        // 补差字使逐字反码和为 0xFFFF，从而 sum.inv() and 0xFFFF == 0
+        val word = 0xFFFF - sum
+        packet[38] = ((word shr 8) and 0xFF).toByte()
+        packet[39] = (word and 0xFF).toByte()
+
+        assertEquals(0xFFFF, PacketRewriter.computeIpv6UdpChecksum(packet, totalLength))
     }
 }
