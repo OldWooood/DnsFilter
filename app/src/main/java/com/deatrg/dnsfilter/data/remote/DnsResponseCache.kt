@@ -121,19 +121,34 @@ internal class DnsResponseCache(
         response: ByteArray,
         ttlSeconds: Long,
         expectedGeneration: Long
-    ): Boolean = synchronized(lock) {
-        putLocked(key, response, ttlSeconds, expectedGeneration, EntryKind.POSITIVE)
-    }
+    ): Boolean = putSnapshot(key, response, ttlSeconds, expectedGeneration, EntryKind.POSITIVE)
 
     fun putNegative(
         key: String,
         response: ByteArray,
         ttlSeconds: Long,
         expectedGeneration: Long
-    ): Boolean = synchronized(lock) {
-        putLocked(key, response, ttlSeconds, expectedGeneration, EntryKind.NEGATIVE)
+    ): Boolean = putSnapshot(key, response, ttlSeconds, expectedGeneration, EntryKind.NEGATIVE)
+
+    /**
+     * Snapshots [response] OUTSIDE the lock: the memcpy must not lengthen the
+     * critical section shared with reader-thread hit lookups. The generation
+     * check still happens inside the lock.
+     */
+    private fun putSnapshot(
+        key: String,
+        response: ByteArray,
+        ttlSeconds: Long,
+        expectedGeneration: Long,
+        kind: EntryKind
+    ): Boolean {
+        val snapshot = response.copyOf()
+        return synchronized(lock) {
+            putLocked(key, snapshot, ttlSeconds, expectedGeneration, kind)
+        }
     }
 
+    /** [response] must already be an exclusive snapshot owned by the cache. */
     private fun putLocked(
         key: String,
         response: ByteArray,
@@ -145,7 +160,7 @@ internal class DnsResponseCache(
         val now = nowMs()
         val ttlMs = ttlSeconds.coerceAtMost(Long.MAX_VALUE / 1000L) * 1000L
         entries[key] = Entry(
-            response = response.copyOf(),
+            response = response,
             storedAtMs = now,
             expiresAtMs = now + ttlMs,
             kind = kind,

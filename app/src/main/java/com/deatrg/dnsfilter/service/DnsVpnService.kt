@@ -90,11 +90,19 @@ class DnsVpnService : VpnService() {
     @Volatile
     private var activeNetwork: Network? = null
 
-    // Upstream DNS queries mostly wait on IO, so keep this worker count modest.
-    private val slowWorkerCount: Int get() = Runtime.getRuntime().availableProcessors().coerceIn(4, 16) * 2
+    // Upstream races suspend the worker (it releases its Dispatchers.IO permit
+    // while awaiting), so this count bounds concurrent unique cache misses, not
+    // live threads. 3x cores (12..32) keeps cold-cache bursts from queueing
+    // behind a handful of slow races.
+    private val slowWorkerCount: Int get() =
+        (Runtime.getRuntime().availableProcessors() * 3).coerceIn(12, 32)
 
-    // All TUN writes funnel through one writer coroutine fed by responseQueue,
-    // so workers never contend on a lock in the hot path.
+    // TUN writes are split: reader-generated fast-path responses (L2 hits,
+    // blocked NXDOMAIN, TC=1, SERVFAIL) are written directly on the reader
+    // thread, while worker responses still funnel through one writer coroutine
+    // fed by responseQueue. Every write shares the short tunWriteLock monitor
+    // in runDnsLoop, so responses never interleave while the hot path skips a
+    // coroutine hand-off.
     private data class QueuedResponse(
         val packet: ByteArray,
         val length: Int
@@ -270,12 +278,21 @@ class DnsVpnService : VpnService() {
         val upstreamQueue = Channel<UpstreamTask>(capacity = UPSTREAM_QUEUE_CAPACITY)
         val responseQueue = Channel<QueuedResponse>(capacity = UPSTREAM_QUEUE_CAPACITY)
 
-        // Single writer: the only coroutine touching outputStream. Workers and
-        // the reader only enqueue, so there is no write-lock contention.
+        // All TUN writes share this short monitor, which wraps only the write
+        // call (~ns uncontended). Reader fast-path responses write here
+        // directly; worker responses go through the single writer coroutine.
+        // The lock keeps concurrent producers from interleaving if the stream
+        // ever splits one write into multiple syscalls.
+        val tunWriteLock = Any()
+        val writePacket: (ByteArray, Int) -> Unit = { buffer, writeLength ->
+            synchronized(tunWriteLock) { outputStream.write(buffer, 0, writeLength) }
+        }
+
+        // Single writer for worker responses; the reader never enqueues here.
         val writerJob = scope.launch(Dispatchers.IO) {
             for (queued in responseQueue) {
                 try {
-                    outputStream.write(queued.packet, 0, queued.length)
+                    writePacket(queued.packet, queued.length)
                 } catch (e: Exception) {
                     AppLog.e(TAG) { "Failed to send DNS response: ${e.message}" }
                 } finally {
@@ -324,11 +341,11 @@ class DnsVpnService : VpnService() {
 
                 var handled = true
                 try {
-                    handled = processPacket(packet, length, responseQueue, upstreamQueue)
+                    handled = processPacket(packet, length, upstreamQueue, writePacket)
                 } catch (e: Exception) {
                     AppLog.e(TAG) { "Error while processing packet: ${e.message}" }
                 }
-                // false 表示包已移交给上游队列或响应队列，所有权归 worker/writer
+                // false 表示包已移交给上游队列，所有权归 worker
                 if (handled) recyclePacket(packet)
             }
         } catch (e: InterruptedIOException) {
@@ -353,14 +370,15 @@ class DnsVpnService : VpnService() {
     }
 
     /**
-     * 统一处理 IPv4/IPv6 DNS 查询包。
-     * @return true 表示包的所有权仍在调用方（缓冲区可回收）；false 表示已移交上游队列或响应队列。
+     * 统一处理 IPv4/IPv6 DNS 查询包。reader 侧生成的响应（拦截、CNAME 判决、
+     * L2 命中、队列满 SERVFAIL）直接写 TUN，不再经过 writer 协程。
+     * @return true 表示包的所有权仍在调用方（缓冲区可回收）；false 表示已移交上游队列。
      */
-    private suspend fun processPacket(
+    private fun processPacket(
         packet: ByteArray,
         length: Int,
-        responseQueue: Channel<QueuedResponse>,
-        upstreamQueue: Channel<UpstreamTask>
+        upstreamQueue: Channel<UpstreamTask>,
+        writePacket: (ByteArray, Int) -> Unit
     ): Boolean {
         // probeIpHeader 返回 IP 头长度：正数 = IPv4 的 IHL，负数 = IPv6 固定 40，
         // 0 表示非 UDP 载体（丢弃）；版本由返回值符号区分，不再每包分配 PacketContext。
@@ -394,8 +412,8 @@ class DnsVpnService : VpnService() {
             AppLog.d(TAG) { "Domain ${question.domain} is blocked" }
             statisticsBuffer?.recordQuery(blocked = true, responseTime = 0, includeInAvg = false)
             val dnsResponseLength = patchBlockedNxDomainResponse(packet, dnsStart, question.questionEndOffset)
-            sendPrebuiltResponse(task, dnsResponseLength, responseQueue)
-            return false
+            writePrebuiltResponseDirect(task, dnsResponseLength, writePacket)
+            return true
         }
 
         // CNAME-cloaking 判决缓存：命中则直接 NXDOMAIN，跳过上游。
@@ -403,8 +421,8 @@ class DnsVpnService : VpnService() {
             AppLog.d(TAG) { "Domain ${question.domain} is CNAME-cloak blocked (cached)" }
             statisticsBuffer?.recordQuery(blocked = true, responseTime = 0, includeInAvg = false)
             val dnsResponseLength = patchBlockedNxDomainResponse(packet, dnsStart, question.questionEndOffset)
-            sendPrebuiltResponse(task, dnsResponseLength, responseQueue)
-            return false
+            writePrebuiltResponseDirect(task, dnsResponseLength, writePacket)
+            return true
         }
 
         // Cache key 只算一次，miss 时复用给 executor，避免重复拼串与二次 L2 查询。
@@ -435,12 +453,12 @@ class DnsVpnService : VpnService() {
                     val truncatedLength = patchDnsTruncatedResponse(
                         packet, dnsStart, question.questionEndOffset
                     )
-                    sendPrebuiltResponse(task, truncatedLength, responseQueue)
+                    writePrebuiltResponseDirect(task, truncatedLength, writePacket)
                 } else {
                     AppLog.d(TAG) { "DNS L2 cache hit: ${question.domain}" }
-                    sendPrebuiltResponse(task, servedLength, responseQueue)
+                    writePrebuiltResponseDirect(task, servedLength, writePacket)
                 }
-                return false
+                return true
             }
         }
 
@@ -452,8 +470,8 @@ class DnsVpnService : VpnService() {
             val dnsResponseLength = patchDnsErrorResponse(
                 packet, dnsStart, question.questionEndOffset, DNS_RCODE_SERVFAIL
             )
-            sendPrebuiltResponse(task, dnsResponseLength, responseQueue)
-            return false
+            writePrebuiltResponseDirect(task, dnsResponseLength, writePacket)
+            return true
         }
         return false
     }
@@ -589,6 +607,21 @@ class DnsVpnService : VpnService() {
         responseQueue.send(QueuedResponse(task.packet, responseLength))
     }
 
+    /**
+     * reader 线程直写版本：改写 IP/UDP 头后立即写入 TUN，省去 writer 协程的
+     * 一次调度唤醒；缓冲区仍归 reader 所有，由调用方回收。
+     */
+    private fun writePrebuiltResponseDirect(
+        task: UpstreamTask,
+        dnsResponseLength: Int,
+        writePacket: (ByteArray, Int) -> Unit
+    ) {
+        val responseLength = PacketRewriter.rewriteAsResponse(
+            task.packet, task.isIPv6, task.ipHeaderLength, task.srcPort, dnsResponseLength
+        )
+        writePacket(task.packet, responseLength)
+    }
+
     private fun createNotification(): Notification {
         return VpnNotifications.buildServiceNotification(this)
     }
@@ -615,6 +648,9 @@ class DnsVpnService : VpnService() {
                 if (servers != newServers) {
                     servers = newServers
                     invalidateResponseCache("upstream DNS servers changed")
+                    // New addresses start with empty socket pools: warm them in
+                    // the background so first queries skip create+protect.
+                    scope.launch { dnsQueryExecutor?.prewarm(newServers) }
                 }
                 AppLog.d(TAG) { "Updated active DNS servers: ${servers.size}" }
             }

@@ -12,7 +12,7 @@ A fast local DNS filtering proxy for Android. Intercepts DNS queries via Android
 - **In-flight Query Coalescing** — Concurrent requests for the same domain/type/class join one in-flight upstream lookup instead of sending duplicates
 - **CNAME Cloaking Protection** — Positive answers whose CNAME chain hits the blocklist are answered NXDOMAIN instead, without polluting the cache; the verdict is remembered so repeats skip upstream
 - **TCP Fallback & Oversized Answers** — Upstream TC=1 answers (or datagrams that fill the 4,096-byte receive buffer) are retried over TCP to the same server (RFC 7766); the TUN MTU of 8000 lets big answers reach the client in a single UDP datagram
-- **UDP Socket Pooling** — Up to 32 reusable sockets per upstream server, prewarmed on VPN start and network change; sockets that lose a race are drained and reused instead of destroyed
+- **UDP Socket Pooling** — Up to 64 reusable sockets per upstream server, prewarmed on VPN start, network changes, and upstream-list changes; sockets that lose a race are returned to the pool promptly (blocked receives poll for cancellation) with stale replies rejected by DNS question matching
 - **Statistics** — In-memory counters for DNS requests handled by the VPN, blocked requests, block rate, and average upstream response time
 - **Dashboard** — Protection status, start/stop toggle, statistics grid
 - **DNS Server Management** — Configure multiple upstream plain DNS servers (add with validation, enable/disable, delete, reset to defaults); `ip:port`, `[ipv6]:port`, and hostname addresses are supported

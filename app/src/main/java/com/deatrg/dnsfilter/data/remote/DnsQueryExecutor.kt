@@ -9,15 +9,15 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
-import java.io.EOFException
+import java.io.InputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -41,16 +41,20 @@ class DnsQueryExecutor(
         // anything filling it completely is treated as suspect-truncated and
         // retried over TCP (the kernel truncates oversized datagrams silently).
         private const val DNS_RESPONSE_BUFFER_SIZE = 4096
-        private const val UDP_SOCKET_POOL_SIZE = 32
-        private const val PREWARM_SOCKETS_PER_SERVER = 2
+        private const val UDP_SOCKET_POOL_SIZE = 64
+        private const val PREWARM_SOCKETS_PER_SERVER = 4
         private val STALE_WINDOW_MS = STALE_DNS_MAX_WINDOW_SECONDS * 1000L
         private const val PREFETCH_GUARD_MS = 30_000L
         /** Default per-server upstream timeout for foreground queries and prefetch refreshes. */
         const val DEFAULT_QUERY_TIMEOUT_MS = 3000L
         // Blocked upstream receives park a thread each (workers x servers in
-        // flight); give them dedicated permits instead of borrowing from the
-        // shared 64-thread Dispatchers.IO pool.
-        private const val UPSTREAM_IO_PARALLELISM = 256
+        // flight). IO views are elastic (they may exceed the shared 64-thread
+        // default view on demand), so this bound sizes the worst-case thread
+        // count: keep it above slowWorkerCount × enabled servers plus headroom
+        // for refresh/prefetch races (32 × 3 = 96, +32 headroom).
+        private const val UPSTREAM_IO_PARALLELISM = 128
+        /** Blocked upstream reads poll for cancellation on this slice. */
+        private const val CANCEL_CHECK_INTERVAL_MS = 200L
 
         /** [serveCachedResponseForClient] result: no fresh cache entry (miss). */
         const val CACHED_SERVE_MISS = -1
@@ -105,7 +109,12 @@ class DnsQueryExecutor(
     private val inFlightQueries = ConcurrentHashMap<String, CompletableDeferred<DnsQueryResult>>()
     private val responseCache = DnsResponseCache(DNS_RESPONSE_CACHE_SIZE, ::monotonicNowMs)
     private val refreshScope = CoroutineScope(upstreamIo + SupervisorJob())
+    // 竞速腿的宿主：必须与调用方的结构化作用域解耦——输家阻塞在 socket 读里时，
+    // coroutineScope 会等它完成才返回，导致首个成功响应被最慢的腿拖住。
+    // 调用方在 finally 主动 cancel 自己的腿；腿在下一个轮询切片退出并归还 socket。
+    private val raceScope = CoroutineScope(upstreamIo + SupervisorJob())
     private val lastRefreshMs = ConcurrentHashMap<String, Long>()
+    private val refreshGuardLock = Any()
 
     private fun monotonicNowMs(): Long = SystemClock.elapsedRealtime()
 
@@ -327,9 +336,13 @@ class DnsQueryExecutor(
     ) {
         if (servers.isEmpty()) return
         if (inFlightQueries.containsKey(queryKey)) return
+        // Atomic check-and-set: two concurrent stale/prefetch hits must not
+        // both pass the guard window and launch duplicate refreshes.
         val now = monotonicNowMs()
-        if (now - (lastRefreshMs[queryKey] ?: 0L) < PREFETCH_GUARD_MS) return
-        lastRefreshMs[queryKey] = now
+        synchronized(refreshGuardLock) {
+            if (now - (lastRefreshMs[queryKey] ?: 0L) < PREFETCH_GUARD_MS) return
+            lastRefreshMs[queryKey] = now
+        }
         // The caller's packet buffer is recycled; copy the DNS question for the refresh.
         val bytes = query.copyOfRange(queryOffset, queryOffset + queryLength)
         val request = RefreshRequest(queryKey, domain, servers, bytes, 0, bytes.size,
@@ -359,6 +372,8 @@ class DnsQueryExecutor(
      */
     suspend fun prewarm(servers: List<DnsServer>, perServer: Int = PREWARM_SOCKETS_PER_SERVER) =
         withContext(Dispatchers.IO) {
+            // 停机后清空的池不要被迟到的预热重新填上。
+            if (isShutdown) return@withContext
             servers.distinctBy { it.address }.forEach { server ->
                 try {
                     val endpoint = resolveServerEndpoint(server.address)
@@ -385,10 +400,16 @@ class DnsQueryExecutor(
         qtype: Int,
         timeoutMs: Long,
         cnameBlocklistCheck: ((String) -> Boolean)? = null
-    ): DnsQueryResult = coroutineScope {
+    ): DnsQueryResult {
         val cacheGeneration = responseCache.generation()
-        val deferreds = servers.map { server ->
-            async {
+        val outcomes = Channel<ServerQueryOutcome>(capacity = servers.size)
+
+        // 竞速腿跑在 executor 自己的 raceScope 上，而不是调用方的结构化作用域：
+        // 输家阻塞在 socket.receive 时，coroutineScope 必须等它完成才肯返回，
+        // 会把"首个成功响应"拖到输家超时/迟到为止。这里 finally 主动取消腿，
+        // 腿在下一次取消轮询切片（≤200ms）退出并归还 socket。
+        val legs = servers.map { server ->
+            raceScope.launch {
                 val startTime = monotonicNowMs()
                 // 单个服务器失败（地址非法/无法解析/连接错误）转成该服务器的失败结果，
                 // 不炸掉整个竞速，让其余服务器继续参与。
@@ -413,37 +434,41 @@ class DnsQueryExecutor(
                 } catch (e: Exception) {
                     DnsQueryResult(false, null, 0, e.message ?: "Upstream error")
                 }
-                ServerQueryOutcome(server, result, monotonicNowMs() - startTime)
+                outcomes.trySend(ServerQueryOutcome(server, result, monotonicNowMs() - startTime))
             }
-        }.toMutableList()
+        }
 
-        var firstError: String? = null
-        while (deferreds.isNotEmpty()) {
-            val completed = select<Pair<kotlinx.coroutines.Deferred<ServerQueryOutcome>, ServerQueryOutcome>> {
-                deferreds.forEach { deferred ->
-                    deferred.onAwait { result -> Pair(deferred, result) }
+        try {
+            var firstError: String? = null
+            var pending = legs.size
+            while (pending > 0) {
+                val outcome = outcomes.receive()
+                pending--
+                val responseBytes = outcome.result.responseBytes
+
+                if (!outcome.result.success || responseBytes == null) {
+                    if (firstError == null) {
+                        firstError = outcome.result.error
+                    }
+                    continue
                 }
-            }
-            val result = completed.second
-            val responseBytes = result.result.responseBytes
 
-            if (result.result.success && responseBytes != null) {
-                deferreds.forEach { it.cancel() }
                 val rcode = dnsResponseRcode(responseBytes)
                 val answerCount = dnsResponseAnswerCount(responseBytes)
+                if (rcode == null || answerCount == null) {
+                    if (firstError == null) firstError = "Malformed DNS response"
+                    continue
+                }
                 when {
-                    rcode == null || answerCount == null -> {
-                        if (firstError == null) firstError = "Malformed DNS response"
-                    }
                     rcode == 0 && answerCount > 0 -> {
                         if (cnameBlocklistCheck != null &&
                             extractCnameTargets(responseBytes).any { cnameBlocklistCheck(it) }
                         ) {
                             AppLog.d(TAG) { "DNS CNAME-cloaked block: domain=$domain qtype=$qtype" }
-                            return@coroutineScope DnsQueryResult(
+                            return DnsQueryResult(
                                 success = true,
                                 responseBytes = responseBytes,
-                                responseTime = result.elapsedMs,
+                                responseTime = outcome.elapsedMs,
                                 error = null,
                                 blocked = true
                             )
@@ -453,12 +478,12 @@ class DnsQueryExecutor(
                             responseCache.put(queryKey, responseBytes, ttlSeconds, cacheGeneration)
                         }
                         AppLog.d(TAG) {
-                            "DNS success: domain=$domain qtype=$qtype server=${result.server.name} time=${result.elapsedMs}ms"
+                            "DNS success: domain=$domain qtype=$qtype server=${outcome.server.name} time=${outcome.elapsedMs}ms"
                         }
-                        return@coroutineScope DnsQueryResult(
+                        return DnsQueryResult(
                             success = true,
                             responseBytes = responseBytes,
-                            responseTime = result.elapsedMs,
+                            responseTime = outcome.elapsedMs,
                             error = null
                         )
                     }
@@ -468,12 +493,12 @@ class DnsQueryExecutor(
                             responseCache.putNegative(queryKey, responseBytes, negativeTtl, cacheGeneration)
                         }
                         AppLog.d(TAG) {
-                            "DNS negative: domain=$domain qtype=$qtype rcode=$rcode server=${result.server.name}"
+                            "DNS negative: domain=$domain qtype=$qtype rcode=$rcode server=${outcome.server.name}"
                         }
-                        return@coroutineScope DnsQueryResult(
+                        return DnsQueryResult(
                             success = true,
                             responseBytes = responseBytes,
-                            responseTime = result.elapsedMs,
+                            responseTime = outcome.elapsedMs,
                             error = null
                         )
                     }
@@ -481,10 +506,10 @@ class DnsQueryExecutor(
                         // Upstream SERVFAIL: hand the real answer to this client but
                         // short-circuit repeats briefly (RFC 9520).
                         responseCache.putServfail(queryKey, SERVFAIL_CACHE_TTL_SECONDS)
-                        return@coroutineScope DnsQueryResult(
+                        return DnsQueryResult(
                             success = true,
                             responseBytes = responseBytes,
-                            responseTime = result.elapsedMs,
+                            responseTime = outcome.elapsedMs,
                             error = null
                         )
                     }
@@ -492,29 +517,21 @@ class DnsQueryExecutor(
                         if (firstError == null) firstError = "Upstream rcode=$rcode"
                     }
                 }
-                if (rcode == null || answerCount == null || (rcode != 0 && rcode != 2 && rcode != 3)) {
-                    deferreds.remove(completed.first)
-                    continue
-                }
-                // rcode 2/negative paths already returned above; this is unreachable
-                // except for defensive fall-through.
-                deferreds.remove(completed.first)
-            } else {
-                if (firstError == null) {
-                    firstError = result.result.error
-                }
-                deferreds.remove(completed.first)
             }
-        }
 
-        AppLog.e(TAG) { "DNS failed: domain=$domain qtype=$qtype error=$firstError" }
-        responseCache.putServfail(queryKey, SERVFAIL_CACHE_TTL_SECONDS)
-        return@coroutineScope DnsQueryResult(
-            success = false,
-            responseBytes = null,
-            responseTime = 0,
-            error = firstError ?: "All DNS queries failed"
-        )
+            AppLog.e(TAG) { "DNS failed: domain=$domain qtype=$qtype error=$firstError" }
+            responseCache.putServfail(queryKey, SERVFAIL_CACHE_TTL_SECONDS)
+            return DnsQueryResult(
+                success = false,
+                responseBytes = null,
+                responseTime = 0,
+                error = firstError ?: "All DNS queries failed"
+            )
+        } finally {
+            // 赢家已定（或全部失败）：取消剩余腿；它们在下一个切片退出并归还 socket。
+            legs.forEach { it.cancel() }
+            outcomes.close()
+        }
     }
 
     private suspend fun queryPlainDns(
@@ -527,15 +544,17 @@ class DnsQueryExecutor(
         val endpoint = resolveServerEndpoint(serverAddress)
         val wrapper = acquireUdpSocket(serverAddress, endpoint)
         val completed = AtomicBoolean(false)
+        // Cancellation signal for the blocked receive: this withContext job is
+        // a child of the race leg, so it turns inactive when the leg loses.
+        val raceJob = currentCoroutineContext()[Job]
 
         try {
             suspendCancellableCoroutine { continuation ->
                 continuation.invokeOnCancellation {
                     // Lost the race: do NOT close the pooled socket. The blocked
-                    // receive below finishes on its own (this query's late response
-                    // or the deadline) and hands the socket back to the pool; any
-                    // leftover datagram is drained by the next receive loop via
-                    // question-section matching.
+                    // receive returns at its next cancel-poll slice and hands the
+                    // socket back to the pool; any late datagram is drained by the
+                    // next receive loop via question-section matching.
                     completed.set(true)
                 }
 
@@ -544,7 +563,7 @@ class DnsQueryExecutor(
                     wrapper.socket.send(wrapper.requestPacket)
 
                     receiveMatchingResponse(
-                        wrapper, request, requestOffset, requestLength, endpoint, timeoutMs
+                        wrapper, request, requestOffset, requestLength, endpoint, timeoutMs, raceJob
                     )
                 } catch (e: Exception) {
                     wrapper.isValid = false
@@ -574,11 +593,19 @@ class DnsQueryExecutor(
         }
     }
 
+    /** True when a losing (cancelled) race leg should stop waiting. */
+    private fun isRaceCancelled(raceJob: Job?): Boolean = raceJob?.isActive == false
+
     /**
      * Drain-receive loop for a pooled connected socket. Skips stale datagrams
      * left by previously cancelled queries and waits until this query's own
      * response arrives or the overall deadline hits. Timeouts do NOT poison
      * the socket, so it stays in the pool.
+     *
+     * Waits in [CANCEL_CHECK_INTERVAL_MS] slices: once the race is lost
+     * ([raceJob] inactive) the loop returns immediately, releasing the thread
+     * and the socket without waiting out the full deadline. A late datagram is
+     * drained by the next receive loop and rejected by question matching.
      */
     private fun receiveMatchingResponse(
         wrapper: ReusableUdpSocket,
@@ -586,20 +613,27 @@ class DnsQueryExecutor(
         requestOffset: Int,
         requestLength: Int,
         endpoint: ServerEndpoint,
-        timeoutMs: Long
+        timeoutMs: Long,
+        raceJob: Job?
     ): DnsQueryResult {
         val buffer = wrapper.responseBuffer
         val responsePacket = wrapper.responsePacket
         val deadlineMs = monotonicNowMs() + timeoutMs
         while (true) {
+            if (isRaceCancelled(raceJob)) {
+                return DnsQueryResult(false, null, 0, "Cancelled")
+            }
             val remainingMs = (deadlineMs - monotonicNowMs()).coerceAtLeast(1L)
-            wrapper.socket.soTimeout = remainingMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+            wrapper.socket.soTimeout = remainingMs.coerceAtMost(CANCEL_CHECK_INTERVAL_MS).toInt()
             responsePacket.setData(buffer, 0, buffer.size)
             responsePacket.length = buffer.size
             try {
                 wrapper.socket.receive(responsePacket)
             } catch (_: SocketTimeoutException) {
-                return DnsQueryResult(false, null, 0, "Timeout")
+                if (monotonicNowMs() >= deadlineMs) {
+                    return DnsQueryResult(false, null, 0, "Timeout")
+                }
+                continue
             }
             if (!isExpectedResponseSource(responsePacket, endpoint)) {
                 continue
@@ -622,6 +656,10 @@ class DnsQueryExecutor(
     /**
      * DNS over TCP with the 2-byte length framing from RFC 7766. Used when a
      * UDP response arrives truncated (TC=1); not part of the hot path.
+     *
+     * Blocking reads run in [CANCEL_CHECK_INTERVAL_MS] slices tied to a single
+     * overall deadline, so a losing TCP leg observes cancellation shortly after
+     * the race ends instead of pinning its thread for the full timeout.
      */
     private suspend fun queryTcpDns(
         request: ByteArray,
@@ -631,13 +669,14 @@ class DnsQueryExecutor(
         timeoutMs: Long
     ): DnsQueryResult = withContext(upstreamIo) {
         var socket: Socket? = null
+        val raceJob = currentCoroutineContext()[Job]
         try {
             val endpoint = resolveServerEndpoint(serverAddress)
             socket = Socket()
             tcpSocketProtector?.invoke(socket)
             socket.connect(InetSocketAddress(endpoint.address, endpoint.port), timeoutMs.toInt())
-            socket.soTimeout = timeoutMs.toInt()
 
+            val deadlineMs = monotonicNowMs() + timeoutMs
             val out = socket.getOutputStream()
             out.write((requestLength shr 8) and 0xFF)
             out.write(requestLength and 0xFF)
@@ -645,21 +684,22 @@ class DnsQueryExecutor(
             out.flush()
 
             val input = socket.getInputStream()
-            val hi = input.read()
-            val lo = input.read()
-            if (hi < 0 || lo < 0) {
-                return@withContext DnsQueryResult(false, null, 0, "TCP framing EOF")
+            val lengthBytes = ByteArray(2)
+            if (!readTcpFully(input, lengthBytes, 0, 2, socket, deadlineMs, raceJob)) {
+                return@withContext DnsQueryResult(
+                    false, null, 0, tcpReadFailure("TCP framing", raceJob, deadlineMs)
+                )
             }
-            val responseLength = (hi shl 8) or lo
+            val responseLength =
+                ((lengthBytes[0].toInt() and 0xFF) shl 8) or (lengthBytes[1].toInt() and 0xFF)
             if (responseLength < 12 || responseLength > 65535) {
                 return@withContext DnsQueryResult(false, null, 0, "Bad TCP DNS length")
             }
             val responseBytes = ByteArray(responseLength)
-            var read = 0
-            while (read < responseLength) {
-                val n = input.read(responseBytes, read, responseLength - read)
-                if (n < 0) throw EOFException("TCP DNS body truncated")
-                read += n
+            if (!readTcpFully(input, responseBytes, 0, responseLength, socket, deadlineMs, raceJob)) {
+                return@withContext DnsQueryResult(
+                    false, null, 0, tcpReadFailure("TCP body", raceJob, deadlineMs)
+                )
             }
             if (!isValidDnsResponse(request, requestOffset, requestLength, responseBytes)) {
                 return@withContext DnsQueryResult(false, null, 0, "Mismatched DNS response")
@@ -672,6 +712,44 @@ class DnsQueryExecutor(
         } finally {
             runCatching { socket?.close() }
         }
+    }
+
+    /** Error label for a failed sliced TCP read. */
+    private fun tcpReadFailure(part: String, raceJob: Job?, deadlineMs: Long): String = when {
+        isRaceCancelled(raceJob) -> "TCP cancelled"
+        monotonicNowMs() >= deadlineMs -> "TCP timeout"
+        else -> "$part EOF"
+    }
+
+    /**
+     * Reads exactly [length] bytes into [target], polling for cancellation
+     * every [CANCEL_CHECK_INTERVAL_MS] and respecting [deadlineMs].
+     * Returns false on EOF, deadline expiry, or cancellation.
+     */
+    private fun readTcpFully(
+        input: InputStream,
+        target: ByteArray,
+        offset: Int,
+        length: Int,
+        socket: Socket,
+        deadlineMs: Long,
+        raceJob: Job?
+    ): Boolean {
+        var read = 0
+        while (read < length) {
+            if (isRaceCancelled(raceJob)) return false
+            val remainingMs = deadlineMs - monotonicNowMs()
+            if (remainingMs <= 0L) return false
+            socket.soTimeout = minOf(remainingMs, CANCEL_CHECK_INTERVAL_MS).toInt()
+            val n = try {
+                input.read(target, offset + read, length - read)
+            } catch (_: SocketTimeoutException) {
+                continue
+            }
+            if (n < 0) return false
+            read += n
+        }
+        return true
     }
 
     /**
@@ -805,6 +883,8 @@ class DnsQueryExecutor(
         // 并归还，releaseUdpSocket 需要知道直接关闭而不是回池。
         isShutdown = true
         refreshScope.cancel()
+        // raceScope 故意不取消：stop 过程中 runDnsLoop 的 NonCancellable 排水仍会
+        // 处理排队查询并调用 query()，腿必须还能运行，否则 worker join 永久挂起。
         lastRefreshMs.clear()
         responseCache.clear()
         inFlightQueries.values.forEach { it.cancel() }
