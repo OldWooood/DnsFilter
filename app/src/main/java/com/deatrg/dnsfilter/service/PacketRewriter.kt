@@ -120,8 +120,9 @@ internal object PacketRewriter {
         val udpLength = totalLength - IPV6_HEADER_LENGTH
 
         // 旧伪头部字序列 [0,0,lenHi,lenLo,0,0,0,17] 等价于这两个字。
-        // MTU <= 8000，32 位 Int 累加全部 16 位字绝不会溢出，循环内无需进位分支，
-        // 仅在末尾一次性折叠高 16 位进位。
+        // IPv6 载荷长度上限 65535 字节 => 最多 32768 个 16 位字；每字 ≤ 0xFFFF，
+        // 累加上限约 2^31（此处 MTU 8000 更远低于上限），32 位 Int 不会溢出，
+        // 循环内无需逐字折叠，仅在末尾一次性折叠高 16 位进位。
         var sum = (udpLength and 0xFFFF) + 17
 
         // src + dst（bytes 8..39）与 UDP 头 + 载荷（bytes 40..totalLength）连续，合并单循环遍历

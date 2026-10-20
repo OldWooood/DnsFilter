@@ -182,6 +182,49 @@ class PacketRewriterTest {
     }
 
     @Test
+    fun ipv6UdpChecksumHandlesMtuSizedOddPayload() {
+        // 接近 TUN MTU 的奇数载荷：验证 32 位累加 + 末尾单次折叠在最大包长下
+        // 仍与逐字进位的参考实现一致。
+        val dnsPayload = ByteArray(7_913) { (it * 31 + 7).toByte() }
+        val payloadLength = 8 + dnsPayload.size
+        val totalLength = 40 + payloadLength
+        val packet = ByteArray(totalLength)
+        packet[6] = 17
+
+        val srcAddr = ByteArray(16) { (it * 3 + 1).toByte() }
+        val dstAddr = ByteArray(16) { (it * 5 + 9).toByte() }
+        srcAddr.copyInto(packet, 8)
+        dstAddr.copyInto(packet, 24)
+        packet[40] = ((5555 shr 8) and 0xFF).toByte()
+        packet[41] = (5555 and 0xFF).toByte()
+        packet[42] = 0
+        packet[43] = PacketRewriter.DNS_PORT.toByte()
+        packet[44] = ((payloadLength shr 8) and 0xFF).toByte()
+        packet[45] = (payloadLength and 0xFF).toByte()
+        dnsPayload.copyInto(packet, 48)
+
+        val checksum = PacketRewriter.computeIpv6UdpChecksum(packet, totalLength)
+
+        var sum = 0
+        fun addWord(value: Int) {
+            sum += value
+            if (sum > 0xFFFF) sum = (sum and 0xFFFF) + 1
+        }
+        for (i in 8 until 40 step 2) addWord(u16(packet, i))
+        addWord(payloadLength)
+        addWord(17)
+        var i = 40
+        while (i + 1 < totalLength) {
+            addWord(u16(packet, i))
+            i += 2
+        }
+        if (i < totalLength) addWord((packet[i].toInt() and 0xFF) shl 8)
+        val expected = (sum.inv() and 0xFFFF).let { if (it == 0) 0xFFFF else it }
+
+        assertEquals(expected, checksum)
+    }
+
+    @Test
     fun ipv6UdpChecksumZeroSumIsSentAs0xFFFF() {
         // 构造反码和恰为 0x0000 的向量（先把 dst 末字留 0 算出基准反码和，
         // 再把该字设为补差值使总和归 0）：按 UDP 语义必须发送 0xFFFF。

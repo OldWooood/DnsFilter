@@ -50,10 +50,23 @@ class DnsQueryExecutor(
         // count: keep it above slowWorkerCount × enabled servers plus headroom
         // for refresh/prefetch races (32 × 3 = 96, +32 headroom).
         private const val UPSTREAM_IO_PARALLELISM = 128
-        /** Blocked upstream reads poll for cancellation on this slice. */
+        /**
+         * Fast cancel-poll slice right after dispatch: races usually resolve
+         * inside [CANCEL_FAST_POLL_WINDOW_MS], so losing legs release their
+         * sockets promptly.
+         */
         private const val CANCEL_CHECK_INTERVAL_MS = 50L
+        /**
+         * Idle slice after [CANCEL_FAST_POLL_WINDOW_MS]: a healthy leg waiting
+         * for a slow upstream must not wake up (and construct a
+         * SocketTimeoutException) 20x/s. A leg that loses the race later still
+         * exits within this slice.
+         */
+        private const val IDLE_CHECK_INTERVAL_MS = 200L
+        /** How long a leg polls at [CANCEL_CHECK_INTERVAL_MS] before backing off. */
+        private const val CANCEL_FAST_POLL_WINDOW_MS = 500L
 
-        /** [serveCachedResponseForClient] result: no fresh cache entry (miss). */
+        /** [serveCachedResponseForClient] result: no fresh or stale cache entry (miss). */
         const val CACHED_SERVE_MISS = -1
         /** [serveCachedResponseForClient] result: cached payload exceeds destCapacity. */
         const val CACHED_SERVE_OVERFLOW = -2
@@ -126,17 +139,20 @@ class DnsQueryExecutor(
     }
 
     /**
-     * Reader-thread L2 fresh-hit fast path: copies the cached response into
-     * [dest] at [destOffset] — normally the client packet buffer, right where
-     * its DNS message lives — so serving a hit costs ONE copy. TTLs are aged
-     * and the client's transaction ID / RD bit restored in place; a hot
-     * near-expiry entry additionally kicks off an Unbound-style background
-     * refresh (hint evaluated in the same cache-lock acquisition as the hit,
-     * and before [dest] is overwritten since dest may be the query itself).
+     * Reader-thread L2 fast path for FRESH and RFC 8767 STALE entries: copies
+     * the cached response into [dest] at [destOffset] — normally the client
+     * packet buffer, right where its DNS message lives — so serving a hit costs
+     * ONE copy. TTLs are aged and the client's transaction ID / RD bit restored
+     * in place. A hot near-expiry entry triggers Unbound-style prefetch, and a
+     * stale entry triggers a background refresh (both evaluated in the same
+     * cache-lock acquisition and before [dest] is overwritten since dest may be
+     * the query itself). Stale answers are stamped to a 30s TTL; negative
+     * stale answers also stamp the SOA MINIMUM so RFC 2308 downstream caching
+     * still honors that window.
      *
      * @return the DNS payload length written into [dest], [CACHED_SERVE_MISS]
-     *   when there is no fresh entry, or [CACHED_SERVE_OVERFLOW] when the
-     *   cached payload does not fit [destCapacity] ([dest] left untouched;
+     *   when there is no fresh or stale entry, or [CACHED_SERVE_OVERFLOW] when
+     *   the cached payload does not fit [destCapacity] ([dest] left untouched;
      *   the caller answers TC=1).
      *
      * 前置条件由调用方保证并以 require 快速判定：
@@ -188,7 +204,13 @@ class DnsQueryExecutor(
             agePositiveDnsTtlsInPlace(dest, cached.ageSeconds, destOffset, payload.size)
         }
         if (cached.stale) {
-            stampStaleTtlsInPlace(dest, STALE_DNS_TTL_SECONDS, destOffset, payload.size)
+            stampStaleTtlsInPlace(
+                dest,
+                STALE_DNS_TTL_SECONDS,
+                destOffset,
+                payload.size,
+                stampSoaMinimum = cached.kind == DnsResponseCache.EntryKind.NEGATIVE
+            )
         }
         dest[destOffset] = transactionId0
         dest[destOffset + 1] = transactionId1
@@ -253,7 +275,10 @@ class DnsQueryExecutor(
             } else {
                 agePositiveDnsTtlsInPlace(response, hit.ageSeconds)
             }
-            stampStaleTtlsInPlace(response)
+            stampStaleTtlsInPlace(
+                response,
+                stampSoaMinimum = hit.kind == DnsResponseCache.EntryKind.NEGATIVE
+            )
             return DnsQueryResult(
                 success = true,
                 responseBytes = response,
@@ -407,7 +432,7 @@ class DnsQueryExecutor(
         // 竞速腿跑在 executor 自己的 raceScope 上，而不是调用方的结构化作用域：
         // 输家阻塞在 socket.receive 时，coroutineScope 必须等它完成才肯返回，
         // 会把"首个成功响应"拖到输家超时/迟到为止。这里 finally 主动取消腿，
-        // 腿在下一次取消轮询切片（≤200ms）退出并归还 socket。
+        // 腿在下一次取消轮询切片（前 500ms 内 ≤50ms，之后 ≤200ms）退出并归还 socket。
         val legs = servers.map { server ->
             raceScope.launch {
                 val startTime = monotonicNowMs()
@@ -580,10 +605,13 @@ class DnsQueryExecutor(
      * response arrives or the overall deadline hits. Timeouts do NOT poison
      * the socket, so it stays in the pool.
      *
-     * Waits in [CANCEL_CHECK_INTERVAL_MS] slices: once the race is lost
-     * ([raceJob] inactive) the loop returns immediately, releasing the thread
-     * and the socket without waiting out the full deadline. A late datagram is
-     * drained by the next receive loop and rejected by question matching.
+     * Waits in slices: [CANCEL_CHECK_INTERVAL_MS] during the first
+     * [CANCEL_FAST_POLL_WINDOW_MS], then [IDLE_CHECK_INTERVAL_MS], so a losing
+     * leg still returns promptly without making a healthy slow query build a
+     * timeout exception 20x/s. Once the race is lost ([raceJob] inactive) the
+     * loop returns immediately, releasing the thread and the socket without
+     * waiting out the full deadline. A late datagram is drained by the next
+     * receive loop and rejected by question matching.
      */
     private fun receiveMatchingResponse(
         wrapper: ReusableUdpSocket,
@@ -596,13 +624,20 @@ class DnsQueryExecutor(
     ): DnsQueryResult {
         val buffer = wrapper.responseBuffer
         val responsePacket = wrapper.responsePacket
-        val deadlineMs = monotonicNowMs() + timeoutMs
+        val startMs = monotonicNowMs()
+        val deadlineMs = startMs + timeoutMs
         while (true) {
             if (isRaceCancelled(raceJob)) {
                 return DnsQueryResult(false, null, 0, "Cancelled")
             }
-            val remainingMs = (deadlineMs - monotonicNowMs()).coerceAtLeast(1L)
-            wrapper.socket.soTimeout = remainingMs.coerceAtMost(CANCEL_CHECK_INTERVAL_MS).toInt()
+            val now = monotonicNowMs()
+            val remainingMs = (deadlineMs - now).coerceAtLeast(1L)
+            val sliceMs = if (now - startMs < CANCEL_FAST_POLL_WINDOW_MS) {
+                CANCEL_CHECK_INTERVAL_MS
+            } else {
+                IDLE_CHECK_INTERVAL_MS
+            }
+            wrapper.socket.soTimeout = remainingMs.coerceAtMost(sliceMs).toInt()
             responsePacket.setData(buffer, 0, buffer.size)
             responsePacket.length = buffer.size
             try {
@@ -635,9 +670,10 @@ class DnsQueryExecutor(
      * DNS over TCP with the 2-byte length framing from RFC 7766. Used when a
      * UDP response arrives truncated (TC=1); not part of the hot path.
      *
-     * Blocking reads run in [CANCEL_CHECK_INTERVAL_MS] slices tied to a single
-     * overall deadline, so a losing TCP leg observes cancellation shortly after
-     * the race ends instead of pinning its thread for the full timeout.
+     * Blocking reads run in adaptive slices ([CANCEL_CHECK_INTERVAL_MS], then
+     * [IDLE_CHECK_INTERVAL_MS]) tied to a single overall deadline, so a losing
+     * TCP leg observes cancellation shortly after the race ends instead of
+     * pinning its thread for the full timeout.
      */
     private suspend fun queryTcpDns(
         request: ByteArray,
@@ -654,7 +690,8 @@ class DnsQueryExecutor(
             tcpSocketProtector?.invoke(socket)
             socket.connect(InetSocketAddress(endpoint.address, endpoint.port), timeoutMs.toInt())
 
-            val deadlineMs = monotonicNowMs() + timeoutMs
+            val startMs = monotonicNowMs()
+            val deadlineMs = startMs + timeoutMs
             val out = socket.getOutputStream()
             out.write((requestLength shr 8) and 0xFF)
             out.write(requestLength and 0xFF)
@@ -663,7 +700,7 @@ class DnsQueryExecutor(
 
             val input = socket.getInputStream()
             val lengthBytes = ByteArray(2)
-            if (!readTcpFully(input, lengthBytes, 0, 2, socket, deadlineMs, raceJob)) {
+            if (!readTcpFully(input, lengthBytes, 0, 2, socket, startMs, deadlineMs, raceJob)) {
                 return@withContext DnsQueryResult(
                     false, null, 0, tcpReadFailure("TCP framing", raceJob, deadlineMs)
                 )
@@ -674,7 +711,7 @@ class DnsQueryExecutor(
                 return@withContext DnsQueryResult(false, null, 0, "Bad TCP DNS length")
             }
             val responseBytes = ByteArray(responseLength)
-            if (!readTcpFully(input, responseBytes, 0, responseLength, socket, deadlineMs, raceJob)) {
+            if (!readTcpFully(input, responseBytes, 0, responseLength, socket, startMs, deadlineMs, raceJob)) {
                 return@withContext DnsQueryResult(
                     false, null, 0, tcpReadFailure("TCP body", raceJob, deadlineMs)
                 )
@@ -700,9 +737,9 @@ class DnsQueryExecutor(
     }
 
     /**
-     * Reads exactly [length] bytes into [target], polling for cancellation
-     * every [CANCEL_CHECK_INTERVAL_MS] and respecting [deadlineMs].
-     * Returns false on EOF, deadline expiry, or cancellation.
+     * Reads exactly [length] bytes into [target], polling for cancellation on
+     * adaptive slices ([startMs] anchors the fast window) and respecting
+     * [deadlineMs]. Returns false on EOF, deadline expiry, or cancellation.
      */
     private fun readTcpFully(
         input: InputStream,
@@ -710,15 +747,22 @@ class DnsQueryExecutor(
         offset: Int,
         length: Int,
         socket: Socket,
+        startMs: Long,
         deadlineMs: Long,
         raceJob: Job?
     ): Boolean {
         var read = 0
         while (read < length) {
             if (isRaceCancelled(raceJob)) return false
-            val remainingMs = deadlineMs - monotonicNowMs()
+            val now = monotonicNowMs()
+            val remainingMs = deadlineMs - now
             if (remainingMs <= 0L) return false
-            socket.soTimeout = minOf(remainingMs, CANCEL_CHECK_INTERVAL_MS).toInt()
+            val sliceMs = if (now - startMs < CANCEL_FAST_POLL_WINDOW_MS) {
+                CANCEL_CHECK_INTERVAL_MS
+            } else {
+                IDLE_CHECK_INTERVAL_MS
+            }
+            socket.soTimeout = minOf(remainingMs, sliceMs).toInt()
             val n = try {
                 input.read(target, offset + read, length - read)
             } catch (_: SocketTimeoutException) {

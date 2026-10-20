@@ -415,12 +415,18 @@ internal fun ageNegativeDnsTtlsInPlace(
 /**
  * Stamps every real RR TTL to [staleTtlSeconds] so RFC 8767 serve-stale answers
  * are cached downstream only briefly while a background refresh runs.
+ *
+ * [stampSoaMinimum] additionally rewrites the SOA MINIMUM field inside the
+ * authority record. RFC 2308 defines the negative-cache TTL as
+ * min(SOA TTL, SOA MINIMUM), so a stale NXDOMAIN/NODATA answer stays cacheable
+ * downstream only when both fields are stamped (aging already zeroes MINIMUM).
  */
 internal fun stampStaleTtlsInPlace(
     response: ByteArray,
     staleTtlSeconds: Long = STALE_DNS_TTL_SECONDS,
     dnsStart: Int = 0,
-    dnsLength: Int = response.size - dnsStart
+    dnsLength: Int = response.size - dnsStart,
+    stampSoaMinimum: Boolean = false
 ): Boolean {
     if (dnsLength < DNS_HEADER_SIZE) return false
     val end = dnsStart + dnsLength
@@ -443,6 +449,10 @@ internal fun stampStaleTtlsInPlace(
         if (nextOffset > end) return false
         if (type != DNS_TYPE_OPT && type != DNS_TYPE_TKEY && type != DNS_TYPE_TSIG) {
             writeUInt32(response, headerOffset + 4, staleTtlSeconds)
+            if (stampSoaMinimum && type == DNS_TYPE_SOA && rdataLength >= 20) {
+                // MINIMUM 是 SOA RDATA 的最后 4 个字节（RFC 2308）。
+                writeUInt32(response, nextOffset - 4, staleTtlSeconds)
+            }
             touched = true
         }
         offset = nextOffset
@@ -450,31 +460,73 @@ internal fun stampStaleTtlsInPlace(
     return touched
 }
 
-private fun readMessageNameString(data: ByteArray, start: Int, end: Int): String? {
-    val name = acquireNameBuilder()
-    name.setLength(0)
+/**
+ * Shared DNS name label walker. [pointerBase] is the offset of the DNS message
+ * inside [data], so compression pointers (relative to the message start) resolve
+ * correctly for both standalone messages (base 0) and names embedded in a packet
+ * buffer. [end] bounds every read.
+ *
+ * Fills [out] with the lowercased name and returns the offset just past the
+ * name's on-wire encoding in its current section (after the first compression
+ * pointer, or after the root label). Returns null for a malformed/truncated
+ * label. A name that runs to [end] without a root label yields the labels read
+ * so far, matching the historical parsers.
+ *
+ * [rejectPointersPastEnd] is used by standalone-message callers, which treat a
+ * pointer target outside the message as malformed; packet callers keep relying
+ * on the loop bound (historical behavior).
+ */
+private fun readDnsNameInto(
+    data: ByteArray,
+    start: Int,
+    end: Int,
+    pointerBase: Int,
+    rejectPointersPastEnd: Boolean,
+    out: StringBuilder
+): Int? {
     var idx = start
+    var jumped = false
+    var nextOffset = start
     var jumps = 0
+
     while (idx < end) {
         val len = data[idx].toInt() and 0xFF
         if (len == 0) {
+            if (!jumped) nextOffset = idx + 1
             break
         }
         if ((len and 0xC0) == 0xC0) {
             if (idx + 1 >= end) return null
             val pointer = ((len and 0x3F) shl 8) or (data[idx + 1].toInt() and 0xFF)
-            if (pointer >= end) return null
-            idx = pointer
+            if (rejectPointersPastEnd && pointerBase + pointer >= end) return null
+            if (!jumped) nextOffset = idx + 2
+            idx = pointerBase + pointer
+            jumped = true
             jumps++
             if (jumps > 8) return null
             continue
         }
         idx++
         if (idx + len > end) return null
-        if (name.isNotEmpty()) name.append('.')
-        appendLowercaseAscii(name, data, idx, len)
+        if (out.isNotEmpty()) out.append('.')
+        appendLowercaseAscii(out, data, idx, len)
         idx += len
+        if (!jumped) nextOffset = idx
     }
+    return nextOffset
+}
+
+private fun readMessageNameString(data: ByteArray, start: Int, end: Int): String? {
+    val name = acquireNameBuilder()
+    name.setLength(0)
+    readDnsNameInto(
+        data = data,
+        start = start,
+        end = end,
+        pointerBase = 0,
+        rejectPointersPastEnd = true,
+        out = name
+    ) ?: return null
     if (name.isEmpty()) return null
     return name.toString()
 }
@@ -515,42 +567,6 @@ internal fun anyCnameTargetMatches(
         offset = nextOffset
     }
     return false
-}
-
-/**
- * Extracts CNAME chain targets from the answer section for CNAME-cloaking
- * checks. Returns an empty list when there are no CNAME answers or the message
- * is malformed. Capped to 16 targets against hostile chains.
- */
-internal fun extractCnameTargets(response: ByteArray, maxTargets: Int = 16): List<String> {
-    if (response.size < DNS_HEADER_SIZE) return emptyList()
-    val end = response.size
-    val questionCount = readUInt16(response, 4)
-    val answerCount = readUInt16(response, 6)
-    if (answerCount == 0) return emptyList()
-    var offset = DNS_HEADER_SIZE
-    repeat(questionCount) {
-        offset = (skipDnsName(response, offset, end) ?: return emptyList()) + 4
-        if (offset > end) return emptyList()
-    }
-    var targets: ArrayList<String>? = null
-    repeat(answerCount) {
-        val headerOffset = skipDnsName(response, offset, end) ?: return targets ?: emptyList()
-        if (headerOffset + 10 > end) return targets ?: emptyList()
-        val type = readUInt16(response, headerOffset)
-        val rdataLength = readUInt16(response, headerOffset + 8)
-        val rdataStart = headerOffset + 10
-        val nextOffset = rdataStart + rdataLength
-        if (nextOffset > end) return targets ?: emptyList()
-        if (type == DNS_TYPE_CNAME && (targets?.size ?: 0) < maxTargets) {
-            readMessageNameString(response, rdataStart, end)?.let {
-                val list = targets ?: ArrayList<String>(4).also { targets = it }
-                list.add(it)
-            }
-        }
-        offset = nextOffset
-    }
-    return targets ?: emptyList()
 }
 
 /**
@@ -673,60 +689,10 @@ internal fun patchDnsTruncatedResponse(
 }
 
 /**
- * Parse DNS name from a raw IP packet buffer where DNS compression pointers
- * are relative to the start of the DNS message (not the packet).
- * @param data  full IP packet buffer
- * @param dnsStart  offset within data where the DNS message starts
- * @param startOffset  offset within data where the name label begins
- * @param packetLength  total length of the packet buffer
+ * Allocating convenience wrapper around [parseDnsQueryFromPacketInto]. The
+ * reader hot path uses the Into variant; this wrapper stays for callers/tests
+ * that want a standalone [DnsQuestion].
  */
-fun readDnsNameFromPacket(
-    data: ByteArray,
-    dnsStart: Int,
-    startOffset: Int,
-    packetLength: Int
-): Pair<String, Int>? {
-    val name = acquireNameBuilder()
-    name.setLength(0)
-    var idx = startOffset
-    var jumped = false
-    var nextOffset = startOffset
-    var jumps = 0
-
-    while (idx < packetLength) {
-        val len = data[idx].toInt() and 0xFF
-        if (len == 0) {
-            if (!jumped) {
-                nextOffset = idx + 1
-            }
-            break
-        }
-        if ((len and 0xC0) == 0xC0) {
-            if (idx + 1 >= packetLength) return null
-            val pointer = ((len and 0x3F) shl 8) or (data[idx + 1].toInt() and 0xFF)
-            if (!jumped) {
-                nextOffset = idx + 2
-            }
-            idx = dnsStart + pointer
-            jumped = true
-            jumps++
-            if (jumps > 8) return null
-            continue
-        }
-        idx++
-        if (idx + len > packetLength) return null
-        if (name.isNotEmpty()) name.append('.')
-        appendLowercaseAscii(name, data, idx, len)
-        idx += len
-        if (!jumped) {
-            nextOffset = idx
-        }
-    }
-
-    if (name.isEmpty()) return null
-    return Pair(name.toString(), nextOffset)
-}
-
 fun parseDnsQueryFromPacket(
     packet: ByteArray,
     dnsStart: Int,
@@ -741,7 +707,9 @@ fun parseDnsQueryFromPacket(
 }
 
 /**
- * 零分配解析 DNS 查询：直接填充 [out]，不创建 [Pair] 或 [DnsQuestion]。
+ * 低分配解析 DNS 查询：复用 [out]，不再创建 [Pair] 与 [DnsQuestion]。
+ * 域名 String 仍由 `toString()` 产生（缓存 key / 拦截判断需要），因此热路径
+ * 是“少分配”而不是严格零分配。
  */
 internal fun parseDnsQueryFromPacketInto(
     packet: ByteArray,
@@ -758,40 +726,14 @@ internal fun parseDnsQueryFromPacketInto(
 
     val name = acquireNameBuilder()
     name.setLength(0)
-    var idx = dnsStart + 12
-    var jumped = false
-    var nextOffset = idx
-    var jumps = 0
-
-    while (idx < packetLength) {
-        val len = packet[idx].toInt() and 0xFF
-        if (len == 0) {
-            if (!jumped) {
-                nextOffset = idx + 1
-            }
-            break
-        }
-        if ((len and 0xC0) == 0xC0) {
-            if (idx + 1 >= packetLength) return false
-            val pointer = ((len and 0x3F) shl 8) or (packet[idx + 1].toInt() and 0xFF)
-            if (!jumped) {
-                nextOffset = idx + 2
-            }
-            idx = dnsStart + pointer
-            jumped = true
-            jumps++
-            if (jumps > 8) return false
-            continue
-        }
-        idx++
-        if (idx + len > packetLength) return false
-        if (name.isNotEmpty()) name.append('.')
-        appendLowercaseAscii(name, packet, idx, len)
-        idx += len
-        if (!jumped) {
-            nextOffset = idx
-        }
-    }
+    val nextOffset = readDnsNameInto(
+        data = packet,
+        start = dnsStart + 12,
+        end = packetLength,
+        pointerBase = dnsStart,
+        rejectPointersPastEnd = false,
+        out = name
+    ) ?: return false
 
     if (name.isEmpty()) return false
     if (nextOffset + 4 > packetLength) return false

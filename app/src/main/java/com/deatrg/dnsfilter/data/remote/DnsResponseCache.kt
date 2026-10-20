@@ -63,19 +63,13 @@ internal class DnsResponseCache(
         val entry = entries[key] ?: return@synchronized null
         val now = nowMs()
         if (now >= entry.expiresAtMs) {
-            // Expired entries are RETAINED (not evicted) so getStale() can serve
-            // them inside the RFC 8767 window; beyond-window eviction happens
-            // there or under LRU pressure.
+            // Expired entries are RETAINED (not evicted) so getStale()/getOrStale()
+            // can serve them inside the RFC 8767 window; beyond-window eviction
+            // happens there or under LRU pressure.
             return@synchronized null
         }
         entry.hits++
-        Hit(
-            response = entry.response,
-            ageSeconds = ((now - entry.storedAtMs).coerceAtLeast(0L) + 999L) / 1000L,
-            stale = false,
-            kind = entry.kind,
-            prefetch = prefetchConditionLocked(entry, now)
-        )
+        freshHitLocked(entry, now)
     }
 
     /**
@@ -88,24 +82,9 @@ internal class DnsResponseCache(
         val now = nowMs()
         if (now < entry.expiresAtMs) {
             entry.hits++
-            return@synchronized Hit(
-                response = entry.response,
-                ageSeconds = ((now - entry.storedAtMs).coerceAtLeast(0L) + 999L) / 1000L,
-                stale = false,
-                kind = entry.kind,
-                prefetch = prefetchConditionLocked(entry, now)
-            )
+            return@synchronized freshHitLocked(entry, now)
         }
-        if (now - entry.expiresAtMs > maxStaleMs) {
-            entries.remove(key)
-            return@synchronized null
-        }
-        Hit(
-            response = entry.response,
-            ageSeconds = ((now - entry.storedAtMs).coerceAtLeast(0L) + 999L) / 1000L,
-            stale = true,
-            kind = entry.kind
-        )
+        staleHitLocked(key, entry, now, maxStaleMs)
     }
 
     /**
@@ -117,11 +96,25 @@ internal class DnsResponseCache(
         val entry = entries[key] ?: return@synchronized null
         val now = nowMs()
         if (now < entry.expiresAtMs) return@synchronized null
+        staleHitLocked(key, entry, now, maxStaleMs)
+    }
+
+    /** Must be called with [lock] held. */
+    private fun freshHitLocked(entry: Entry, now: Long): Hit = Hit(
+        response = entry.response,
+        ageSeconds = ((now - entry.storedAtMs).coerceAtLeast(0L) + 999L) / 1000L,
+        stale = false,
+        kind = entry.kind,
+        prefetch = prefetchConditionLocked(entry, now)
+    )
+
+    /** Must be called with [lock] held. Evicts entries outside the stale window. */
+    private fun staleHitLocked(key: String, entry: Entry, now: Long, maxStaleMs: Long): Hit? {
         if (now - entry.expiresAtMs > maxStaleMs) {
             entries.remove(key)
-            return@synchronized null
+            return null
         }
-        Hit(
+        return Hit(
             response = entry.response,
             ageSeconds = ((now - entry.storedAtMs).coerceAtLeast(0L) + 999L) / 1000L,
             stale = true,

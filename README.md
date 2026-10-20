@@ -8,11 +8,11 @@ A fast local DNS filtering proxy for Android. Intercepts DNS queries via Android
 - **Always-on VPN** — Can be set as "Always-on" in system settings (auto-restarts after reboot, optional "block connections without VPN"); revocation runs the full stop cleanup
 - **Domain Blocking** — Filters against AdAway-format blocklists. Supports multiple lists, add/remove/toggle, and manual refresh
 - **Concurrent Multi-Server Queries** — Sends DNS queries to all enabled upstream servers simultaneously, uses the fastest successful response; a broken server address only fails its own attempt, never the race
-- **Two-Level DNS Caching** — Android Resolver is L1; a 4,096-entry L2 stores positive, RFC 2308 negative (NXDOMAIN/NODATA) and brief RFC 9520 SERVFAIL entries, returns correctly aged remaining TTLs, serves expired entries stale for up to 3 days (RFC 8767) while refreshing in the background, and prefetches hot near-expiry entries
+- **Two-Level DNS Caching** — Android Resolver is L1; a 4,096-entry L2 stores positive, RFC 2308 negative (NXDOMAIN/NODATA) and brief RFC 9520 SERVFAIL entries, returns correctly aged remaining TTLs, serves fresh and expired entries directly on the reader fast path, serves expired entries stale for up to 3 days (RFC 8767) while refreshing in the background, and prefetches hot near-expiry entries
 - **In-flight Query Coalescing** — Concurrent requests for the same domain/type/class join one in-flight upstream lookup instead of sending duplicates
 - **CNAME Cloaking Protection** — Positive answers whose CNAME chain hits the blocklist are answered NXDOMAIN instead, without polluting the cache; the verdict is remembered so repeats skip upstream
 - **TCP Fallback & Oversized Answers** — Upstream TC=1 answers (or datagrams that fill the 4,096-byte receive buffer) are retried over TCP to the same server (RFC 7766); the TUN MTU of 8000 lets big answers reach the client in a single UDP datagram
-- **UDP Socket Pooling** — Up to 64 reusable sockets per upstream server, prewarmed on VPN start, network changes, and upstream-list changes; sockets that lose a race are returned to the pool promptly (blocked receives poll for cancellation) with stale replies rejected by DNS question matching
+- **UDP Socket Pooling** — Up to 64 reusable sockets per upstream server, prewarmed on VPN start, network changes, and upstream-list changes; sockets that lose a race are returned to the pool promptly (blocked receives poll for cancellation on adaptive 50 ms → 200 ms slices) with stale replies rejected by DNS question matching
 - **Statistics** — In-memory counters for DNS requests handled by the VPN, blocked requests, block rate, and average upstream response time
 - **Dashboard** — Protection status, start/stop toggle, statistics grid
 - **DNS Server Management** — Configure multiple upstream plain DNS servers (add with validation, enable/disable, delete, reset to defaults); `ip:port`, `[ipv6]:port`, and hostname addresses are supported
@@ -72,7 +72,7 @@ DnsVpnService — reads IP packets, parses IPv4/IPv6/UDP/DNS
 2. Reads raw IP/UDP packets from the VPN interface
 3. Parses the DNS question from each packet
 4. Checks against loaded blocklists — blocked domains (and remembered CNAME-cloaking verdicts) get an immediate, 24-hour cacheable NXDOMAIN response
-5. Checks a 4,096-entry LRU cache (positive + negative + SERVFAIL markers); fresh hits return correctly aged remaining TTLs, expired entries may serve stale (RFC 8767, up to 3 days) while a background refresh runs, and hot near-expiry entries are prefetched
+5. Checks a 4,096-entry LRU cache (positive + negative + SERVFAIL markers); fresh hits and expired entries (stale, RFC 8767, up to 3 days) are served directly on the reader fast path with correctly aged TTLs while a background refresh runs, and hot near-expiry entries are prefetched
 6. Coalesces matching concurrent cache misses into one in-flight lookup per domain/type/class
 7. Forwards each unique miss to all enabled upstream DNS servers concurrently via plain UDP; TC=1 or receive-buffer-saturated answers are retried over TCP to the same server (RFC 7766)
 8. Clamps positive TTLs per qtype (A/AAAA 1–6 hours, others 10 minutes–2 hours), stores them in L2, and returns the fastest successful response; answers whose CNAME chain hits the blocklist are answered NXDOMAIN instead

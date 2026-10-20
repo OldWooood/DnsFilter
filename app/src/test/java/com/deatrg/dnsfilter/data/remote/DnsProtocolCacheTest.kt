@@ -3,6 +3,7 @@ package com.deatrg.dnsfilter.data.remote
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -99,14 +100,12 @@ class DnsProtocolCacheTest {
     }
 
     @Test
-    fun cnameTargetsAreExtractedLowercased() {
+    fun cnameTargetsAreMatchedLowercased() {
         val response = buildCnameResponse()
-        assertEquals(listOf("target.example.com"), extractCnameTargets(response))
         assertTrue(anyCnameTargetMatches(response) { it == "target.example.com" })
         assertFalse(anyCnameTargetMatches(response) { it == "other.example.com" })
 
         val positive = buildPositiveResponse()
-        assertEquals(emptyList<String>(), extractCnameTargets(positive))
         assertFalse(anyCnameTargetMatches(positive) { true })
     }
 
@@ -122,6 +121,52 @@ class DnsProtocolCacheTest {
         assertEquals(30L, readUInt32(response, secondAnswerTtlOffset))
         // OPT metadata untouched.
         assertEquals(0x8000L, readUInt32(response, optMetadataOffset))
+    }
+
+    @Test
+    fun staleNegativeHitKeepsRfc2308NegativeWindow() {
+        var now = 0L
+        val cache = DnsResponseCache(maxEntries = 4, nowMs = { now })
+        val key = "missing.example:1:1"
+        val response = buildNxDomainResponse(soaTtl = 60, soaMinimum = 60)
+        assertTrue(cache.putNegative(key, response, 60, cache.generation()))
+
+        now = 61_000L
+        val hit = cache.getOrStale(key, 3L * 24 * 60 * 60 * 1000)
+        assertNotNull(hit)
+        assertEquals(true, hit?.stale)
+
+        // 模拟 reader 命中路径：拷贝到客户端包缓冲 → 老化 → stale 戳记。
+        val dest = ByteArray(response.size)
+        hit!!.response.copyInto(dest)
+        assertTrue(ageNegativeDnsTtlsInPlace(dest, hit.ageSeconds))
+        assertTrue(
+            stampStaleTtlsInPlace(
+                dest,
+                STALE_DNS_TTL_SECONDS,
+                stampSoaMinimum = hit.kind == DnsResponseCache.EntryKind.NEGATIVE
+            )
+        )
+
+        val rrStart = 12 + exampleQuestion().size
+        val headerOffset = skipDnsName(dest, rrStart, dest.size)!!
+        val rdataStart = headerOffset + 10
+        val rdataLength = readUInt16(dest, headerOffset + 8)
+        assertEquals(STALE_DNS_TTL_SECONDS, readUInt32(dest, headerOffset + 4))
+        assertEquals(STALE_DNS_TTL_SECONDS, readUInt32(dest, rdataStart + rdataLength - 4))
+    }
+
+    @Test
+    fun staleStampDoesNotTouchSoaMinimumByDefault() {
+        val response = buildNxDomainResponse(soaTtl = 60, soaMinimum = 60)
+        val rrStart = 12 + exampleQuestion().size
+        val headerOffset = skipDnsName(response, rrStart, response.size)!!
+        val rdataStart = headerOffset + 10
+        val rdataLength = readUInt16(response, headerOffset + 8)
+
+        assertTrue(stampStaleTtlsInPlace(response, 30))
+        assertEquals(30L, readUInt32(response, headerOffset + 4))
+        assertEquals(60L, readUInt32(response, rdataStart + rdataLength - 4))
     }
 
     @Test
@@ -251,6 +296,52 @@ class DnsProtocolCacheTest {
         assertEquals(expected?.qtype, reusable.qtype)
         assertEquals(expected?.qclass, reusable.qclass)
         assertEquals(expected?.questionEndOffset, reusable.questionEndOffset)
+    }
+
+    @Test
+    fun parseDnsQueryIntoFollowsCompressedName() {
+        val dnsStart = 28
+        val nameOffset = dnsStart + 32
+        val packet = ByteArray(nameOffset + exampleQuestion().size)
+        writeUInt16(packet, dnsStart + 4, 1)
+        // QNAME 只放一个指向包内名字的压缩指针，QTYPE/QCLASS 紧随其后。
+        packet[dnsStart + 12] = 0xC0.toByte()
+        packet[dnsStart + 13] = 0x20
+        packet[dnsStart + 14] = 0
+        packet[dnsStart + 15] = 1
+        packet[dnsStart + 16] = 0
+        packet[dnsStart + 17] = 1
+        // 名字本体（exampleQuestion 的域名部分，根标签后即结束）。
+        exampleQuestion().copyInto(
+            packet,
+            destinationOffset = nameOffset,
+            startIndex = 0,
+            endIndex = 13
+        )
+
+        val out = MutableDnsQuestion()
+        assertTrue(parseDnsQueryFromPacketInto(packet, dnsStart, packet.size, out))
+        assertEquals("example.com", out.domain)
+        assertEquals(1, out.qtype)
+        assertEquals(1, out.qclass)
+        assertEquals(dnsStart + 18, out.questionEndOffset)
+    }
+
+    @Test
+    fun parseDnsQueryIntoRejectsTruncatedOrEmptyName() {
+        val dnsStart = 28
+        val packet = ByteArray(64)
+        writeUInt16(packet, dnsStart + 4, 1)
+
+        // 标签声明 5 字节但只提供 1 字节。
+        packet[dnsStart + 12] = 5
+        packet[dnsStart + 13] = 'a'.code.toByte()
+        val out = MutableDnsQuestion()
+        assertFalse(parseDnsQueryFromPacketInto(packet, dnsStart, dnsStart + 14, out))
+
+        // 根标签（空名字）不是合法查询。
+        packet[dnsStart + 12] = 0
+        assertFalse(parseDnsQueryFromPacketInto(packet, dnsStart, packet.size, out))
     }
 
     private fun buildQueryPacket(): ByteArray {

@@ -112,6 +112,30 @@ class DnsResponseCacheTest {
     }
 
     @Test
+    fun getOrStaleReportsPrefetchOnlyForFreshHits() {
+        var now = 0L
+        val cache = DnsResponseCache(maxEntries = 2, nowMs = { now })
+        val key = "hot.example:1:1"
+        assertTrue(cache.put(key, byteArrayOf(1), 60, cache.generation()))
+
+        // hits >= 3 且剩余 TTL < 10%（6s）时，fresh 命中带预取提示。
+        now = 20_000L
+        repeat(3) { assertFalse(cache.getOrStale(key, 60_000L)!!.prefetch) }
+        now = 55_000L
+        val fresh = cache.getOrStale(key, 60_000L)
+        assertNotNull(fresh)
+        assertEquals(false, fresh?.stale)
+        assertEquals(true, fresh?.prefetch)
+
+        // stale 命中总会触发刷新，不需要预取提示。
+        now = 61_000L
+        val stale = cache.getOrStale(key, 60_000L)
+        assertNotNull(stale)
+        assertEquals(true, stale?.stale)
+        assertEquals(false, stale?.prefetch)
+    }
+
+    @Test
     fun servfailMarkersExpireAndClear() {
         var now = 0L
         val cache = DnsResponseCache(maxEntries = 2, nowMs = { now })
