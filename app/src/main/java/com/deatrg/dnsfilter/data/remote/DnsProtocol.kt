@@ -7,6 +7,16 @@ data class DnsQuestion(
     val questionEndOffset: Int = 0
 )
 
+/**
+ * 复用型查询解析输出槽（单线程 Reader 复用，消除每包分配 [Pair] 与 [DnsQuestion]）。
+ */
+internal class MutableDnsQuestion {
+    var domain: String = ""
+    var qtype: Int = 0
+    var qclass: Int = 0
+    var questionEndOffset: Int = 0
+}
+
 internal const val POSITIVE_DNS_MIN_TTL_SECONDS = 60L * 60L
 internal const val POSITIVE_DNS_MAX_TTL_SECONDS = 6L * 60L * 60L
 internal const val BLOCKED_DOMAIN_TTL_SECONDS = 24L * 60L * 60L
@@ -406,12 +416,19 @@ internal fun ageNegativeDnsTtlsInPlace(
  * Stamps every real RR TTL to [staleTtlSeconds] so RFC 8767 serve-stale answers
  * are cached downstream only briefly while a background refresh runs.
  */
-internal fun stampStaleTtlsInPlace(response: ByteArray, staleTtlSeconds: Long = STALE_DNS_TTL_SECONDS): Boolean {
-    if (response.size < DNS_HEADER_SIZE) return false
-    val end = response.size
-    val questionCount = readUInt16(response, 4)
-    val recordCount = readUInt16(response, 6) + readUInt16(response, 8) + readUInt16(response, 10)
-    var offset = DNS_HEADER_SIZE
+internal fun stampStaleTtlsInPlace(
+    response: ByteArray,
+    staleTtlSeconds: Long = STALE_DNS_TTL_SECONDS,
+    dnsStart: Int = 0,
+    dnsLength: Int = response.size - dnsStart
+): Boolean {
+    if (dnsLength < DNS_HEADER_SIZE) return false
+    val end = dnsStart + dnsLength
+    val questionCount = readUInt16(response, dnsStart + 4)
+    val recordCount = readUInt16(response, dnsStart + 6) +
+        readUInt16(response, dnsStart + 8) +
+        readUInt16(response, dnsStart + 10)
+    var offset = dnsStart + DNS_HEADER_SIZE
     repeat(questionCount) {
         offset = (skipDnsName(response, offset, end) ?: return false) + 4
         if (offset > end) return false
@@ -433,26 +450,21 @@ internal fun stampStaleTtlsInPlace(response: ByteArray, staleTtlSeconds: Long = 
     return touched
 }
 
-private fun readMessageName(data: ByteArray, start: Int, end: Int): Pair<String, Int>? {
+private fun readMessageNameString(data: ByteArray, start: Int, end: Int): String? {
     val name = acquireNameBuilder()
     name.setLength(0)
     var idx = start
-    var jumped = false
-    var nextOffset = start
     var jumps = 0
     while (idx < end) {
         val len = data[idx].toInt() and 0xFF
         if (len == 0) {
-            if (!jumped) nextOffset = idx + 1
             break
         }
         if ((len and 0xC0) == 0xC0) {
             if (idx + 1 >= end) return null
             val pointer = ((len and 0x3F) shl 8) or (data[idx + 1].toInt() and 0xFF)
             if (pointer >= end) return null
-            if (!jumped) nextOffset = idx + 2
             idx = pointer
-            jumped = true
             jumps++
             if (jumps > 8) return null
             continue
@@ -462,10 +474,47 @@ private fun readMessageName(data: ByteArray, start: Int, end: Int): Pair<String,
         if (name.isNotEmpty()) name.append('.')
         appendLowercaseAscii(name, data, idx, len)
         idx += len
-        if (!jumped) nextOffset = idx
     }
     if (name.isEmpty()) return null
-    return Pair(name.toString(), nextOffset)
+    return name.toString()
+}
+
+/**
+ * Checks whether any CNAME target in the answer section matches [predicate]
+ * without allocating a temporary list. Capped to [maxTargets] against hostile chains.
+ */
+internal fun anyCnameTargetMatches(
+    response: ByteArray,
+    maxTargets: Int = 16,
+    predicate: (String) -> Boolean
+): Boolean {
+    if (response.size < DNS_HEADER_SIZE) return false
+    val end = response.size
+    val questionCount = readUInt16(response, 4)
+    val answerCount = readUInt16(response, 6)
+    if (answerCount == 0) return false
+    var offset = DNS_HEADER_SIZE
+    repeat(questionCount) {
+        offset = (skipDnsName(response, offset, end) ?: return false) + 4
+        if (offset > end) return false
+    }
+    var checked = 0
+    repeat(answerCount) {
+        val headerOffset = skipDnsName(response, offset, end) ?: return false
+        if (headerOffset + 10 > end) return false
+        val type = readUInt16(response, headerOffset)
+        val rdataLength = readUInt16(response, headerOffset + 8)
+        val rdataStart = headerOffset + 10
+        val nextOffset = rdataStart + rdataLength
+        if (nextOffset > end) return false
+        if (type == DNS_TYPE_CNAME && checked < maxTargets) {
+            checked++
+            val target = readMessageNameString(response, rdataStart, end)
+            if (target != null && predicate(target)) return true
+        }
+        offset = nextOffset
+    }
+    return false
 }
 
 /**
@@ -484,21 +533,24 @@ internal fun extractCnameTargets(response: ByteArray, maxTargets: Int = 16): Lis
         offset = (skipDnsName(response, offset, end) ?: return emptyList()) + 4
         if (offset > end) return emptyList()
     }
-    val targets = ArrayList<String>(4)
+    var targets: ArrayList<String>? = null
     repeat(answerCount) {
-        val headerOffset = skipDnsName(response, offset, end) ?: return targets
-        if (headerOffset + 10 > end) return targets
+        val headerOffset = skipDnsName(response, offset, end) ?: return targets ?: emptyList()
+        if (headerOffset + 10 > end) return targets ?: emptyList()
         val type = readUInt16(response, headerOffset)
         val rdataLength = readUInt16(response, headerOffset + 8)
         val rdataStart = headerOffset + 10
         val nextOffset = rdataStart + rdataLength
-        if (nextOffset > end) return targets
-        if (type == DNS_TYPE_CNAME && targets.size < maxTargets) {
-            readMessageName(response, rdataStart, end)?.let { targets.add(it.first) }
+        if (nextOffset > end) return targets ?: emptyList()
+        if (type == DNS_TYPE_CNAME && (targets?.size ?: 0) < maxTargets) {
+            readMessageNameString(response, rdataStart, end)?.let {
+                val list = targets ?: ArrayList<String>(4).also { targets = it }
+                list.add(it)
+            }
         }
         offset = nextOffset
     }
-    return targets
+    return targets ?: emptyList()
 }
 
 /**
@@ -680,22 +732,75 @@ fun parseDnsQueryFromPacket(
     dnsStart: Int,
     packetLength: Int
 ): DnsQuestion? {
-    if (packetLength - dnsStart < 12) return null
+    val out = MutableDnsQuestion()
+    return if (parseDnsQueryFromPacketInto(packet, dnsStart, packetLength, out)) {
+        DnsQuestion(out.domain, out.qtype, out.qclass, out.questionEndOffset)
+    } else {
+        null
+    }
+}
+
+/**
+ * 零分配解析 DNS 查询：直接填充 [out]，不创建 [Pair] 或 [DnsQuestion]。
+ */
+internal fun parseDnsQueryFromPacketInto(
+    packet: ByteArray,
+    dnsStart: Int,
+    packetLength: Int,
+    out: MutableDnsQuestion
+): Boolean {
+    if (packetLength - dnsStart < 12) return false
 
     val flags = ((packet[dnsStart + 2].toInt() and 0xFF) shl 8) or
             (packet[dnsStart + 3].toInt() and 0xFF)
     val qrBit = (flags shr 15) and 1
-    if (qrBit != 0) return null
+    if (qrBit != 0) return false
 
-    val nameResult = readDnsNameFromPacket(packet, dnsStart, dnsStart + 12, packetLength) ?: return null
-    // DNS names are normalized while parsing, so callers don't need to re-lowercase.
-    val domain = nameResult.first
-    val offset = nameResult.second
-    if (offset + 4 > packetLength) return null
+    val name = acquireNameBuilder()
+    name.setLength(0)
+    var idx = dnsStart + 12
+    var jumped = false
+    var nextOffset = idx
+    var jumps = 0
 
-    val qtype = ((packet[offset].toInt() and 0xFF) shl 8) or
-            (packet[offset + 1].toInt() and 0xFF)
-    val qclass = ((packet[offset + 2].toInt() and 0xFF) shl 8) or
-            (packet[offset + 3].toInt() and 0xFF)
-    return DnsQuestion(domain, qtype, qclass, offset + 4)
+    while (idx < packetLength) {
+        val len = packet[idx].toInt() and 0xFF
+        if (len == 0) {
+            if (!jumped) {
+                nextOffset = idx + 1
+            }
+            break
+        }
+        if ((len and 0xC0) == 0xC0) {
+            if (idx + 1 >= packetLength) return false
+            val pointer = ((len and 0x3F) shl 8) or (packet[idx + 1].toInt() and 0xFF)
+            if (!jumped) {
+                nextOffset = idx + 2
+            }
+            idx = dnsStart + pointer
+            jumped = true
+            jumps++
+            if (jumps > 8) return false
+            continue
+        }
+        idx++
+        if (idx + len > packetLength) return false
+        if (name.isNotEmpty()) name.append('.')
+        appendLowercaseAscii(name, packet, idx, len)
+        idx += len
+        if (!jumped) {
+            nextOffset = idx
+        }
+    }
+
+    if (name.isEmpty()) return false
+    if (nextOffset + 4 > packetLength) return false
+
+    out.domain = name.toString()
+    out.qtype = ((packet[nextOffset].toInt() and 0xFF) shl 8) or
+            (packet[nextOffset + 1].toInt() and 0xFF)
+    out.qclass = ((packet[nextOffset + 2].toInt() and 0xFF) shl 8) or
+            (packet[nextOffset + 3].toInt() and 0xFF)
+    out.questionEndOffset = nextOffset + 4
+    return true
 }

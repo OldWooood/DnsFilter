@@ -102,9 +102,12 @@ class DnsProtocolCacheTest {
     fun cnameTargetsAreExtractedLowercased() {
         val response = buildCnameResponse()
         assertEquals(listOf("target.example.com"), extractCnameTargets(response))
+        assertTrue(anyCnameTargetMatches(response) { it == "target.example.com" })
+        assertFalse(anyCnameTargetMatches(response) { it == "other.example.com" })
 
         val positive = buildPositiveResponse()
         assertEquals(emptyList<String>(), extractCnameTargets(positive))
+        assertFalse(anyCnameTargetMatches(positive) { true })
     }
 
     @Test
@@ -211,6 +214,43 @@ class DnsProtocolCacheTest {
         // 区外字节保持不变
         assertArrayEquals(ByteArray(28) { 0x7F }, packet.copyOfRange(0, 28))
         assertArrayEquals(ByteArray(11) { 0x7F }, packet.copyOfRange(dnsStart + payload.size, packet.size))
+    }
+
+    @Test
+    fun stampStaleRewritesOnlyTheEmbeddedMessageRegion() {
+        val payload = buildPositiveResponse()
+        val packet = ByteArray(28 + payload.size + 13) { 0x7F }
+        val dnsStart = 28
+        payload.copyInto(packet, dnsStart)
+        val expected = payload.copyOf()
+
+        assertTrue(stampStaleTtlsInPlace(packet, 30, dnsStart = dnsStart, dnsLength = payload.size))
+        assertTrue(stampStaleTtlsInPlace(expected, 30))
+
+        assertArrayEquals(expected, packet.copyOfRange(dnsStart, dnsStart + payload.size))
+        assertEquals(30L, readUInt32(packet, dnsStart + 35))
+        assertEquals(30L, readUInt32(packet, dnsStart + 51))
+        assertEquals(0x8000L, readUInt32(packet, dnsStart + 78))
+        assertArrayEquals(ByteArray(28) { 0x7F }, packet.copyOfRange(0, 28))
+        assertArrayEquals(ByteArray(13) { 0x7F }, packet.copyOfRange(dnsStart + payload.size, packet.size))
+    }
+
+    @Test
+    fun parseDnsQueryIntoMatchesAllocatingParser() {
+        val question = exampleQuestion()
+        val packet = ByteArray(28 + 12 + question.size)
+        val dnsStart = 28
+        writeUInt16(packet, dnsStart + 4, 1)
+        question.copyInto(packet, destinationOffset = dnsStart + 12)
+
+        val expected = parseDnsQueryFromPacket(packet, dnsStart, packet.size)
+        val reusable = MutableDnsQuestion()
+        assertTrue(parseDnsQueryFromPacketInto(packet, dnsStart, packet.size, reusable))
+
+        assertEquals(expected?.domain, reusable.domain)
+        assertEquals(expected?.qtype, reusable.qtype)
+        assertEquals(expected?.qclass, reusable.qclass)
+        assertEquals(expected?.questionEndOffset, reusable.questionEndOffset)
     }
 
     private fun buildQueryPacket(): ByteArray {

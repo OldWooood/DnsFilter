@@ -15,8 +15,9 @@ import com.deatrg.dnsfilter.data.remote.DnsQueryExecutor
 import com.deatrg.dnsfilter.data.remote.DnsQueryResult
 import com.deatrg.dnsfilter.data.remote.DnsQuestion
 import com.deatrg.dnsfilter.data.remote.DNS_RCODE_SERVFAIL
+import com.deatrg.dnsfilter.data.remote.MutableDnsQuestion
 import com.deatrg.dnsfilter.data.remote.minAnswerTtlSeconds
-import com.deatrg.dnsfilter.data.remote.parseDnsQueryFromPacket
+import com.deatrg.dnsfilter.data.remote.parseDnsQueryFromPacketInto
 import com.deatrg.dnsfilter.data.remote.patchBlockedNxDomainResponse
 import com.deatrg.dnsfilter.data.remote.patchDnsErrorResponse
 import com.deatrg.dnsfilter.data.remote.patchDnsResponseForClient
@@ -112,6 +113,8 @@ class DnsVpnService : VpnService() {
     // queries for cloaked ad domains answer NXDOMAIN without another upstream
     // round-trip. Bounded LRU; TTL-capped like ordinary DNS cache entries.
     private val cnameVerdictLock = Any()
+    @Volatile
+    private var hasCnameVerdicts = false
     private val cnameBlockedVerdicts =
         object : LinkedHashMap<String, Long>(256, 0.75f, true) {
             override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?): Boolean {
@@ -119,18 +122,27 @@ class DnsVpnService : VpnService() {
             }
         }
 
-    private fun isCnameBlockedCached(domain: String, nowMs: Long): Boolean = synchronized(cnameVerdictLock) {
-        val expiresAt = cnameBlockedVerdicts[domain] ?: return false
-        if (nowMs >= expiresAt) {
-            cnameBlockedVerdicts.remove(domain)
-            return false
+    // 单 Reader 线程复用解析输出槽，避免每次拦截或 L2 命中分配 Pair 与 DnsQuestion。
+    private val reusableQuestion = MutableDnsQuestion()
+
+    private fun isCnameBlockedCached(domain: String): Boolean {
+        if (!hasCnameVerdicts) return false
+        val nowMs = SystemClock.elapsedRealtime()
+        return synchronized(cnameVerdictLock) {
+            val expiresAt = cnameBlockedVerdicts[domain] ?: return false
+            if (nowMs >= expiresAt) {
+                cnameBlockedVerdicts.remove(domain)
+                if (cnameBlockedVerdicts.isEmpty()) hasCnameVerdicts = false
+                return false
+            }
+            true
         }
-        true
     }
 
     private fun rememberCnameBlocked(domain: String, ttlSeconds: Long, nowMs: Long) {
         synchronized(cnameVerdictLock) {
             cnameBlockedVerdicts[domain] = nowMs + ttlSeconds.coerceIn(60L, 7200L) * 1000L
+            hasCnameVerdicts = true
         }
     }
 
@@ -150,7 +162,7 @@ class DnsVpnService : VpnService() {
         val isIPv6: Boolean,
         val ipHeaderLength: Int,
         // Reader 线程已算好的 L2/in-flight key，worker 复用以避免重复拼串。
-        var cacheKeyHint: String? = null
+        val cacheKeyHint: String? = null
     )
 
     override fun onCreate() {
@@ -395,43 +407,37 @@ class DnsVpnService : VpnService() {
 
         val dnsStart = udpStart + PacketRewriter.UDP_HEADER_LENGTH
         if (length < dnsStart + DNS_HEADER_LENGTH) return true
-        val question = parseDnsQueryFromPacket(packet, dnsStart, length) ?: return true
-
-        val task = UpstreamTask(
-            packet = packet,
-            dnsStart = dnsStart,
-            dnsLength = length - dnsStart,
-            question = question,
-            srcPort = srcPort,
-            isIPv6 = isIPv6,
-            ipHeaderLength = headerLength
-        )
+        val parsed = reusableQuestion
+        if (!parseDnsQueryFromPacketInto(packet, dnsStart, length, parsed)) return true
+        val domain = parsed.domain
+        val qtype = parsed.qtype
+        val qclass = parsed.qclass
+        val questionEndOffset = parsed.questionEndOffset
 
         // 检查拦截；24 小时 SOA TTL 交由 Android Resolver 负缓存。
-        if (domainFilter?.isDomainBlocked(question.domain) == true) {
-            AppLog.d(TAG) { "Domain ${question.domain} is blocked" }
+        if (domainFilter?.isDomainBlocked(domain) == true) {
+            AppLog.d(TAG) { "Domain $domain is blocked" }
             statisticsBuffer?.recordQuery(blocked = true, responseTime = 0, includeInAvg = false)
-            val dnsResponseLength = patchBlockedNxDomainResponse(packet, dnsStart, question.questionEndOffset)
-            writePrebuiltResponseDirect(task, dnsResponseLength, writePacket)
+            val dnsResponseLength = patchBlockedNxDomainResponse(packet, dnsStart, questionEndOffset)
+            writePrebuiltResponseDirect(packet, isIPv6, headerLength, srcPort, dnsResponseLength, writePacket)
             return true
         }
 
-        // CNAME-cloaking 判决缓存：命中则直接 NXDOMAIN，跳过上游。
-        if (isCnameBlockedCached(question.domain, SystemClock.elapsedRealtime())) {
-            AppLog.d(TAG) { "Domain ${question.domain} is CNAME-cloak blocked (cached)" }
+        // CNAME-cloaking 判决缓存：命中则直接 NXDOMAIN，跳过上游（无条目时无锁无系统调用快速跳过）。
+        if (isCnameBlockedCached(domain)) {
+            AppLog.d(TAG) { "Domain $domain is CNAME-cloak blocked (cached)" }
             statisticsBuffer?.recordQuery(blocked = true, responseTime = 0, includeInAvg = false)
-            val dnsResponseLength = patchBlockedNxDomainResponse(packet, dnsStart, question.questionEndOffset)
-            writePrebuiltResponseDirect(task, dnsResponseLength, writePacket)
+            val dnsResponseLength = patchBlockedNxDomainResponse(packet, dnsStart, questionEndOffset)
+            writePrebuiltResponseDirect(packet, isIPv6, headerLength, srcPort, dnsResponseLength, writePacket)
             return true
         }
 
         // Cache key 只算一次，miss 时复用给 executor，避免重复拼串与二次 L2 查询。
         val executor = dnsQueryExecutor
-        val cacheKey = executor?.cacheKeyFor(question.domain, question.qtype, question.qclass)
+        val cacheKey = executor?.cacheKeyFor(domain, qtype, qclass)
         if (executor != null && cacheKey != null) {
-            // L2 命中快路径：应答单次拷贝就地写进 task.packet（TTL aging + TXID/RD
-            // 还原在副本上完成），热点临期条目同时触发后台预取。原实现先 patch 进
-            // 临时数组再 copyInto 包缓冲，每命中多一次全消息拷贝。
+            // L2 命中（含 Serve-Stale）快路径：应答单次拷贝就地写进 packet（TTL aging/stale stamp
+            // + TXID/RD 还原在副本上完成），热点临期或 stale 条目同时触发后台刷新。
             val servedLength = executor.serveCachedResponseForClient(
                 key = cacheKey,
                 query = packet,
@@ -440,37 +446,46 @@ class DnsVpnService : VpnService() {
                 dest = packet,
                 destOffset = dnsStart,
                 destCapacity = packet.size - dnsStart,
-                domain = question.domain,
+                domain = domain,
                 servers = servers,
-                qtype = question.qtype,
+                qtype = qtype,
                 cnameBlocklistCheck = cnameBlocklistCheck
             )
             if (servedLength != DnsQueryExecutor.CACHED_SERVE_MISS) {
                 statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
                 if (servedLength == DnsQueryExecutor.CACHED_SERVE_OVERFLOW) {
                     // 缓存应答塞不进包缓冲：与 sendDnsPayload 一致，回 TC=1。
-                    AppLog.d(TAG) { "DNS L2 cache hit too large: ${question.domain}" }
+                    AppLog.d(TAG) { "DNS L2 cache hit too large: $domain" }
                     val truncatedLength = patchDnsTruncatedResponse(
-                        packet, dnsStart, question.questionEndOffset
+                        packet, dnsStart, questionEndOffset
                     )
-                    writePrebuiltResponseDirect(task, truncatedLength, writePacket)
+                    writePrebuiltResponseDirect(packet, isIPv6, headerLength, srcPort, truncatedLength, writePacket)
                 } else {
-                    AppLog.d(TAG) { "DNS L2 cache hit: ${question.domain}" }
-                    writePrebuiltResponseDirect(task, servedLength, writePacket)
+                    AppLog.d(TAG) { "DNS L2 cache hit: $domain" }
+                    writePrebuiltResponseDirect(packet, isIPv6, headerLength, srcPort, servedLength, writePacket)
                 }
                 return true
             }
         }
 
-        // 先赋 hint 再入队：trySend 后 worker 可能在下一行执行前就把任务取走。
-        task.cacheKeyHint = cacheKey
+        // 仅在 L2 Miss 需送往上游队列时才分配 DnsQuestion 与 UpstreamTask。
+        val task = UpstreamTask(
+            packet = packet,
+            dnsStart = dnsStart,
+            dnsLength = length - dnsStart,
+            question = DnsQuestion(domain, qtype, qclass, questionEndOffset),
+            srcPort = srcPort,
+            isIPv6 = isIPv6,
+            ipHeaderLength = headerLength,
+            cacheKeyHint = cacheKey
+        )
         if (!upstreamQueue.trySend(task).isSuccess) {
             // Queue full: return SERVFAIL immediately instead of blocking the main loop
             statisticsBuffer?.recordQuery(blocked = false, responseTime = 0, includeInAvg = false)
             val dnsResponseLength = patchDnsErrorResponse(
-                packet, dnsStart, question.questionEndOffset, DNS_RCODE_SERVFAIL
+                packet, dnsStart, questionEndOffset, DNS_RCODE_SERVFAIL
             )
-            writePrebuiltResponseDirect(task, dnsResponseLength, writePacket)
+            writePrebuiltResponseDirect(packet, isIPv6, headerLength, srcPort, dnsResponseLength, writePacket)
             return true
         }
         return false
@@ -609,17 +624,20 @@ class DnsVpnService : VpnService() {
 
     /**
      * reader 线程直写版本：改写 IP/UDP 头后立即写入 TUN，省去 writer 协程的
-     * 一次调度唤醒；缓冲区仍归 reader 所有，由调用方回收。
+     * 一次调度唤醒，且无需构造 [UpstreamTask]；缓冲区仍归 reader 所有，由调用方回收。
      */
     private fun writePrebuiltResponseDirect(
-        task: UpstreamTask,
+        packet: ByteArray,
+        isIPv6: Boolean,
+        ipHeaderLength: Int,
+        srcPort: Int,
         dnsResponseLength: Int,
         writePacket: (ByteArray, Int) -> Unit
     ) {
         val responseLength = PacketRewriter.rewriteAsResponse(
-            task.packet, task.isIPv6, task.ipHeaderLength, task.srcPort, dnsResponseLength
+            packet, isIPv6, ipHeaderLength, srcPort, dnsResponseLength
         )
-        writePacket(task.packet, responseLength)
+        writePacket(packet, responseLength)
     }
 
     private fun createNotification(): Notification {

@@ -93,14 +93,21 @@ class DnsResponseCacheTest {
         assertEquals(true, stale?.stale)
         assertArrayEquals(byteArrayOf(1), stale?.response)
 
-        // Fresh entries are not reported as stale.
         now = 0L
         assertTrue(cache.put("fresh.example:1:1", byteArrayOf(2), 60, cache.generation()))
         assertNull(cache.getStale("fresh.example:1:1", windowMs))
+        val freshFromCombined = cache.getOrStale("fresh.example:1:1", windowMs)
+        assertNotNull(freshFromCombined)
+        assertEquals(false, freshFromCombined?.stale)
+
+        now = 61_000L
+        val staleFromCombined = cache.getOrStale("example.com:1:1", windowMs)
+        assertNotNull(staleFromCombined)
+        assertEquals(true, staleFromCombined?.stale)
 
         // Beyond the window the entry is evicted.
         now = 61_000L + windowMs + 1
-        assertNull(cache.getStale("example.com:1:1", windowMs))
+        assertNull(cache.getOrStale("example.com:1:1", windowMs))
         assertEquals(1, cache.size())
     }
 

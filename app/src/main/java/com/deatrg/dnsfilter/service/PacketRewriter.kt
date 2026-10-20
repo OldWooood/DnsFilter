@@ -120,33 +120,22 @@ internal object PacketRewriter {
         val udpLength = totalLength - IPV6_HEADER_LENGTH
 
         // 旧伪头部字序列 [0,0,lenHi,lenLo,0,0,0,17] 等价于这两个字。
-        var sum = udpLength and 0xFFFF
-        sum += 17
+        // MTU <= 8000，32 位 Int 累加全部 16 位字绝不会溢出，循环内无需进位分支，
+        // 仅在末尾一次性折叠高 16 位进位。
+        var sum = (udpLength and 0xFFFF) + 17
 
-        // src + dst（bytes 8..39）
+        // src + dst（bytes 8..39）与 UDP 头 + 载荷（bytes 40..totalLength）连续，合并单循环遍历
         var i = 8
-        while (i < IPV6_HEADER_LENGTH) {
-            sum += ((packet[i].toInt() and 0xFF) shl 8) or (packet[i + 1].toInt() and 0xFF)
-            if (sum > 0xFFFF) {
-                sum = (sum and 0xFFFF) + 1
-            }
-            i += 2
-        }
-
-        // UDP 头 + 载荷（bytes 40..totalLength，含奇数尾字节按高字节补齐）
-        i = IPV6_HEADER_LENGTH
         while (i + 1 < totalLength) {
             sum += ((packet[i].toInt() and 0xFF) shl 8) or (packet[i + 1].toInt() and 0xFF)
-            if (sum > 0xFFFF) {
-                sum = (sum and 0xFFFF) + 1
-            }
             i += 2
         }
         if (i < totalLength) {
             sum += (packet[i].toInt() and 0xFF) shl 8
-            if (sum > 0xFFFF) {
-                sum = (sum and 0xFFFF) + 1
-            }
+        }
+
+        while ((sum ushr 16) != 0) {
+            sum = (sum and 0xFFFF) + (sum ushr 16)
         }
 
         val checksum = sum.inv() and 0xFFFF
@@ -158,16 +147,13 @@ internal object PacketRewriter {
         var sum = 0
         var i = 0
         while (i < headerLength) {
-            if (i == 10) {
-                i += 2
-                continue
-            }
-            val word = ((packet[i].toInt() and 0xFF) shl 8) or (packet[i + 1].toInt() and 0xFF)
-            sum += word
-            if (sum > 0xFFFF) {
-                sum = (sum and 0xFFFF) + 1
+            if (i != 10) {
+                sum += ((packet[i].toInt() and 0xFF) shl 8) or (packet[i + 1].toInt() and 0xFF)
             }
             i += 2
+        }
+        while ((sum ushr 16) != 0) {
+            sum = (sum and 0xFFFF) + (sum ushr 16)
         }
         return sum.inv() and 0xFFFF
     }

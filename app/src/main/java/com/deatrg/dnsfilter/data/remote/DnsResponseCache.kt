@@ -79,6 +79,36 @@ internal class DnsResponseCache(
     }
 
     /**
+     * Returns a fresh hit, or if expired within [maxStaleMs], a stale hit
+     * (RFC 8767) in a SINGLE lock acquisition. Returns null on miss or when
+     * expired beyond [maxStaleMs] (which evicts the entry).
+     */
+    fun getOrStale(key: String, maxStaleMs: Long): Hit? = synchronized(lock) {
+        val entry = entries[key] ?: return@synchronized null
+        val now = nowMs()
+        if (now < entry.expiresAtMs) {
+            entry.hits++
+            return@synchronized Hit(
+                response = entry.response,
+                ageSeconds = ((now - entry.storedAtMs).coerceAtLeast(0L) + 999L) / 1000L,
+                stale = false,
+                kind = entry.kind,
+                prefetch = prefetchConditionLocked(entry, now)
+            )
+        }
+        if (now - entry.expiresAtMs > maxStaleMs) {
+            entries.remove(key)
+            return@synchronized null
+        }
+        Hit(
+            response = entry.response,
+            ageSeconds = ((now - entry.storedAtMs).coerceAtLeast(0L) + 999L) / 1000L,
+            stale = true,
+            kind = entry.kind
+        )
+    }
+
+    /**
      * Returns the entry even after expiry, as long as it expired less than
      * [maxStaleMs] ago. Returns null for fresh entries (use [get]) and for
      * entries beyond the stale window (which are evicted).

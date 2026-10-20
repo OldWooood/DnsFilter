@@ -15,7 +15,6 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.io.InputStream
 import java.net.DatagramPacket
@@ -26,8 +25,6 @@ import java.net.Socket
 import java.net.SocketTimeoutException
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.coroutines.resume
 
 class DnsQueryExecutor(
     private val socketProtector: ((DatagramSocket) -> Unit)? = null,
@@ -42,7 +39,7 @@ class DnsQueryExecutor(
         // retried over TCP (the kernel truncates oversized datagrams silently).
         private const val DNS_RESPONSE_BUFFER_SIZE = 4096
         private const val UDP_SOCKET_POOL_SIZE = 64
-        private const val PREWARM_SOCKETS_PER_SERVER = 4
+        private const val PREWARM_SOCKETS_PER_SERVER = 8
         private val STALE_WINDOW_MS = STALE_DNS_MAX_WINDOW_SECONDS * 1000L
         private const val PREFETCH_GUARD_MS = 30_000L
         /** Default per-server upstream timeout for foreground queries and prefetch refreshes. */
@@ -54,7 +51,7 @@ class DnsQueryExecutor(
         // for refresh/prefetch races (32 × 3 = 96, +32 headroom).
         private const val UPSTREAM_IO_PARALLELISM = 128
         /** Blocked upstream reads poll for cancellation on this slice. */
-        private const val CANCEL_CHECK_INTERVAL_MS = 200L
+        private const val CANCEL_CHECK_INTERVAL_MS = 50L
 
         /** [serveCachedResponseForClient] result: no fresh cache entry (miss). */
         const val CACHED_SERVE_MISS = -1
@@ -165,14 +162,14 @@ class DnsQueryExecutor(
         require(destOffset in 0..dest.size && destCapacity in 0..(dest.size - destOffset)) {
             "dest window too small: offset=$destOffset capacity=$destCapacity size=${dest.size}"
         }
-        val cached = responseCache.get(key) ?: return CACHED_SERVE_MISS
+        val cached = responseCache.getOrStale(key, STALE_WINDOW_MS) ?: return CACHED_SERVE_MISS
         val payload = cached.response
 
-        // Prefetch BEFORE the overflow exit: the old reader path prefetched on
-        // every hit regardless of answer size, and the refresh snapshot-copies
-        // the request bytes synchronously before any possible dest overwrite.
-        if (cached.prefetch) {
-            AppLog.d(TAG) { "DNS prefetch: domain=$domain qtype=$qtype" }
+        // Prefetch or stale refresh BEFORE the overflow exit: the old reader path
+        // prefetched on every hit regardless of answer size, and the refresh
+        // snapshot-copies the request bytes synchronously before any possible dest overwrite.
+        if (cached.stale || cached.prefetch) {
+            AppLog.d(TAG) { "DNS background refresh (stale=${cached.stale}): domain=$domain qtype=$qtype" }
             refreshInBackground(key, domain, servers, query, queryOffset, queryLength,
                 qtype, DEFAULT_QUERY_TIMEOUT_MS, cnameBlocklistCheck)
         }
@@ -189,6 +186,9 @@ class DnsQueryExecutor(
             ageNegativeDnsTtlsInPlace(dest, cached.ageSeconds, destOffset, payload.size)
         } else {
             agePositiveDnsTtlsInPlace(dest, cached.ageSeconds, destOffset, payload.size)
+        }
+        if (cached.stale) {
+            stampStaleTtlsInPlace(dest, STALE_DNS_TTL_SECONDS, destOffset, payload.size)
         }
         dest[destOffset] = transactionId0
         dest[destOffset + 1] = transactionId1
@@ -462,7 +462,7 @@ class DnsQueryExecutor(
                 when {
                     rcode == 0 && answerCount > 0 -> {
                         if (cnameBlocklistCheck != null &&
-                            extractCnameTargets(responseBytes).any { cnameBlocklistCheck(it) }
+                            anyCnameTargetMatches(responseBytes, predicate = cnameBlocklistCheck)
                         ) {
                             AppLog.d(TAG) { "DNS CNAME-cloaked block: domain=$domain qtype=$qtype" }
                             return DnsQueryResult(
@@ -543,53 +543,31 @@ class DnsQueryExecutor(
     ): DnsQueryResult = withContext(upstreamIo) {
         val endpoint = resolveServerEndpoint(serverAddress)
         val wrapper = acquireUdpSocket(serverAddress, endpoint)
-        val completed = AtomicBoolean(false)
         // Cancellation signal for the blocked receive: this withContext job is
         // a child of the race leg, so it turns inactive when the leg loses.
         val raceJob = currentCoroutineContext()[Job]
 
         try {
-            suspendCancellableCoroutine { continuation ->
-                continuation.invokeOnCancellation {
-                    // Lost the race: do NOT close the pooled socket. The blocked
-                    // receive returns at its next cancel-poll slice and hands the
-                    // socket back to the pool; any late datagram is drained by the
-                    // next receive loop via question-section matching.
-                    completed.set(true)
-                }
+            wrapper.requestPacket.setData(request, requestOffset, requestLength)
+            wrapper.socket.send(wrapper.requestPacket)
 
-                val result = try {
-                    wrapper.requestPacket.setData(request, requestOffset, requestLength)
-                    wrapper.socket.send(wrapper.requestPacket)
-
-                    receiveMatchingResponse(
-                        wrapper, request, requestOffset, requestLength, endpoint, timeoutMs, raceJob
-                    )
-                } catch (e: Exception) {
-                    wrapper.isValid = false
-                    closeUdpSocket(wrapper)
-                    // 失效端点缓存：hostname 型服务器换地址后，下一次查询会重新解析。
-                    invalidateServerEndpoint(serverAddress)
-                    DnsQueryResult(false, null, 0, e.message)
-                }
-
-                if (completed.compareAndSet(false, true)) {
-                    releaseUdpSocket(serverAddress, wrapper)
-                    if (continuation.isActive) {
-                        continuation.resume(result)
-                    }
-                } else {
-                    // Cancelled while blocked, but the socket survived: hand it back.
-                    releaseUdpSocket(serverAddress, wrapper)
-                }
-            }
+            receiveMatchingResponse(
+                wrapper, request, requestOffset, requestLength, endpoint, timeoutMs, raceJob
+            )
         } catch (e: CancellationException) {
-            // 已取消且 block 从未运行（acquire 与挂起点注册之间的窗口）：
-            // socket 尚未使用也尚未归还，直接关闭，别靠 GC finalizer 兜底。
-            if (completed.compareAndSet(false, true)) {
-                closeUdpSocket(wrapper)
-            }
             throw e
+        } catch (e: Exception) {
+            wrapper.isValid = false
+            closeUdpSocket(wrapper)
+            // 失效端点缓存：hostname 型服务器换地址后，下一次查询会重新解析。
+            invalidateServerEndpoint(serverAddress)
+            DnsQueryResult(false, null, 0, e.message)
+        } finally {
+            // Lost the race or completed normally: do NOT close a valid pooled socket.
+            // The blocked receive returns at its next cancel-poll slice and hands the
+            // socket back to the pool; any late datagram is drained by the next receive
+            // loop via question-section matching.
+            releaseUdpSocket(serverAddress, wrapper)
         }
     }
 
