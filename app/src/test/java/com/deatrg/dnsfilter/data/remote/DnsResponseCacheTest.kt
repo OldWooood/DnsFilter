@@ -152,6 +152,21 @@ class DnsResponseCacheTest {
     }
 
     @Test
+    fun expiredServfailMarkersArePrunedUnderPressure() {
+        var now = 0L
+        val cache = DnsResponseCache(maxEntries = 2, nowMs = { now })
+
+        repeat(3_000) { i -> cache.putServfail("down$i:1:1", 10) }
+
+        now = 11_000L
+        // This insert exceeds the marker bound and prunes every expired row.
+        cache.putServfail("fresh:1:1", 10)
+
+        assertFalse(cache.isServfailCached("down0:1:1"))
+        assertTrue(cache.isServfailCached("fresh:1:1"))
+    }
+
+    @Test
     fun hotNearExpiryEntriesHintPrefetch() {
         var now = 0L
         val cache = DnsResponseCache(maxEntries = 2, nowMs = { now })

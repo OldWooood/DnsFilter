@@ -16,6 +16,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.InputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -33,15 +34,23 @@ class DnsQueryExecutor(
 
     companion object {
         private const val TAG = "DnsQueryExecutor"
-        private const val DNS_RESPONSE_CACHE_SIZE = 4096
+        // 8192 entries: a phone can touch several thousand distinct names per
+        // day (apps, ads, CDNs); the extra headroom keeps LRU eviction from
+        // turning repeated names into upstream round-trips.
+        private const val DNS_RESPONSE_CACHE_SIZE = 8192
         // 4096: covers any answer the client could have advertised via EDNS;
         // anything filling it completely is treated as suspect-truncated and
         // retried over TCP (the kernel truncates oversized datagrams silently).
         private const val DNS_RESPONSE_BUFFER_SIZE = 4096
         private const val UDP_SOCKET_POOL_SIZE = 64
-        private const val PREWARM_SOCKETS_PER_SERVER = 8
+        // 16 per server covers a typical cold-cache burst (two enabled servers
+        // x 16 = 32 concurrent sends) so workers rarely pay create + protect()
+        // on the query path.
+        private const val PREWARM_SOCKETS_PER_SERVER = 16
         private val STALE_WINDOW_MS = STALE_DNS_MAX_WINDOW_SECONDS * 1000L
         private const val PREFETCH_GUARD_MS = 30_000L
+        /** Bound the per-domain refresh guard map; entries older than the guard are prunable. */
+        private const val MAX_REFRESH_GUARD_ENTRIES = 8192
         /** Default per-server upstream timeout for foreground queries and prefetch refreshes. */
         const val DEFAULT_QUERY_TIMEOUT_MS = 3000L
         // Blocked upstream receives park a thread each (workers x servers in
@@ -65,6 +74,13 @@ class DnsQueryExecutor(
         private const val IDLE_CHECK_INTERVAL_MS = 200L
         /** How long a leg polls at [CANCEL_CHECK_INTERVAL_MS] before backing off. */
         private const val CANCEL_FAST_POLL_WINDOW_MS = 500L
+        /**
+         * After one upstream returns SERVFAIL, keep the race open briefly for a
+         * healthier server. Returning the first SERVFAIL immediately would
+         * discard an answer that is only a few ms slower, and the client would
+         * retry the whole lookup seconds later.
+         */
+        private const val SERVFAIL_RACE_GRACE_MS = 500L
 
         /** [serveCachedResponseForClient] result: no fresh or stale cache entry (miss). */
         const val CACHED_SERVE_MISS = -1
@@ -76,8 +92,12 @@ class DnsQueryExecutor(
     }
 
     // Each server reuses a small UDP socket pool to avoid repeated create/protect cost.
+    // [generation] pins a socket to the network it was connected on: after a
+    // default-network change the pools are rebuilt and old wrappers are closed
+    // instead of being parked in the new pool with a stale route.
     private class ReusableUdpSocket(
         val socket: DatagramSocket,
+        val generation: Long,
         val responseBuffer: ByteArray = ByteArray(DNS_RESPONSE_BUFFER_SIZE)
     ) {
         val requestPacket: DatagramPacket = DatagramPacket(ByteArray(0), 0)
@@ -113,6 +133,8 @@ class DnsQueryExecutor(
     )
 
     private val udpSocketPools = ConcurrentHashMap<String, UdpSocketPool>()
+    @Volatile
+    private var socketGeneration = 0L
     @Volatile
     private var isShutdown = false
     private val serverEndpoints = ConcurrentHashMap<String, ServerEndpoint>()
@@ -367,6 +389,13 @@ class DnsQueryExecutor(
         synchronized(refreshGuardLock) {
             if (now - (lastRefreshMs[queryKey] ?: 0L) < PREFETCH_GUARD_MS) return
             lastRefreshMs[queryKey] = now
+            if (lastRefreshMs.size > MAX_REFRESH_GUARD_ENTRIES) {
+                // Long uptime with many stale hits: drop expired guard rows so
+                // the map tracks recent refreshes instead of every domain ever seen.
+                lastRefreshMs.entries.removeIf { (_, timestamp) ->
+                    now - timestamp >= PREFETCH_GUARD_MS
+                }
+            }
         }
         // The caller's packet buffer is recycled; copy the DNS question for the refresh.
         val bytes = query.copyOfRange(queryOffset, queryOffset + queryLength)
@@ -405,7 +434,9 @@ class DnsQueryExecutor(
                     val pool = udpSocketPools.getOrPut(server.address) { UdpSocketPool() }
                     repeat((perServer - pool.sockets.size).coerceAtLeast(0)) {
                         val wrapper = createUdpSocket(endpoint)
-                        if (!pool.sockets.offer(wrapper)) {
+                        // A network change may have reset the pools while we were
+                        // creating this socket; never park a stale-route socket.
+                        if (wrapper.generation != socketGeneration || !pool.sockets.offer(wrapper)) {
                             closeUdpSocket(wrapper)
                         }
                     }
@@ -436,10 +467,16 @@ class DnsQueryExecutor(
         val legs = servers.map { server ->
             raceScope.launch {
                 val startTime = monotonicNowMs()
+                // 直接跑在 raceScope(upstreamIo) 上：queryPlainDns/queryTcpDns 是阻塞
+                // 实现，不再各自 withContext(upstreamIo) 多一次调度；腿自身的 Job
+                // 就是阻塞 receive 轮询的取消信号。
+                val legJob = currentCoroutineContext()[Job]
                 // 单个服务器失败（地址非法/无法解析/连接错误）转成该服务器的失败结果，
                 // 不炸掉整个竞速，让其余服务器继续参与。
                 val result = try {
-                    val udpResult = queryPlainDns(query, queryOffset, queryLength, server.address, timeoutMs)
+                    val udpResult = queryPlainDns(
+                        query, queryOffset, queryLength, server.address, timeoutMs, legJob
+                    )
                     if (udpResult.success && udpResult.responseBytes != null &&
                         (isTruncatedResponse(udpResult.responseBytes) || udpResult.udpBufferSaturated)
                     ) {
@@ -447,7 +484,8 @@ class DnsQueryExecutor(
                         // filled (kernel truncates oversized datagrams silently):
                         // retry the same server over TCP.
                         val tcpResult = queryTcpDns(
-                            query, queryOffset, queryLength, server.address, DNS_TCP_TIMEOUT_MS.toLong()
+                            query, queryOffset, queryLength, server.address,
+                            DNS_TCP_TIMEOUT_MS.toLong(), legJob
                         )
                         if (tcpResult.success) tcpResult
                         else DnsQueryResult(false, null, 0, "Truncated, TCP fallback failed")
@@ -465,9 +503,21 @@ class DnsQueryExecutor(
 
         try {
             var firstError: String? = null
+            // SERVFAIL 不是可用答案：先扣住，给其他服务器一个短暂的窗口。
+            // 否则一台快速失败的服务器会击败只慢几毫秒的健康服务器，客户端
+            // 只能整轮重试（通常以秒计）。窗口结束仍无好答案才回退它。
+            var servfailFallback: ServerQueryOutcome? = null
+            var servfailGraceDeadlineMs: Long? = null
             var pending = legs.size
             while (pending > 0) {
-                val outcome = outcomes.receive()
+                val receiveTimeoutMs = servfailGraceDeadlineMs?.let {
+                    (it - monotonicNowMs()).coerceAtLeast(0L)
+                }
+                val outcome = if (receiveTimeoutMs != null) {
+                    withTimeoutOrNull(receiveTimeoutMs) { outcomes.receive() } ?: break
+                } else {
+                    outcomes.receive()
+                }
                 pending--
                 val responseBytes = outcome.result.responseBytes
 
@@ -528,20 +578,33 @@ class DnsQueryExecutor(
                         )
                     }
                     rcode == 2 -> {
-                        // Upstream SERVFAIL: hand the real answer to this client but
-                        // short-circuit repeats briefly (RFC 9520).
-                        responseCache.putServfail(queryKey, SERVFAIL_CACHE_TTL_SECONDS)
-                        return DnsQueryResult(
-                            success = true,
-                            responseBytes = responseBytes,
-                            responseTime = outcome.elapsedMs,
-                            error = null
-                        )
+                        // Hold the first SERVFAIL as a fallback instead of letting
+                        // it win the race; a healthy server may still answer.
+                        if (servfailFallback == null) {
+                            servfailFallback = outcome
+                            servfailGraceDeadlineMs =
+                                monotonicNowMs() + SERVFAIL_RACE_GRACE_MS
+                        }
                     }
                     else -> {
                         if (firstError == null) firstError = "Upstream rcode=$rcode"
                     }
                 }
+            }
+
+            servfailFallback?.let { fallback ->
+                // No server produced a usable answer inside the grace window:
+                // return the real SERVFAIL response and briefly fail fast.
+                AppLog.e(TAG) {
+                    "DNS SERVFAIL fallback: domain=$domain qtype=$qtype server=${fallback.server.name}"
+                }
+                responseCache.putServfail(queryKey, SERVFAIL_CACHE_TTL_SECONDS)
+                return DnsQueryResult(
+                    success = true,
+                    responseBytes = fallback.result.responseBytes,
+                    responseTime = fallback.elapsedMs,
+                    error = null
+                )
             }
 
             AppLog.e(TAG) { "DNS failed: domain=$domain qtype=$qtype error=$firstError" }
@@ -559,20 +622,24 @@ class DnsQueryExecutor(
         }
     }
 
-    private suspend fun queryPlainDns(
+    /**
+     * Blocking UDP lookup. Runs directly on the race leg (raceScope already uses
+     * upstreamIo), so it deliberately avoids an extra withContext dispatch per
+     * leg. [raceJob] is the leg's own Job: once the leg loses the race it turns
+     * inactive and [receiveMatchingResponse] exits on its next poll slice.
+     */
+    private fun queryPlainDns(
         request: ByteArray,
         requestOffset: Int,
         requestLength: Int,
         serverAddress: String,
-        timeoutMs: Long
-    ): DnsQueryResult = withContext(upstreamIo) {
+        timeoutMs: Long,
+        raceJob: Job?
+    ): DnsQueryResult {
         val endpoint = resolveServerEndpoint(serverAddress)
         val wrapper = acquireUdpSocket(serverAddress, endpoint)
-        // Cancellation signal for the blocked receive: this withContext job is
-        // a child of the race leg, so it turns inactive when the leg loses.
-        val raceJob = currentCoroutineContext()[Job]
 
-        try {
+        return try {
             wrapper.requestPacket.setData(request, requestOffset, requestLength)
             wrapper.socket.send(wrapper.requestPacket)
 
@@ -675,49 +742,55 @@ class DnsQueryExecutor(
      * TCP leg observes cancellation shortly after the race ends instead of
      * pinning its thread for the full timeout.
      */
-    private suspend fun queryTcpDns(
+    private fun queryTcpDns(
         request: ByteArray,
         requestOffset: Int,
         requestLength: Int,
         serverAddress: String,
-        timeoutMs: Long
-    ): DnsQueryResult = withContext(upstreamIo) {
+        timeoutMs: Long,
+        raceJob: Job?
+    ): DnsQueryResult {
         var socket: Socket? = null
-        val raceJob = currentCoroutineContext()[Job]
-        try {
+        return try {
             val endpoint = resolveServerEndpoint(serverAddress)
             socket = Socket()
             tcpSocketProtector?.invoke(socket)
+            // Nagle would hold the payload behind the 2-byte length until its
+            // ACK arrives (delayed-ACK ~40 ms) on this one-shot request.
+            socket.tcpNoDelay = true
             socket.connect(InetSocketAddress(endpoint.address, endpoint.port), timeoutMs.toInt())
 
             val startMs = monotonicNowMs()
             val deadlineMs = startMs + timeoutMs
             val out = socket.getOutputStream()
-            out.write((requestLength shr 8) and 0xFF)
-            out.write(requestLength and 0xFF)
-            out.write(request, requestOffset, requestLength)
+            // One write: RFC 7766 length prefix + message, no Nagle interaction.
+            val framed = ByteArray(2 + requestLength)
+            framed[0] = ((requestLength shr 8) and 0xFF).toByte()
+            framed[1] = (requestLength and 0xFF).toByte()
+            System.arraycopy(request, requestOffset, framed, 2, requestLength)
+            out.write(framed)
             out.flush()
 
             val input = socket.getInputStream()
             val lengthBytes = ByteArray(2)
             if (!readTcpFully(input, lengthBytes, 0, 2, socket, startMs, deadlineMs, raceJob)) {
-                return@withContext DnsQueryResult(
+                return DnsQueryResult(
                     false, null, 0, tcpReadFailure("TCP framing", raceJob, deadlineMs)
                 )
             }
             val responseLength =
                 ((lengthBytes[0].toInt() and 0xFF) shl 8) or (lengthBytes[1].toInt() and 0xFF)
             if (responseLength < 12 || responseLength > 65535) {
-                return@withContext DnsQueryResult(false, null, 0, "Bad TCP DNS length")
+                return DnsQueryResult(false, null, 0, "Bad TCP DNS length")
             }
             val responseBytes = ByteArray(responseLength)
             if (!readTcpFully(input, responseBytes, 0, responseLength, socket, startMs, deadlineMs, raceJob)) {
-                return@withContext DnsQueryResult(
+                return DnsQueryResult(
                     false, null, 0, tcpReadFailure("TCP body", raceJob, deadlineMs)
                 )
             }
             if (!isValidDnsResponse(request, requestOffset, requestLength, responseBytes)) {
-                return@withContext DnsQueryResult(false, null, 0, "Mismatched DNS response")
+                return DnsQueryResult(false, null, 0, "Mismatched DNS response")
             }
             DnsQueryResult(success = true, responseBytes = responseBytes, responseTime = 0, error = null)
         } catch (e: SocketTimeoutException) {
@@ -839,6 +912,11 @@ class DnsQueryExecutor(
             closeUdpSocket(wrapper)
             return
         }
+        // 跨默认网络切换的旧 socket：路由可能已失效，关闭而不是回池。
+        if (wrapper.generation != socketGeneration) {
+            closeUdpSocket(wrapper)
+            return
+        }
 
         val pool = udpSocketPools.getOrPut(serverAddress) { UdpSocketPool() }
         if (!pool.sockets.offer(wrapper)) {
@@ -850,7 +928,7 @@ class DnsQueryExecutor(
         val socket = DatagramSocket()
         socketProtector?.invoke(socket)
         socket.connect(endpoint.address, endpoint.port)
-        return ReusableUdpSocket(socket)
+        return ReusableUdpSocket(socket, socketGeneration)
     }
 
     private fun closeUdpSocket(wrapper: ReusableUdpSocket) {
@@ -922,15 +1000,33 @@ class DnsQueryExecutor(
         responseCache.clear()
         // Requests started on the old network must not be joined by new callers.
         inFlightQueries.clear()
+        // 缓存已清空，旧的预取防抖记录不再有意义；及时释放域名 key。
+        lastRefreshMs.clear()
     }
 
     /**
      * Soft invalidation for default-network transitions: in-flight joins are
      * dropped, but L2 entries are KEPT so expired rows can serve stale
      * (RFC 8767) while a background refresh repopulates the cache.
+     *
+     * Connected UDP sockets cache their route at connect() time, so idle
+     * pooled sockets from the old network are closed and rebuilt. Wrappers
+     * still held by in-flight legs fail the [socketGeneration] check on
+     * release and are closed too.
      */
     fun onDefaultNetworkChanged() {
         inFlightQueries.clear()
+        socketGeneration++
+        val stalePools = udpSocketPools.values.toList()
+        udpSocketPools.clear()
+        stalePools.forEach { pool ->
+            while (true) {
+                val wrapper = pool.sockets.poll() ?: break
+                closeUdpSocket(wrapper)
+            }
+        }
+        // hostname 型上游在新网络下可能解析到不同地址。
+        serverEndpoints.clear()
     }
 }
 

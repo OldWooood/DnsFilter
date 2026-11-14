@@ -37,7 +37,7 @@ app/src/main/java/com/deatrg/dnsfilter/
 │   │   └── StatisticsBuffer.kt         # In-memory stats buffer to reduce disk I/O
 │   ├── remote/
 │   │   ├── DnsQueryExecutor.kt         # L2 cache, UDP racing + TCP fallback, TTL rewriting
-│   │   ├── DnsResponseCache.kt         # 4,096-entry LRU: positive + negative + SERVFAIL + serve-stale + prefetch
+│   │   ├── DnsResponseCache.kt         # 8,192-entry LRU: positive + negative + SERVFAIL + serve-stale + prefetch
 │   │   └── DomainFilter.kt             # Loads blocklists, checks domains, supports AdAway format
 │   ├── repository/
 │   │   ├── DnsServerRepositoryImpl.kt
@@ -100,13 +100,13 @@ APKs are output to `app/build/outputs/apk/`. The build produces split APKs by AB
 4. The app excludes itself from the VPN (`addDisallowedApplication`) to avoid routing loops.
 5. Packets are read from the VPN `ParcelFileDescriptor`, parsed (IPv4/IPv6 → UDP → DNS payload), and processed.
 6. If the domain is blocked, an `NXDOMAIN` response with a 24-hour SOA negative TTL is returned immediately.
-7. Allowed queries check a 4,096-entry LRU cache (positive + RFC 2308 negative + RFC 9520 SERVFAIL markers); fresh hits return correctly aged remaining TTLs.
+7. Allowed queries check an 8,192-entry LRU cache (positive + RFC 2308 negative + RFC 9520 SERVFAIL markers); fresh hits return correctly aged remaining TTLs.
 8. Matching concurrent cache misses are coalesced while they are in flight.
-9. Misses are forwarded concurrently to all enabled upstream DNS servers; the first successful response is used. Truncated (TC=1) UDP answers — and datagrams that fill the entire 4,096-byte receive buffer — are retried over TCP to the same server (RFC 7766).
+9. Misses are forwarded concurrently to all enabled upstream DNS servers; the first successful response is used. A fast SERVFAIL is held as a fallback for a 500 ms grace window so a healthy server that is only slightly slower can still win; if nothing better arrives, the real SERVFAIL is returned and marker-cached (RFC 9520). Truncated (TC=1) UDP answers — and datagrams that fill the entire 4,096-byte receive buffer — are retried over TCP to the same server (RFC 7766).
 10. Fresh AND expired (within 3 days) entries are served directly on the reader thread by `DnsQueryExecutor.serveCachedResponseForClient` (one copy into the client packet buffer). Expired answers are RFC 8767 stale-stamped with a 30s TTL — negative answers also stamp the SOA MINIMUM so RFC 2308 downstream caching honors that window — while a background refresh repopulates the cache; hot near-expiry entries trigger Unbound-style prefetch. The worker path always uses `skipCacheLookup`. Stale serving also covers default-network transitions, which no longer clear the cache.
 11. Positive response TTLs are clamped per qtype (A/AAAA: 1–6 hours; others: 10min–2h) and cached by both the app L2 and Android Resolver L1.
 12. Positive answers whose CNAME chain hits the blocklist are answered `NXDOMAIN` instead, and the QNAME verdict is remembered (TTL-capped, max 2h) so repeats skip upstream.
-13. L2 is cleared on upstream-server changes; on default-network changes only in-flight joins are dropped while entries are kept for stale-serve.
+13. L2 is cleared only when the enabled upstream address set changes (renaming/reordering servers keeps it); on default-network changes in-flight joins are dropped, entries are kept for stale-serve, and the idle UDP socket pools plus cached server endpoints are rebuilt because connected UDP sockets pin the old route.
 
 ### Domain Filtering
 - Blocklists use the **AdAway/hosts file format**: lines like `0.0.0.0 domain.com` or `127.0.0.1 domain.com`.
@@ -135,7 +135,8 @@ APKs are output to `app/build/outputs/apk/`. The build produces split APKs by AB
 - `DnsVpnService` serializes start/stop through `lifecycleMutex`; the service `scope` is never cancelled, only individual jobs are (fast off→on toggles must keep working).
 - Matching in-flight L2 misses share one logical lookup; `DnsQueryExecutor` still sends that lookup concurrently to every enabled server.
 - Race legs run on an executor-owned `raceScope`, NOT the caller's structured scope. The first successful answer must return immediately, and a loser blocked in `socket.receive()` would otherwise gate delivery (`coroutineScope`/structured concurrency awaits all children, including cancelled ones — `queryUpstream` no longer wraps the race in it). The race cancels its remaining legs on the way out; they exit at the next cancel-poll slice. Do not cancel `raceScope` in `shutdown()`: the non-cancellable drain still runs queued queries and would hang waiting for legs.
-- UDP sockets that lose a race are NOT destroyed: the blocked receive exits at the next cancel-poll slice (50 ms during the first 500 ms, then 200 ms) after the race is lost (or when its own response/deadline arrives) and returns the socket to the pool. Stale datagrams are rejected by DNS question-section matching (`dnsQuestionSectionMatches`); sockets are only closed on send/IO errors or shutdown. Do not close pooled sockets on cancellation.
+- UDP sockets that lose a race are NOT destroyed: the blocked receive exits at the next cancel-poll slice (50 ms during the first 500 ms, then 200 ms) after the race is lost (or when its own response/deadline arrives) and returns the socket to the pool. Stale datagrams are rejected by DNS question-section matching (`dnsQuestionSectionMatches`); sockets are only closed on send/IO errors, network-generation changes, or shutdown. Do not close pooled sockets on cancellation.
+- Connected UDP sockets pin the route of the network they were connected on. `onDefaultNetworkChanged()` advances `socketGeneration`, drains/clears the idle pools and cached endpoints, and drops wrappers still held by in-flight legs when they are released; prewarm then refills the pools (16 sockets per server).
 - Blocking upstream receives (UDP/TCP + background refreshes) run on a `Dispatchers.IO.limitedParallelism(128)` view (`upstreamIo` in `DnsQueryExecutor`). IO views are elastic, so the bound only sizes the worst-case thread count; keep it above `slowWorkerCount × enabled servers` plus refresh headroom. Blocked receives poll for cancellation on adaptive slices (50 ms for the first 500 ms, then 200 ms) so losing race legs release threads promptly without waking healthy slow queries 20 times per second.
 - Per-server failures (invalid address, unresolvable hostname, connect/send errors) are caught inside the race in `queryUpstream` and become that server's failed attempt; one broken server never fails the whole race. `CancellationException` must be rethrown, not swallowed, by this catch.
 

@@ -41,6 +41,11 @@ internal class DnsResponseCache(
         var hits: Long = 0L
     )
 
+    private companion object {
+        /** Bound the RFC 9520 marker map; expired rows are pruned on pressure. */
+        private const val MAX_SERVFAIL_MARKERS = 2048
+    }
+
     private val lock = Any()
     private var generation = 0L
     private val entries = object : LinkedHashMap<String, Entry>(maxEntries, 0.75f, true) {
@@ -197,6 +202,9 @@ internal class DnsResponseCache(
         if (ttlSeconds <= 0) return@synchronized
         val now = nowMs()
         servfailMarkers[key] = now + ttlSeconds.coerceAtMost(Long.MAX_VALUE / 1000L) * 1000L
+        if (servfailMarkers.size > MAX_SERVFAIL_MARKERS) {
+            servfailMarkers.entries.removeIf { now >= it.value }
+        }
     }
 
     fun isServfailCached(key: String): Boolean = synchronized(lock) {

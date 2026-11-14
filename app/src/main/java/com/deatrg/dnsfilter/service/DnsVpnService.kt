@@ -172,11 +172,12 @@ class DnsVpnService : VpnService() {
         cnameBlocklistCheck = domainFilter?.let { f -> { domain: String -> f.isDomainBlocked(domain) } }
         statisticsBuffer = ServiceLocator.provideStatisticsBuffer()
         vpnState = ServiceLocator.provideVpnStateHolder()
-        dnsQueryExecutor = DnsQueryExecutor(
-            socketProtector = { socket -> protect(socket) },
-            tcpSocketProtector = { socket -> protect(socket) }
-        )
     }
+
+    private fun createQueryExecutor() = DnsQueryExecutor(
+        socketProtector = { socket -> protect(socket) },
+        tcpSocketProtector = { socket -> protect(socket) }
+    )
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         AppLog.d(TAG) { "onStartCommand action=${intent?.action}" }
@@ -209,6 +210,12 @@ class DnsVpnService : VpnService() {
     private suspend fun startVpn() {
         if (isRunning || vpnInterface != null) return
         AppLog.d(TAG) { "Starting VPN service" }
+
+        // shutdown() 是单向的（isShutdown 永久置位）。同一个 service 实例在
+        // 快速"关→开"时会被复用，所以每次启动都换一个全新的 executor；
+        // 否则 socket 池/预热会永久失效，每次查询都要新建 socket。
+        dnsQueryExecutor?.shutdown()
+        dnsQueryExecutor = createQueryExecutor()
 
         val prefsManager = ServiceLocator.providePreferencesManager()
         // 挂起式读取配置（原实现为 runBlocking 阻塞主线程）
@@ -655,6 +662,8 @@ class DnsVpnService : VpnService() {
         vpnInterface = null
         dnsLoopJob?.cancel()
         dnsLoopJob = null
+        dnsQueryExecutor?.shutdown()
+        dnsQueryExecutor = null
         super.onDestroy()
     }
 
@@ -663,8 +672,12 @@ class DnsVpnService : VpnService() {
         serversJob = scope.launch {
             preferencesManager.dnsServers.collect { updatedServers ->
                 val newServers = updatedServers.filter(::isSupportedDnsServer)
-                if (servers != newServers) {
-                    servers = newServers
+                // 只有真正参与竞速的地址集合变化才需要清 L2：改名/排序不应
+                // 让用户平白损失缓存（清缓存意味着下一轮全部回源）。
+                val addressesChanged = servers.mapTo(HashSet()) { it.address } !=
+                    newServers.mapTo(HashSet()) { it.address }
+                servers = newServers
+                if (addressesChanged) {
                     invalidateResponseCache("upstream DNS servers changed")
                     // New addresses start with empty socket pools: warm them in
                     // the background so first queries skip create+protect.
